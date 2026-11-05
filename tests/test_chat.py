@@ -9,7 +9,7 @@ import pytest
 from genesis.agent import Genesis
 from genesis.chat import ChatEngine, detect_lang
 from genesis.chat_server import make_handler
-from genesis.environments import SequenceWorld, sandboxed
+from genesis.environments import ObjectWorld, SequenceWorld, sandboxed
 
 
 @pytest.fixture
@@ -64,7 +64,7 @@ def test_unknown_text_is_answered_honestly(engine):
     cid = engine.new_conversation("en")["id"]
     r = _say(engine, cid, "what is the capital of France")
     assert r["meta"]["intent"] == "unknown-topic"
-    assert "capital" in r["text"] and "know nothing about it" in r["text"]
+    assert "capital" in r["text"] and "cannot answer" in r["text"]
     r = _say(engine, cid, "blorp zingle")
     assert r["meta"]["intent"] == "not-understood"
     assert "unknown to me" in r["text"]
@@ -113,7 +113,8 @@ def server(tmp_path):
 
     def run():  # the SQLite connection must live on the serving thread
         agent = Genesis(str(tmp_path / "http.db"))
-        srv = HTTPServer(("127.0.0.1", 0), make_handler(ChatEngine(agent)))
+        engine = ChatEngine(agent, object_factory=lambda s: sandboxed(ObjectWorld(s), 1000))
+        srv = HTTPServer(("127.0.0.1", 0), make_handler(engine))
         box["srv"], box["url"] = srv, f"http://127.0.0.1:{srv.server_port}"
         ready.set()
         try:
@@ -158,3 +159,44 @@ def test_http_api_round_trip_and_guards(server):
     assert _req(url, {"text": ""})[0] == 400
     assert _req(url, {"text": "x" * 20000})[0] == 413
     assert _req(f"{server}/api/conversations/999/messages", {"text": "hi"})[0] == 404
+
+
+def test_http_semantic_learning_and_correction(server):
+    _, body = _req(server + "/api/conversations", {"lang": "en"})
+    cid = json.loads(body)["id"]
+    url = f"{server}/api/conversations/{cid}/messages"
+
+    def say(text):
+        code, body = _req(url, {"text": text})
+        assert code == 200
+        return json.loads(body)["reply"]
+
+    say("Nala is a cat; All cats are animals")
+    r = say("Is Nala an animal?")
+    assert r["meta"]["status"] == "supported"
+    assert len(r["meta"]["knowledge_ids"]) == 2
+    kid = r["meta"]["knowledge_ids"][0]
+    assert say(f"explain {kid}")["meta"]["found"]
+    say("correction: Nala is not a cat")
+    assert say("Is Nala an animal?")["meta"]["status"] == "unknown"
+
+
+def test_http_object_workshop(server):
+    _, body = _req(server + "/api/conversations", {"lang": "fr"})
+    cid = json.loads(body)["id"]
+    url = f"{server}/api/conversations/{cid}/messages"
+
+    def say(text):
+        code, body = _req(url, {"text": text})
+        assert code == 200
+        return json.loads(body)["reply"]
+
+    assert say("atelier objets")["meta"]["intent"] == "object-workshop"
+    assert say("observe specimen-0")["meta"]["effects"] == {}
+    assert say("teste a0")["meta"]["effect"] in (0, 1)
+    observed = say("observe specimen-0")["meta"]
+    assert "a0" in observed["effects"] and observed["experiment_episodes"]
+    taught = say("cet objet est dax")["meta"]
+    assert taught["intent"] == "object-word-teach" and not taught["validated"]
+    assert "agreement" in say(f"explain {taught['knowledge_id']}")["text"]
+    assert say("show an object unknown")["meta"]["objects"] == []

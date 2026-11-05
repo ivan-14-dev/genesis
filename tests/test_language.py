@@ -85,7 +85,7 @@ def test_chat_understands_paraphrases_in_both_languages(say):
 
 def test_out_of_scope_questions_are_answered_honestly(say):
     r = say("Quelle est la capitale de l'Italie ?")
-    assert r["meta"]["intent"] == "unknown-topic" and "je n'en sais rien" in r["text"]
+    assert r["meta"]["intent"] == "unknown-topic" and "ne peux pas répondre" in r["text"]
     r = say("merci")                                        # moving on is not teaching
     assert r["meta"]["intent"] == "thanks" and not r["meta"].get("learned_word")
 

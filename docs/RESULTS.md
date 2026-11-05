@@ -192,7 +192,8 @@ routed intent is compared with the expected one.
 
 The held-out set has 15 FR + 15 EN paraphrases, 2 negations, 2 typos and 4 out-of-scope questions. Both sets were
 written by the same designers as the lexicon, so this measures coverage of *their* phrasing. Failures observed on
-harder probes, kept as known limits:
+harder probes, kept as known limits of the original command parser (the semantic teaching channel below has
+separate, bounded handling of multiple assertions, local negation and subject references):
 - one intent per message ("explore puis dis-moi tes limites" → explore only);
 - negation scope is the whole sentence ("pas besoin d'explorer, dis-moi ce que tu sais" → help);
 - no reference to earlier turns or time ("la suite de tout à l'heure"), no idioms outside the list ("figure
@@ -226,6 +227,188 @@ unrelated control sentences. The figures are the means over seeds 100–109; see
 
 Limits: the unseen paraphrases share content words with the training ones by construction. Learned words are
 word→command associations, combined statistically; they add no new meaning beyond the innate commands.
+
+## Acquiring semantic relations without a pretrained model
+
+`experiments.run_semantic_learning(seed)` uses 30 invented labels per seed, with no facts installed at birth.
+Six independent groups each receive two class-inclusion teachings and one example entity. A new entity in
+each group is then introduced with membership only. The six target memberships require **two inference steps**;
+none is supplied as a teaching. Six cross-group questions are negative controls. Rules of deduction and the
+sentence grammar are designer-provided, not learned. The acquired content is the particular relation graph.
+
+Measured over seeds 100–109:
+
+| Metric | Result |
+|---|---|
+| Initial semantic/world knowledge | 0 items |
+| Target answers before teaching | 60/60 unknown |
+| Training assertions | 24 per run |
+| New-entity target answers after teaching | 60/60 supported, each with 3 premise IDs |
+| Unsupported positive answers on negative controls | 0/60 |
+| Retention after unrelated teaching / restart | 100% / 100% |
+| Opposing teachings detected as a conflict | 10/10 |
+| Obsolete conclusions removed after correction | 10/10 |
+| Unaffected knowledge retained after correction | 100% |
+| Recorded interaction episodes | 52 per run |
+| SQLite size at measurement | 155,648 bytes per run |
+| Wall time on this CPU, isolated measurement | 0.161–0.209 seconds per run |
+
+This is evidence of **symbolic acquisition, transfer and persistence**, not general intelligence, open-domain
+comprehension or independent discovery of logic. User assertions are not independently verified. Prior agreement
+recorded before each teaching measures consistency with the user, not truth. Repeated assertions do not increase
+confidence. The tests additionally cover bilingual teaching, explanation, API use, pronouns across restarts,
+ambiguity, cycle termination, bounded storage, retraction, preservation of old evidence and non-transitivity of
+spatial relations. Unknown and contradicted are distinct outcomes.
+
+Reproduce without running the longer world benchmarks:
+
+```bash
+.venv/bin/python -c 'from genesis.experiments import run_semantic_learning; print([run_semantic_learning(s) for s in range(100, 110)])'
+```
+
+## Grounded object representations (`grounding.py`)
+
+After development on seeds 0–2 and tests on seed 7, the fixed learner was evaluated on world seeds 100–109.
+Each run begins with empty learned knowledge and performs 80 initial experiments on a catalog of 32 structured
+specimens. The five binary sensor channels and two action tokens are opaque. The hidden effect laws are simple
+seed-sampled functions of one or two channels. The innate learner knows neither the functions nor their relevant
+channels; it searches for minimal consistent predictive projections.
+
+Evaluation uses 64 new object IDs per run, each tested under both actions. All objects have previously unseen
+**full** sensor vectors because globally irrelevant channels take value 2. Relevant values remain in the trained
+binary domain. This specifically tests invariance to distractors, **not extrapolation to new causal values**.
+The world oracle is used only by the evaluation harness. The held-out curves never affect training choices,
+budgets, stopping or fitted tables.
+
+| Metric across ten seeds | Result |
+|---|---|
+| Initial prediction coverage | 0% (abstention, no supplied facts) |
+| Final held-out accuracy / coverage | 100% / 100% in every run |
+| Correct minimal feature sets / validated action representations | 2 / 2 per run |
+| Object-ID / full-state lookup coverage | 0% / 0% |
+| Majority-outcome baseline accuracy | 53.9–68.0% |
+| Existing `RuleLearner`, same initial observations | 100% in every run |
+| One-step goals on new specimens | 640/640 successes |
+| Uniform random action, expected goal success | 69.5–77.3% per run |
+| Predictions retained after reload / learning a second world | 100% / 100% |
+| Changed-action accuracy immediately after hidden inversion | 0% |
+| Changed-action accuracy after 80 further experiments | 100% |
+| Unchanged action accuracy after revision | 100% |
+| Abstention when a relevant channel takes an unseen value | 100% |
+| Main-memory interaction episodes | 304 (80 initial, 64 evaluation goals, 80 other-world, 80 adaptation) |
+| SQLite size at measurement | 303,104–311,296 bytes |
+| Measured total wall time, including baselines | 0.91–1.73 s per run |
+
+Same learner, different experiment selection (held-out accuracy ranges over seeds):
+
+| Interaction budget | Active selection | Random selection |
+|---|---|---|
+| 16 | 83.6–93.8% | 50.0–90.6% |
+| 32 | 82.8–90.6% | 50.0–100% |
+| 48 | 100% | 50.0–100% |
+| 64 / 80 | 100% | 100% |
+
+**Honest interpretation:** learned projections outperform rote lookup on the chosen distractor-shift test, but
+do not beat the existing symbolic learner at the final budget. Active exploration is not consistently better
+than random at every intermediate budget. The main addition is an inspectable learned representation and its
+validation/revision lifecycle, not evidence of human-like understanding.
+
+The concept check uses future predictions on novel full configurations plus controlled one-channel contrasts.
+This protects against validating from repeated identical examples, but does not guarantee validity outside the
+sampled world. Confounded evidence can leave multiple candidate projections. Incompatible repeated states
+trigger model revision; under noisy dynamics this could mistake noise for a changed law. Sensor formats, search
+bias and the definition of an action effect remain innate. No word meanings, new sensors, neural features,
+multi-step planning or general physical laws are learned here. Retention across worlds uses separate environment
+contexts, not interference-free learning in a shared neural representation.
+
+```bash
+.venv/bin/python -m genesis grounded --seed 100 --db runs/objects.db
+.venv/bin/python -m genesis dashboard --db runs/objects.db
+# Multiple seeds, isolated temporary memories:
+.venv/bin/python -c 'from genesis.experiments import run_grounded_learning; print([run_grounded_learning(s) for s in range(100, 110)])'
+```
+
+The explicit database path must not already exist. The report, concepts, revisions and original episodes remain
+inspectable there. Goal-evaluation outcomes are logged but never fitted; a separate temporary memory is used for
+the random-exploration comparison.
+
+## Learning word meanings from objects (`grounded_language.py`)
+
+After development on seed 0 and a regression experiment on seed 3, the fixed procedure was measured on
+seeds 100–109. Each fresh memory explores its world for 80 experiments, then receives 24 positive/negative
+examples for each of two arbitrary words. The simulated teacher assigns words to action-effect predicates;
+word/action/value assignments vary by seed. The teacher and evaluation oracle live only in `experiments.py`.
+The learner receives labels linked to actual experiment records, never those predicate definitions.
+
+Evaluation classifies 64 unseen specimens for both words and selects the exact sets matching four
+previously untaught conjunction/negation combinations. New IDs and irrelevant sensor values prevent
+object-ID/full-configuration memorization. Relevant values remain in the trained domain. No test annotation
+or test effect is fitted; the world's 80 training transitions remain unchanged throughout the language test.
+
+| Metric across ten seeds | Result |
+|---|---|
+| Initial word prediction coverage | 0% |
+| World experiments / initial word annotations | 80 / 48 per run |
+| Held-out word classification accuracy / coverage | 1,280/1,280 correct / 100% |
+| Exact composed reference sets | 40/40 |
+| Validated words / correct novel-input checks | 2 per run / 14–22 per word |
+| Object-ID label lookup coverage | 0% |
+| Objects selected by negating an unknown word | 0 |
+| Retention after reload | 100% |
+| Contradictory annotations cause abstention | 10/10 |
+| Explicit correction + eight further examples restore validation | 10/10 |
+| Post-correction accuracy / original incorrect episodes preserved | 100% / 10/10 |
+| Total episodes, including contradiction/correction checks | 138 per run |
+| SQLite size at measurement | 233,472 bytes per run |
+| Measured wall time on this CPU | 0.482–0.542 s per run |
+
+These are **learned lexical predicates in a restricted world**, not evidence of human general comprehension.
+Sensor and effect representations are supplied as a data format; the predicate search space, sentence frames,
+conjunction and negation are designer-provided. A human or simulated teacher supplies the naming convention.
+Observationally equivalent sensor/effect meanings can remain ambiguous despite accurate predictions.
+Agreement with annotations does not establish a uniquely correct or universal definition. No photographs,
+learned grammar, spontaneous language emergence or general physical reasoning are demonstrated.
+
+The tests also cover refusal on unseen relevant values or unvalidated action models, no fitting during queries,
+annotation/resource bounds, bilingual HTTP dialogue, conversation-local selection, correction history and
+invalidation after an observed world revision. Repetition alone cannot validate a meaning.
+
+```bash
+.venv/bin/python -c 'from genesis.experiments import run_grounded_word_learning; print([run_grounded_word_learning(s) for s in range(100, 110)])'
+```
+
+## Inducing sentence constructions (`constructions.py`)
+
+After development on seed 0 and a regression run on seed 3, the fixed procedure was evaluated on seeds 100–109.
+Each run first performs 80 world experiments and receives 144 object-label annotations for six words.
+Eight additional utterance/meaning demonstrations teach two forms with different slot orders. Literal markers,
+word-effect assignments and negation assignments vary by seed; no forms are installed in the learner.
+Four words appear in construction training; two further grounded words appear only in held-out substitutions.
+
+Evaluation uses 36 new sentences per seed and the exact selected object sets on 64 specimens with unseen IDs
+and irrelevant sensor values. Neither held-out meanings nor effects enter training. The meaning supplied by the
+teacher is a conjunction of signed lexical predicates, **not raw unsupervised language experience**.
+
+| Metric across ten seeds | Result |
+|---|---|
+| Recognized probe sentences before construction teaching | 0 |
+| New-sentence exact interpretations / validated coverage | 360/360 / 100% |
+| Exact object selections on unseen specimens | 360/360 sets |
+| Exact-sentence lookup baseline coverage | 0% |
+| Unknown-form abstention / restart retention | 100% / 100% |
+| Episodes per run | 232 = 80 experiments + 144 labels + 8 construction demonstrations |
+| SQLite size after reload | 335,872–348,160 bytes |
+| Measured total wall time on this CPU | 1.625–2.837 s per run |
+
+These are narrow tests of systematic slot substitution, not general grammar, human-level understanding or
+learning a reasoning algorithm. The hypothesis space and interpretation operators remain designer-provided.
+The benchmark does not test recursive syntax, compositional depth, noisy demonstrations or natural discourse.
+Unit tests additionally check ambiguous overlapping forms, contradictory demonstrations, correction and renewed
+validation, repetition, unvaried slots, resource/provenance checks, bilingual dialogue and query non-learning.
+
+```bash
+.venv/bin/python -c 'from genesis.experiments import run_construction_learning; print([run_construction_learning(s) for s in range(100, 110)])'
+```
 
 ## Developmental gating
 

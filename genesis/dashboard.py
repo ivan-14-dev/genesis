@@ -41,7 +41,9 @@ def summary(ltm: LongTermMemory) -> dict:
             "interactions": ltm.get_meta("interactions"), "counts": counts, "knowledge_by_status": by_status,
             "bytes": ltm.size_bytes(), "active_config": ltm.get_meta("active_config") or {},
             "innate": ltm.get_meta("innate_manifest"), "stage0_audit": ltm.get_meta("stage0_audit"),
-            "innate_language": ltm.get_meta("innate_language")}
+            "innate_language": ltm.get_meta("innate_language"),
+            "innate_grounding": ltm.get_meta("innate_grounding"),
+            "grounded_evaluation": ltm.get_meta("grounded_evaluation")}
 
 
 def knowledge(ltm: LongTermMemory, status=None) -> list:
@@ -199,13 +201,14 @@ select{background:#0f1419;color:#d8dee9;border:1px solid #2c3540}
 <main>
 <section><h2>Developmental stages (measured gates)</h2><div id="gates"></div></section>
 <section><h2>Learning progress (prediction accuracy over lifetime)</h2><div id="chart"></div><div id="activity"></div></section>
-<section><h2>Acquired knowledge <select id="kstatus"><option value="">all</option><option>validated</option><option>candidate</option><option>refuted</option><option>unpredictable</option></select></h2><div id="knowledge"></div></section>
+<section><h2>Acquired knowledge <select id="kstatus"><option value="">all</option><option>validated</option><option>candidate</option><option>taught</option><option>disputed</option><option>refuted</option><option>unpredictable</option></select></h2><div id="knowledge"></div></section>
 <section><h2>Memory statistics</h2><div id="memory"></div></section>
 <section><h2>Recent experiences: predictions vs outcomes</h2><div id="episodes"></div></section>
 <section><h2>Failed predictions &amp; refuted beliefs</h2><div id="failures"></div></section>
 <section><h2>Learning objectives (self-generated)</h2><div id="objectives"></div></section>
 <section><h2>Model versions (self-improvement)</h2><div id="versions"></div></section>
 <section><h2>Assessment history</h2><div id="assess"></div></section>
+<section><h2>Last grounded object experiment</h2><div id="grounding"></div></section>
 <section><h2>Procedural memory &amp; associations</h2><div id="procs"></div></section>
 </main>
 <div id="explain"></div>
@@ -228,7 +231,7 @@ function chart(h){ if(!h.length) return "<p class=dim>no predictions yet</p>";
   <polyline points="${line}" fill="none" stroke="#4c566a"/>${pts}</svg><div>`+envs.map((e,i)=>`<span style="color:${col[i%6]}">● ${esc(e)}</span> `).join("")+"</div>";}
 async function explain(id){ const e=await get("explain/"+id), it=e.item; let h=`<a onclick="$('explain').style.display='none'">✕ close</a>
   <h2>#${it.id} ${esc(it.key)}: <code>${esc(it.statement)}</code> ${tag(it.status)}</h2>
-  <p>confidence ${num(it.confidence)} · provenance <b>${esc(it.provenance)}</b> · support ${it.n_support} · contradictions ${it.n_contra} · forward predictions ${it.forward_ok} ok / ${it.forward_bad} wrong</p>
+  <p>confidence ${it.kind==="semantic"?"unverified (not calibrated)":num(it.confidence)} · provenance <b>${esc(it.provenance)}</b> · support ${it.n_support} · contradictions ${it.n_contra} · forward predictions ${it.forward_ok} ok / ${it.forward_bad} wrong</p>
   <h2>Status history</h2>`+table([["time",r=>new Date(r.ts*1000).toLocaleTimeString()],["from",r=>esc(r.old_status)],["to",r=>tag(r.new_status)],["reason",r=>esc(r.reason)]],e.history);
   for(const [rel,v] of Object.entries(e.evidence)) if(v.total) h+=`<h2>${rel} (${v.total} episodes, first ${v.examples.length} shown)</h2>`+
     table([["episode",r=>r.id],["session",r=>r.session],["provenance",r=>esc(r.provenance)],["action",r=>"<code>"+esc(JSON.stringify(r.action))+"</code>"],["outcome",r=>"<code>"+esc(JSON.stringify(r.outcome))+"</code>"]],v.examples);
@@ -237,6 +240,22 @@ async function refresh(){
   const s=await get("summary"), st=s.stage;
   $("stage").innerHTML=`stage <b>${st.stage}</b> — ${esc(st.name)}`;
   $("meta").textContent=`session ${s.session} · ${s.interactions} interactions · ${(s.bytes/1024).toFixed(0)} KiB`;
+  const g=s.grounded_evaluation;
+  $("grounding").innerHTML=g?`<p>Seed ${esc(g.seed)}; ${esc(g.training_interactions)} initial experiments.
+    Categorical toy world; not open-domain understanding.</p>`+
+    table([["measurement",r=>esc(r[0])],["value",r=>num(r[1])]],[
+      ["initial prediction coverage",g.initial.coverage],
+      ["unseen-object transfer accuracy",g.transfer.accuracy],
+      ["existing symbolic baseline",g.baselines.existing_symbolic.accuracy],
+      ["full-state lookup coverage",g.baselines.full_state_lookup.coverage],
+      ["goal success",g.goals.success_rate],
+      ["random-policy expected success",g.goals.random_expected_success],
+      ["retention after reload",g.reload_retention],
+      ["retention after another world",g.other_world_retention],
+      ["changed-rule accuracy before adaptation",g.changed_rule_before.accuracy],
+      ["changed-rule accuracy after adaptation",g.changed_rule_after.accuracy]
+    ])+"<p class=dim>Concepts and their original experiment evidence appear in Acquired knowledge.</p>":
+    "<p class=dim>No grounded experiment recorded. Run python -m genesis grounded with a new memory path.</p>";
   $("gates").innerHTML=table([["stage",g=>(st.passed.includes(g.stage)?"<span class=ok>✔</span> ":g.stage==st.stage?"<span class=warn>▶</span> ":"<span class=dim>·</span> ")+g.stage],["name",g=>esc(g.name)],
     ["criteria (value / required)",g=>g.criteria.map(c=>`${esc(c.metric)} = ${num(c.value)} <span class=dim>${esc(c.required)}</span>`).join("<br>")]],s.gates);
   $("memory").innerHTML=table([["store",r=>r[0]],["items",r=>r[1]]],Object.entries(s.counts))+
@@ -244,7 +263,7 @@ async function refresh(){
     `<p>active config (approved self-improvements): <code>${esc(JSON.stringify(s.active_config))}</code></p>`+
     `<p class=dim>innate: ${esc(Object.keys(s.innate?.arithmetic_primitives||{}).join(", "))}; domain knowledge: ${(s.innate?.domain_knowledge||[]).length?esc(s.innate.domain_knowledge.join(", ")):"none (empty at birth)"}; innate language faculty: ${s.innate_language?esc(s.innate_language.languages.join("/")+" — "+s.innate_language.n_forms+" word forms about itself, no world knowledge, no pretrained model (v"+s.innate_language.version+", installed session "+s.innate_language.installed_session+")"):"none"}</p>`;
   const k=await get("knowledge"+($("kstatus").value?"?status="+$("kstatus").value:""));
-  $("knowledge").innerHTML=table([["id",r=>`<a onclick="explain(${r.id})">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["status",r=>tag(r.status)],["conf",r=>num(r.confidence)],["source",r=>esc(r.provenance)]],k.slice().reverse());
+  $("knowledge").innerHTML=table([["id",r=>`<a onclick="explain(${r.id})">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["status",r=>tag(r.status)],["conf",r=>r.kind==="semantic"?"unverified":num(r.confidence)],["source",r=>esc(r.provenance)]],k.slice().reverse());
   const p=await get("performance");
   $("chart").innerHTML=chart(p.accuracy_history);
   $("activity").innerHTML=table([["session",r=>r.session],["environment",r=>esc(r.env_id)],["mode",r=>esc(r.provenance)],["episodes",r=>r.n]],p.activity);

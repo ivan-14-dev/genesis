@@ -1,4 +1,4 @@
-"""Command line: ``python -m genesis {demo,benchmark,inspect,improve,approve,rollback,dashboard,chat}``."""
+"""Command line: ``python -m genesis {demo,benchmark,grounded,inspect,improve,approve,rollback,dashboard,chat}``."""
 
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ def _seeds(spec: str) -> list:
     return [int(s) for s in spec.split(",")]
 
 
-def _chat_terminal(db: str, worlds) -> None:
+def _chat_terminal(db: str, worlds, objects=None) -> None:
     from .agent import Genesis
     from .chat import ChatEngine
     agent = Genesis(db)
-    engine = ChatEngine(agent, worlds)
+    engine = ChatEngine(agent, worlds, objects)
     cid = engine.new_conversation()["id"]
     print("GENESIS (no language model). Type a number sequence, 'help'/'aide', or Ctrl+D to quit.")
     try:
@@ -46,6 +46,10 @@ def main(argv=None) -> int:
     b.add_argument("--seeds", default="100-109")
     b.add_argument("--out", default="runs/benchmark.json")
     b.add_argument("--quick", action="store_true")
+    gr = sub.add_parser("grounded", help="object-concept learning, transfer, baselines and adaptation")
+    gr.add_argument("--seed", type=int, default=0)
+    gr.add_argument("--steps", type=int, default=80, help="training interactions per phase (1-256)")
+    gr.add_argument("--db", default="runs/grounded.db", help="new memory path; existing files are never replaced")
     i = sub.add_parser("inspect", help="inspect a memory database")
     i.add_argument("--db", default="runs/demo.db")
     i.add_argument("--explain", type=int, help="knowledge id to explain")
@@ -79,6 +83,14 @@ def main(argv=None) -> int:
     if args.cmd == "demo":
         from .demo import run_demo
         run_demo(args.seed, args.db)
+    elif args.cmd == "grounded":
+        from .experiments import run_grounded_learning
+        try:
+            res = run_grounded_learning(args.seed, args.steps, args.db)
+        except (FileExistsError, ValueError) as exc:
+            print(f"grounded experiment refused: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(res, indent=2))
     elif args.cmd == "benchmark":
         from .experiments import run_benchmark_suite
         res = run_benchmark_suite(_seeds(args.seeds), quick=args.quick)
@@ -116,14 +128,15 @@ def main(argv=None) -> int:
         from .dashboard import serve
         serve(args.db, args.host, args.port)
     elif args.cmd == "chat":
-        from .environments import SequenceWorld, sandboxed
+        from .environments import ObjectWorld, SequenceWorld, sandboxed
         os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
         worlds = lambda s: sandboxed(SequenceWorld(s), 1000)  # noqa: E731 - harness supplies sandboxed worlds
+        objects = lambda s: sandboxed(ObjectWorld(s), 2000)  # noqa: E731
         if args.terminal:
-            _chat_terminal(args.db, worlds)
+            _chat_terminal(args.db, worlds, objects)
         else:
             from .chat_server import serve as serve_chat
-            serve_chat(args.db, args.host, args.port, worlds)
+            serve_chat(args.db, args.host, args.port, worlds, objects)
     return 0
 
 
