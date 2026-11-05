@@ -317,17 +317,18 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
 # Test data written by the designers for evaluation only. The agent never sees it as a list: a simulated
 # user sends these sentences one at a time and answers GENESIS's questions truthfully. No sentence contains an
 # innate command keyword, so every success must come from words learned during the run.
+# Slang / jargon chosen to lie *outside* the innate language faculty, so that only learned words can help.
 WORD_CORPUS = {
-    "knowledge": (["montre tes souvenirs", "raconte tes découvertes", "liste tes trouvailles"],
-                  ["tes souvenirs stp", "découvertes récentes ?", "tes trouvailles du jour"]),
-    "stage": (["où en es-tu", "ta progression ?", "ton avancement actuel"],
-              ["tu en es où", "où en est ta progression", "avancement ?"]),
-    "limitations": (["tes points faibles", "qu'est-ce qui te pose problème", "tes défauts"],
-                    ["tes défauts principaux", "points faibles ?", "un problème ?"]),
-    "questions": (["qu'est-ce qui t'intrigue", "tes interrogations", "ce qui te rend curieux"],
-                  ["ce qui t'intrigue", "tes interrogations actuelles", "curieux de quoi ?"]),
-    "help": (["je suis perdu", "comment ça marche", "comment t'utiliser"],
-             ["je suis un peu perdu", "ça marche comment ?", "t'utiliser comment ?"]),
+    "knowledge": (["balance tes trouvailles", "déballe ton butin", "crache tes pépites"],
+                  ["tes trouvailles stp", "ton butin ?", "tes pépites du jour"]),
+    "stage": (["ton palier", "t'as grimpé jusqu'où", "ta grimpette"],
+              ["palier actuel ?", "grimpé jusqu'où", "ta grimpette du jour"]),
+    "limitations": (["tes bugs", "tes galères", "ce qui coince chez toi"],
+                    ["tes galères principales", "des bugs ?", "ça coince ?"]),
+    "questions": (["ce qui t'intrigue", "tes énigmes", "ce qui te titille"],
+                  ["tes énigmes actuelles", "ça t'intrigue ?", "titillé par quoi ?"]),
+    "help": (["je suis paumé", "je capte rien", "comment ça marche"],
+             ["un peu paumé", "je capte pas", "ça marche comment ?"]),
 }
 WORD_CONTROL = ["il pleut dehors", "quelle heure est-il", "j'aime le chocolat", "ferme la fenêtre",
                 "le chat dort", "achète du pain"]
@@ -369,7 +370,7 @@ def run_word_learning(seed: int, passes: int = 4) -> dict:
                     if not ok:
                         say(WORD_COMMANDS[intent])
                         exchanges += 1
-                elif m["intent"] == "not-understood":
+                elif m["intent"] in ("not-understood", "unknown-topic"):
                     log.append((p, "not-understood"))
                     say(WORD_COMMANDS[intent])
                     exchanges += 1
@@ -406,6 +407,104 @@ def run_word_learning(seed: int, passes: int = 4) -> dict:
                "acted_wrong_during_training": sum(1 for _, k in log if k == "acted-wrong")}
         agent.close()
         return out
+
+
+# Designer-written test sentences for the innate FR/EN faculty (written after the lexicon, never used to tune
+# it beyond fixing genuine parsing bugs). (sentence, expected intent, category, needs a prior sequence)
+LANGUAGE_BENCH = [
+    ("Salut GENESIS", "intro", "fr", False), ("Hey there!", "intro", "en", False),
+    ("Tu es qui au juste ?", "intro", "fr", False), ("Who are you exactly?", "intro", "en", False),
+    ("Qu'as-tu appris jusqu'ici ?", "knowledge", "fr", False), ("What have you learnt so far?", "knowledge", "en", False),
+    ("Montre-moi tes connaissances", "knowledge", "fr", False), ("Which rules did you discover?", "knowledge", "en", False),
+    ("Tu en es à quel stade ?", "stage", "fr", False), ("How far along is your development?", "stage", "en", False),
+    ("Parle-moi de ta mémoire", "stage", "fr", False), ("Show me your progress", "stage", "en", False),
+    ("Quels sont tes points faibles et tes limites ?", "limitations", "fr", False),
+    ("What are your weaknesses?", "limitations", "en", False),
+    ("Qu'est-ce que tu ne sais pas encore ?", "questions", "fr", False),
+    ("What are you curious about?", "questions", "en", False), ("Quels sont tes objectifs ?", "questions", "fr", False),
+    ("Quels mots t'ai-je appris ?", "vocabulary", "fr", False), ("Show me your vocabulary", "vocabulary", "en", False),
+    ("Que peux-tu faire pour moi ?", "help", "fr", False), ("What can you do?", "help", "en", False),
+    ("Je ne comprends pas comment t'utiliser", "help", "fr", False), ("I don't understand", "help", "en", False),
+    ("Va explorer un peu", "explore", "fr", False), ("Go and run some experiments", "explore", "en", False),
+    ("Parles-tu français ?", "languages", "fr", False), ("Do you speak English?", "languages", "en", False),
+    ("Qu'est-ce qu'une croyance ?", "define", "fr", False), ("What is a stage?", "define", "en", False),
+    ("Que signifie hypothèse ?", "define", "fr", False), ("What does sequence mean?", "define", "en", False),
+    ("Comment vas-tu ?", "smalltalk", "fr", False), ("How are you today?", "smalltalk", "en", False),
+    ("Merci beaucoup !", "thanks", "fr", False), ("Thank you so much", "thanks", "en", False),
+    ("À bientôt", "bye", "fr", False), ("Goodbye!", "bye", "en", False),
+    ("Prédis les 3 prochains", "predict", "fr", True), ("What comes next?", "predict", "en", True),
+    ("Continue avec 27 31", "sequence", "fr", True), ("Pourquoi ?", "explain", "fr", True),
+    ("Explain your rule", "explain", "en", True), ("Justifie ta réponse", "explain", "fr", True),
+    ("N'explore surtout pas", "declined", "negation", False), ("Don't explore", "declined", "negation", False),
+    ("Ne prédis rien", "declined", "negation", True), ("Please do not predict", "declined", "negation", True),
+    ("Qu'est-ce que tu connais ?", "knowledge", "typo", False),
+    ("Quelles sont tes limitatons ?", "limitations", "typo", False),
+    ("What do you knwo?", "knowledge", "typo", False), ("Shwo me your vocabulary", "vocabulary", "typo", False),
+    ("Expliqe ta règle", "explain", "typo", True), ("Whats your curiousity about?", "questions", "typo", False),
+    ("Quelle est la capitale de l'Italie ?", "unknown-topic", "out-of-scope", False),
+    ("Who won the football match yesterday?", "unknown-topic", "out-of-scope", False),
+    ("Comment cuisiner des pâtes ?", "unknown-topic", "out-of-scope", False),
+    ("What is the meaning of life?", "unknown-topic", "out-of-scope", False),
+    ("Raconte-moi une blague", "not-understood", "out-of-scope", False),
+    ("Write me a poem about the sea", "not-understood", "out-of-scope", False),
+]
+
+# Second set, written after all parser fixes and measured once without any further tuning (true held-out).
+LANGUAGE_HELDOUT = [
+    ("Coucou, tu t'appelles comment ?", "intro", "fr", False), ("Hi, what's your name?", "intro", "en", False),
+    ("Dis-moi ce que tu as découvert", "knowledge", "fr", False), ("Tell me what you know", "knowledge", "en", False),
+    ("Quelles hypothèses as-tu ?", "knowledge", "fr", False), ("Any beliefs yet?", "knowledge", "en", False),
+    ("Quel est ton niveau actuel ?", "stage", "fr", False), ("What's your current status?", "stage", "en", False),
+    ("Où sont tes échecs ?", "limitations", "fr", False), ("Tell me your limits", "limitations", "en", False),
+    ("Sur quoi as-tu des doutes ?", "questions", "fr", False), ("What gaps do you have?", "questions", "en", False),
+    ("Combien de mots connais-tu ?", "vocabulary", "fr", False), ("Which words do you know?", "vocabulary", "en", False),
+    ("Aide-moi stp", "help", "fr", False), ("What are your commands?", "help", "en", False),
+    ("Tu peux faire des expériences ?", "explore", "fr", False), ("Try exploring a bit", "explore", "en", False),
+    ("Tu comprends l'anglais ?", "languages", "fr", False), ("Can you talk in French?", "languages", "en", False),
+    ("C'est quoi une suite ?", "define", "fr", False), ("What is a rule?", "define", "en", False),
+    ("Ça va bien ?", "smalltalk", "fr", False), ("How's it going?", "smalltalk", "en", False),
+    ("Merci GENESIS", "thanks", "fr", False), ("Bye bye", "bye", "en", False),
+    ("Quels sont les suivants ?", "predict", "fr", True), ("Predict five more terms", "predict", "en", True),
+    ("Explique-moi pourquoi", "explain", "fr", True), ("Why do you believe that?", "explain", "en", True),
+    ("N'essaie pas d'explorer", "declined", "negation", False), ("Never predict anything", "declined", "negation", True),
+    ("Quelles sont tes connaisances ?", "knowledge", "typo", False), ("Explian your rule", "explain", "typo", True),
+    ("What's the population of Japan?", "unknown-topic", "out-of-scope", False),
+    ("Pourquoi le ciel est bleu ?", "unknown-topic", "out-of-scope", False),
+    ("Quel temps fera-t-il demain ?", "unknown-topic", "out-of-scope", False),
+    ("Traduis cette phrase en espagnol", "not-understood", "out-of-scope", False),
+]
+
+
+def run_language_understanding(bench=None) -> dict:
+    """Accuracy of the innate FR/EN faculty on designer-written test sentences (no learning involved)."""
+    bench = LANGUAGE_BENCH if bench is None else bench
+    from .chat import ChatEngine
+    with _tmpdb() as path:
+        agent = Genesis(path, seed=0)
+        eng = ChatEngine(agent)
+        rows = []
+        for text, gold, cat, needs_seq in bench:
+            lang = "en" if cat == "en" else "fr" if cat == "fr" else None
+            cid = eng.new_conversation(lang)["id"]
+            if needs_seq:
+                eng.send(cid, "3, 7, 11, 15, 19, 23")
+            got = eng.send(cid, text)["reply"]["meta"]
+            rows.append({"text": text, "gold": gold, "got": got["intent"], "category": cat,
+                         "ok": got["intent"] == gold, "lang": got["lang"]})
+        agent.close()
+    by_cat = {}
+    for r in rows:
+        c = by_cat.setdefault(r["category"], [0, 0])
+        c[0] += r["ok"]
+        c[1] += 1
+    lang_rows = [r for r in rows if r["category"] in ("fr", "en")]
+    unsafe = [r for r in rows if r["category"] == "out-of-scope" and r["got"] not in ("unknown-topic",
+                                                                                     "not-understood")]
+    return {"n": len(rows), "accuracy": round(sum(r["ok"] for r in rows) / len(rows), 4),
+            "by_category": {k: {"correct": v[0], "n": v[1]} for k, v in by_cat.items()},
+            "lang_detection_accuracy": round(sum(r["lang"] == r["category"] for r in lang_rows) / len(lang_rows), 4),
+            "out_of_scope_answered_as_if_known": len(unsafe),
+            "errors": [{k: r[k] for k in ("text", "gold", "got")} for r in rows if not r["ok"]]}
 
 
 # ==================================================================== suite

@@ -21,24 +21,24 @@ def chat(tmp_path):
 def test_starts_with_no_vocabulary_and_does_not_guess(chat):
     eng, say = chat
     assert eng.lexicon.size() == 0
-    r = say("où en es-tu ?")
+    r = say("zorglub blip")
     assert r["meta"]["intent"] == "not-understood"
     assert "Apprends" in r["text"] and r["meta"]["choices"]
 
 
 def test_taught_words_are_proposed_then_validated_by_forward_predictions(chat):
     eng, say = chat
-    say("où en es-tu ?")
+    say("zorglub blip")
     r = say("stade")                                     # teaching
     assert r["meta"]["intent"] == "stage" and r["meta"]["learned_word"]
     for _ in range(2):                                   # unvalidated: asks, never acts silently
-        r = say("où en es-tu ?")
+        r = say("zorglub blip")
         assert r["meta"]["intent"] == "clarify" and r["meta"]["proposed"] == "stage"
         assert say("oui")["meta"]["intent"] == "stage"
-    r = say("où en es-tu ?")                             # validated: acts, and says so
+    r = say("zorglub blip")                              # validated: acts, and says so
     assert r["meta"]["intent"] == "stage" and r["meta"]["interpreted"]
     assert "Réponds `non`" in r["text"]
-    item = [k for k in eng.ltm.knowledge(kind="lexical") if k.key == "lexicon/ou"][0]
+    item = [k for k in eng.ltm.knowledge(kind="lexical") if k.key == "lexicon/zorglub"][0]
     assert item.status == "validated" and item.provenance == "user-taught" and item.forward_ok == 2
     ev = eng.ltm.explain(item.id)["evidence"]
     assert ev["induced_from"]["total"] == 1 and ev["supports"]["total"] == 2
@@ -46,15 +46,15 @@ def test_taught_words_are_proposed_then_validated_by_forward_predictions(chat):
 
 def test_generalises_to_unseen_sentences_sharing_taught_words(chat):
     eng, say = chat
-    say("montre tes souvenirs")
+    say("balance tes trouvailles")
     say("que sais-tu ?")
-    say("dis moi où tu en es")
+    say("zorglub blip")
     say("stade")
-    r = say("tes souvenirs stp")                         # never seen as a whole
+    r = say("tes trouvailles stp")                       # never seen as a whole
     assert r["meta"]["intent"] == "clarify" and r["meta"]["proposed"] == "knowledge"
     say("non")
     say("stade")                                         # correction: reject + teach
-    st = eng.lexicon.stats["souvenirs"]
+    st = eng.lexicon.stats["trouvailles"]
     assert st["knowledge"]["c"] == 1 and st["knowledge"]["bad"] == 1 and st["stage"]["s"] == 1
 
 
@@ -115,14 +115,14 @@ def test_vocabulary_persists_across_sessions(tmp_path):
     a = Genesis(db)
     e = ChatEngine(a)
     cid = e.new_conversation("fr")["id"]
-    e.send(cid, "quoi de neuf", "fr")
+    e.send(cid, "quid du palier", "fr")
     e.send(cid, "stade", "fr")
     a.close()
     a = Genesis(db)
     e = ChatEngine(a)
     assert e.lexicon.size() == 3
     cid = e.new_conversation("fr")["id"]
-    assert e.send(cid, "quoi de neuf", "fr")["reply"]["meta"]["proposed"] == "stage"
+    assert e.send(cid, "quid du palier", "fr")["reply"]["meta"]["proposed"] == "stage"
     assert e.send(cid, "vocabulaire", "fr")["reply"]["meta"]["n"] == 3
     a.close()
 

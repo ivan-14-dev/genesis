@@ -40,7 +40,8 @@ def summary(ltm: LongTermMemory) -> dict:
     return {"stage": Metacognition.current_stage(a), "gates": gates, "session": ltm.get_meta("session"),
             "interactions": ltm.get_meta("interactions"), "counts": counts, "knowledge_by_status": by_status,
             "bytes": ltm.size_bytes(), "active_config": ltm.get_meta("active_config") or {},
-            "innate": ltm.get_meta("innate_manifest"), "stage0_audit": ltm.get_meta("stage0_audit")}
+            "innate": ltm.get_meta("innate_manifest"), "stage0_audit": ltm.get_meta("stage0_audit"),
+            "innate_language": ltm.get_meta("innate_language")}
 
 
 def knowledge(ltm: LongTermMemory, status=None) -> list:
@@ -241,7 +242,7 @@ async function refresh(){
   $("memory").innerHTML=table([["store",r=>r[0]],["items",r=>r[1]]],Object.entries(s.counts))+
     "<p>knowledge by status: "+Object.entries(s.knowledge_by_status).map(([k,v])=>tag(k)+" "+v).join(" ")+"</p>"+
     `<p>active config (approved self-improvements): <code>${esc(JSON.stringify(s.active_config))}</code></p>`+
-    `<p class=dim>innate: ${esc(Object.keys(s.innate?.arithmetic_primitives||{}).join(", "))}; domain knowledge: ${(s.innate?.domain_knowledge||[]).length?esc(s.innate.domain_knowledge.join(", ")):"none (empty at birth)"}</p>`;
+    `<p class=dim>innate: ${esc(Object.keys(s.innate?.arithmetic_primitives||{}).join(", "))}; domain knowledge: ${(s.innate?.domain_knowledge||[]).length?esc(s.innate.domain_knowledge.join(", ")):"none (empty at birth)"}; innate language faculty: ${s.innate_language?esc(s.innate_language.languages.join("/")+" — "+s.innate_language.n_forms+" word forms about itself, no world knowledge, no pretrained model (v"+s.innate_language.version+", installed session "+s.innate_language.installed_session+")"):"none"}</p>`;
   const k=await get("knowledge"+($("kstatus").value?"?status="+$("kstatus").value:""));
   $("knowledge").innerHTML=table([["id",r=>`<a onclick="explain(${r.id})">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["status",r=>tag(r.status)],["conf",r=>num(r.confidence)],["source",r=>esc(r.provenance)]],k.slice().reverse());
   const p=await get("performance");

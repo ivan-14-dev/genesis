@@ -63,8 +63,11 @@ def test_explain_cites_supporting_episodes(engine):
 def test_unknown_text_is_answered_honestly(engine):
     cid = engine.new_conversation("en")["id"]
     r = _say(engine, cid, "what is the capital of France")
+    assert r["meta"]["intent"] == "unknown-topic"
+    assert "capital" in r["text"] and "know nothing about it" in r["text"]
+    r = _say(engine, cid, "blorp zingle")
     assert r["meta"]["intent"] == "not-understood"
-    assert "language model" in r["text"]
+    assert "unknown to me" in r["text"]
 
 
 def test_limits_and_language_detection(engine):

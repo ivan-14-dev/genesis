@@ -1,9 +1,9 @@
 """Conversational entry point to GENESIS.
 
-This is **not** a language model and does not pretend to be one. The agent has never learned words, so
-the interface understands only a small command grammar (French or English keywords plus integers). That
-grammar is part of the *interface*, fixed by the designers and listed in the innate manifest's spirit:
-it is not knowledge the agent acquired, and it is documented as such to the user.
+This is **not** a language model and does not pretend to be one. Language understanding comes from the
+innate bilingual faculty (``language.py``): a hand-written French/English lexicon and grammar about GENESIS's
+own interface and cognition, fixed by the designers, declared at birth and kept separate from acquired
+knowledge. It parses questions, negation, elisions and typos, but carries no knowledge about the world.
 
 What the agent says about the world comes only from its own memory:
 
@@ -22,12 +22,12 @@ Every answer carries ``meta`` (intent, keys, knowledge ids) so it can be traced 
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from typing import Callable, Optional
 
 from .adapters import SEQ_VARS, Outcome, Query, Situation
+from . import language
 from .curiosity import Curiosity
+from .language import FUNCTION, INT_RE, Parse
 from .lexicon import ASK_POSTERIOR, Lexicon
 from .metacognition import Metacognition
 from .perception import Perception
@@ -38,40 +38,10 @@ MAX_ABS = 10 ** 9
 MAX_EXPLORE = 300
 DEFAULT_EXPLORE = 100
 
-INT_RE = re.compile(r"(?<![\w.\-])-?\d+(?![\w.])")
-
-FR = {"bonjour", "salut", "coucou", "bonsoir", "que", "quoi", "sais", "tu", "explique", "pourquoi", "aide",
-      "stade", "etat", "limites", "suite", "merci", "je", "les", "des", "est", "connais", "connaissances",
-      "predis", "prochain", "prochains", "suivant", "suivants", "curiosite", "objectifs", "comment", "qui", "es",
-      "ton", "ta", "tes", "une", "et", "le", "la", "du", "ca", "va", "explorer", "appris", "ignores", "peux",
-      "faire", "quelles", "quels", "quel", "quelle", "voici", "trouve", "regle", "encore", "croyances", "oui",
-      "non", "mots", "vocabulaire"}
-EN = {"hello", "hi", "hey", "what", "know", "explain", "why", "help", "stage", "status", "limitations",
-      "continue", "more", "thanks", "thank", "you", "the", "is", "are", "predict", "next", "who", "how", "do",
-      "your", "knowledge", "learned", "can", "find", "rule", "here", "beliefs", "objectives", "yes", "no",
-      "words", "vocabulary"}
-
-EXPLAIN = {"explain", "explique", "expliquer", "pourquoi", "why", "evidence", "preuve", "preuves", "justify",
-           "justifie"}
-CONTINUE = {"continue", "suite", "encore", "more", "then", "puis"}
-PREDICT = {"predict", "predis", "prediction", "predictions", "next", "suivant", "suivants", "prochain",
-           "prochains", "apres", "after"}
-EXPLORE = {"explore", "explorer", "exploration", "experimente", "experiment", "experiments", "experiences"}
-KNOW = {"know", "sais", "connais", "knowledge", "connaissances", "learned", "appris", "beliefs", "croyances",
-        "savoir", "learnt"}
-STAGE = {"stage", "stade", "status", "etat", "progress", "progres", "developpement", "development", "niveau",
-         "level", "memoire", "memory"}
-LIMITS = {"limitations", "limites", "limits", "faiblesses", "weaknesses", "echecs", "failures", "limitation",
-          "limite"}
-QUESTIONS = {"questions", "curiosity", "curiosite", "objectifs", "objectives", "gaps", "lacunes", "ignores",
-             "uncertain", "incertain", "doutes", "doubts"}
-HELP = {"help", "aide", "commands", "commandes", "capacites", "capabilities", "faire", "usage", "mode", "emploi"}
-GREET = {"bonjour", "salut", "hello", "hi", "hey", "coucou", "bonsoir", "yo"}
-WHO = {"qui", "who"}
-THANKS = {"merci", "thanks", "thank", "thx"}
-VOCAB = {"vocabulaire", "vocabulary", "mots", "words", "lexique", "lexicon"}
-YES = {"oui", "yes", "ouais", "yep", "yeah", "exact", "exactement", "correct", "ok", "okay", "accord", "voila"}
-NO = {"non", "no", "nope", "faux", "wrong", "incorrect", "nan"}
+YES = language.words_of("YES")
+NO = language.words_of("NO")
+TOPICAL = ("LIMIT", "QUESTION", "STAGE", "MEMORY", "WORD", "LANGUAGE", "HELP", "EXPLORE")
+ACTIONS = ("explore", "predict", "explain", "sequence", "continue")
 
 # Intents a learned word may point to (the innate actions the chat can perform).
 TEACHABLE = ("knowledge", "stage", "limitations", "questions", "vocabulary", "help", "intro", "thanks", "explore",
@@ -83,26 +53,50 @@ COMMANDS = (("que sais-tu ?", "what do you know?"), ("stade", "stage"), ("limite
             ("questions", "questions"), ("vocabulaire", "vocabulary"), ("aide", "help"),
             ("explorer 100", "explore 100"))
 
-
-def _norm(text: str) -> str:
-    t = unicodedata.normalize("NFKD", text.lower())
-    return "".join(c for c in t if not unicodedata.combining(c))
-
-
-def _words(text: str) -> list:
-    return re.findall(r"[a-z]+", _norm(text))
+GLOSSARY = {
+    "RULE": ("Pour moi, une **règle** est un petit programme (fait de mes primitives arithmétiques et logiques) qui "
+             "prédit un terme à partir des précédents. Je n'en considère une comme validée qu'après des "
+             "prédictions justes faites *avant* de voir les valeurs.",
+             "To me, a **rule** is a small program (built from my arithmetic and logic primitives) that predicts a "
+             "term from the previous ones. I only call one validated after correct predictions made *before* "
+             "seeing the values."),
+    "BELIEF": ("Une **croyance** est une connaissance que j'ai acquise, avec sa provenance, sa confiance, son statut "
+               "(hypothèse, candidate, validée, réfutée) et les épisodes qui la justifient (`explique N`).",
+               "A **belief** is a piece of knowledge I acquired, with its provenance, confidence, status "
+               "(hypothesis, candidate, validated, refuted) and the episodes supporting it (`explain N`)."),
+    "MEMORY": ("Ma **mémoire** à long terme (SQLite) contient des épisodes (ce que j'ai vécu, jamais effacés), des "
+               "connaissances sémantiques, des procédures, des associations et mon historique d'apprentissage.",
+               "My long-term **memory** (SQLite) holds episodes (what I experienced, never erased), semantic "
+               "knowledge, procedures, associations and my learning history."),
+    "STAGE": ("Un **stade** est une étape de mon développement (0 à 7). Je passe au suivant sur des critères "
+              "mesurés, pas avec le temps. Tape `stade` pour voir où j'en suis.",
+              "A **stage** is a step of my development (0 to 7). I move on based on measured criteria, not elapsed "
+              "time. Type `stage` to see where I am."),
+    "SEQUENCE": ("Une **suite** est une liste d'entiers ; je cherche le programme qui produit chaque terme à partir "
+                 "des précédents. Envoie-m'en une, par exemple `2, 5, 8, 11, 14`.",
+                 "A **sequence** is a list of integers; I look for the program producing each term from the "
+                 "previous ones. Send me one, e.g. `2, 5, 8, 11, 14`."),
+    "PREDICT": ("Une **prédiction** est ce que j'annonce *avant* d'observer. L'erreur entre prédiction et "
+                "observation est mon principal signal d'apprentissage.",
+                "A **prediction** is what I announce *before* observing. The error between prediction and "
+                "observation is my main learning signal."),
+    "QUESTION": ("Ma **curiosité** choisit les expériences qui réduisent le plus mon incertitude (gain "
+                 "d'information attendu), pas au hasard. Tape `questions` pour voir mes lacunes actuelles.",
+                 "My **curiosity** picks the experiments expected to reduce my uncertainty the most (expected "
+                 "information gain), not random ones. Type `questions` to see my current gaps."),
+    "WORD": ("Je connais de naissance un petit vocabulaire français/anglais sur moi-même ; les autres **mots** "
+             "s'apprennent : tu m'enseignes à quelle commande ils renvoient, et je valide par mes prédictions.",
+             "I'm born with a small French/English vocabulary about myself; other **words** are learned: you teach "
+             "me which command they refer to and I validate them through my predictions."),
+    "EXPLORE": ("**Explorer**, c'est expérimenter seul dans un monde isolé aux règles cachées, en changeant une "
+                "variable à la fois pour distinguer causes et corrélations.",
+                "**Exploring** means experimenting on my own in a sandboxed world with hidden rules, changing one "
+                "variable at a time to tell causes from correlations."),
+}
 
 
 def detect_lang(text: str, fallback: Optional[str] = None) -> str:
-    ws = set(_words(text))
-    fr, en = len(ws & FR), len(ws & EN)
-    if any(c in text for c in "éèêàçùôîâ"):
-        fr += 2
-    if fr > en:
-        return "fr"
-    if en > fr:
-        return "en"
-    return fallback if fallback in ("fr", "en") else "en"
+    return language.parse(text, fallback).lang
 
 
 def _t(lang: str, fr: str, en: str) -> str:
@@ -203,35 +197,65 @@ class ChatEngine:
         return {"user": user, "reply": bot, "conversation": self.ltm.conversation(cid)}
 
     # ---------------------------------------------------------------- intents
-    def _innate(self, cid: int, ws: set, nums: list, text: str) -> Optional[str]:
-        """The designer-provided command grammar. Returns an intent name or None."""
+    def _innate(self, cid: int, p: Parse, text: str) -> Optional[str]:
+        """Maps the innate language faculty's parse (concepts, question type, negation) to an intent."""
+        intent = self._intent(cid, p, text)
+        if intent in ACTIONS and p.negated and p.qtype is None:
+            return "declined"
+        return intent
+
+    def _intent(self, cid: int, p: Parse, text: str) -> Optional[str]:
+        nums, has = p.numbers, p.has
         last_seq = self._last(cid, "key")
-        if ws & EXPLAIN and (nums or self._last(cid, "knowledge_id") is not None):
+        content = [t for t in p.tokens if t not in FUNCTION]
+        if has("EXPLAIN") and (nums or not has(*TOPICAL)):
             return "explain"
-        if ws & CONTINUE and nums and last_seq:
+        if p.qtype == "why" and (nums or self._last(cid, "knowledge_id") is not None) and not has(*TOPICAL):
+            return "explain"
+        if has("CONTINUE") and nums and last_seq:
             return "continue"
         if len(nums) >= 4:
             return "sequence"
-        if 1 <= len(nums) <= 3 and not (ws - {"et", "and"}) and last_seq:
+        if 1 <= len(nums) <= 3 and not content and last_seq:
             return "continue"
-        if ws & PREDICT and last_seq:
+        if has("PREDICT") or (last_seq and (has("NEXT") or (has("CONTINUE") and not nums))):
             return "predict"
-        for words, intent in ((EXPLORE, "explore"), (VOCAB, "vocabulary"), (LIMITS, "limitations"),
-                              (QUESTIONS, "questions"), (KNOW, "knowledge"), (STAGE, "stage"), (HELP, "help")):
-            if ws & words:
-                return intent
-        if text.strip() == "?":
+        if has("HOWAREYOU"):
+            return "smalltalk"
+        if any(g in p.concepts for g in GLOSSARY) and (has("MEANING") or (
+                p.qtype == "what" and not has("SELF", "USER", "KNOW", "LEARN", "CAN"))):
+            return "define"
+        if has("LANGUAGE") or (has("SELF") and has("UNDERSTAND", "SPEAK") and not p.negated
+                               and not has(*TOPICAL, "KNOW", "RULE", "BELIEF")):
+            return "languages"
+        if has("USER") and has("UNDERSTAND", "KNOW") and p.negated:
             return "help"
-        if ws & GREET or (ws & WHO and ws & {"es", "are", "you", "tu"}):
+        for concepts, intent in ((("EXPLORE",), "explore"), (("WORD",), "vocabulary"), (("LIMIT",), "limitations"),
+                                 (("QUESTION",), "questions")):
+            if has(*concepts):
+                return intent
+        if has("KNOW") and p.negated:
+            return "questions"
+        if has("HELP") or (has("CAN") and has("SELF")) or text.strip() == "?":
+            return "help"
+        if has("KNOW", "LEARN", "BELIEF", "RULE"):
+            return "knowledge"
+        if has("STAGE", "MEMORY"):
+            return "stage"
+        if has("GREET") or (p.qtype == "who" and has("SELF")) or (has("NAME") and has("SELF")):
             return "intro"
-        if ws & THANKS:
+        if has("THANKS"):
             return "thanks"
+        if has("BYE"):
+            return "bye"
         if 0 < len(nums) < 4:
             return "too-short"
         return None
 
-    def run(self, cid: int, intent: str, nums: list, lang: str) -> tuple:
+    def run(self, cid: int, intent: str, nums: list, lang: str, p: Optional[Parse] = None) -> tuple:
         last_seq = self._last(cid, "key")
+        if intent in ("define", "languages", "smalltalk", "bye", "declined"):
+            return getattr(self, intent)(p or language.parse("", lang), lang)
         if intent == "explain":
             kid = nums[0] if nums else self._last(cid, "knowledge_id")
             if kid is None:
@@ -265,13 +289,27 @@ class ChatEngine:
             {"intent": "too-short"}
 
     def respond(self, cid: int, text: str, lang: str) -> tuple:
-        ws = set(_words(text))
-        nums = [int(m) for m in INT_RE.findall(text)]
+        reply, meta = self._respond(cid, text, lang)
+        p = language.parse(text, lang)
+        if p.corrected and meta.get("intent") not in ("not-understood", "unknown-topic"):
+            fixes = ", ".join(f"« {a} » → « {b} »" for a, b in p.corrected.items())
+            reply += "\n\n" + _t(lang, f"_(J'ai corrigé une faute probable : {fixes}.)_",
+                                  f"_(I corrected a probable typo: {fixes}.)_")
+            meta = {**meta, "corrected": p.corrected}
+        return reply, meta
+
+    def _respond(self, cid: int, text: str, lang: str) -> tuple:
+        p = language.parse(text, lang)
+        nums = p.numbers
+        n_tok = len(p.tokens)
         prev = self._prev_meta(cid)
-        innate = self._innate(cid, ws, nums, text)
+        innate = self._innate(cid, p, text)
         teachable = innate if innate in TEACHABLE else None
-        yes = bool(ws & YES) and not ws & NO and len(ws) <= 4 and not nums
-        no = bool(ws & NO) and not ws & YES and len(ws) <= 4 and not nums
+        if prev.get("intent") == "unknown-topic" and text.strip().lower() not in (prev.get("choices") or []):
+            # I understood the sentence's structure, so only an explicit pick of a command counts as teaching.
+            teachable = None
+        yes = p.has("YES") and not p.has("NO") and n_tok <= 4 and not nums
+        no = p.has("NO") and not p.has("YES") and n_tok <= 4 and not nums
         u = prev.get("utterance")
 
         if prev.get("intent") == "clarify" and u:
@@ -284,7 +322,7 @@ class ChatEngine:
                 info = self.lexicon.learn(u, proposed, "rejected", prev.get("posterior"))
                 return self._ask_teacher(u, prev.get("nums") or [], lang, rejected=proposed, info=info)
             # Any other message is not taken as an answer: ignoring a question is not evidence.
-        elif prev.get("intent") in ("not-understood", "teach-request") and u and teachable:
+        elif prev.get("intent") in ("not-understood", "unknown-topic", "teach-request") and u and teachable:
             info = self.lexicon.learn(u, teachable, "taught")
             return self._with_note(self.run(cid, teachable, nums or prev.get("nums") or [], lang),
                                    self._learn_note(info, u, teachable, "taught", lang))
@@ -292,10 +330,10 @@ class ChatEngine:
             info = self.lexicon.learn(u, prev["intent"], "rejected", prev.get("posterior"))
             return self._ask_teacher(u, prev.get("nums") or [], lang, rejected=prev["intent"], info=info)
 
-        if prev.get("intent") in ("not-understood", "teach-request") and u and (yes or no):
+        if prev.get("intent") in ("not-understood", "unknown-topic", "teach-request") and u and (yes or no):
             return self._ask_teacher(u, prev.get("nums") or [], lang, rejected=None, info=None)
         if innate:
-            return self.run(cid, innate, nums, lang)
+            return self.run(cid, innate, nums, lang, p)
         if yes or no:
             return _t(lang, "Je ne t'ai rien demandé auquel répondre par oui ou non.",
                       "I didn't ask you anything to answer yes or no to."), {"intent": "yes-no"}
@@ -322,6 +360,10 @@ class ChatEngine:
                 {"intent": "clarify", "proposed": guess.intent, "utterance": text, "nums": nums,
                  "posterior": guess.posterior, "lexical_ids": guess.kids,
                  "choices": [_t(lang, "oui", "yes"), _t(lang, "non", "no")]}
+        if p.topic and (p.qtype or p.understood >= 0.5):
+            return self.unknown_topic(p, lang), {"intent": "unknown-topic", "utterance": text, "nums": nums,
+                                                 "topic": p.topic, "qtype": p.qtype,
+                                                 "choices": self._command_choices(lang)}
         return self.not_understood(lang), {"intent": "not-understood", "utterance": text, "nums": nums,
                                            "choices": self._command_choices(lang)}
 
@@ -645,50 +687,116 @@ class ChatEngine:
         return "\n".join(lines), {"intent": "explore", "env_id": env, "steps": rep.steps, "validated": len(val),
                                   "unpredictable": len(unp)}
 
+    # ------------------------------------------------------ language faculty
+    def define(self, p: Parse, lang: str) -> tuple:
+        term = next(g for g in GLOSSARY if g in p.concepts)
+        fr, en = GLOSSARY[term]
+        return _t(lang, fr, en), {"intent": "define", "term": term}
+
+    def languages(self, p: Parse, lang: str) -> tuple:
+        m = language.faculty_manifest()
+        return _t(lang,
+                  f"Je comprends le **français** et l'**anglais** de base : c'est une faculté **innée**, écrite par "
+                  f"mes concepteurs ({m['n_forms']} formes de mots, {len(m['concepts'])} concepts, plus la grammaire "
+                  "des questions, de la négation, des élisions et des fautes de frappe courantes). Elle est déclarée "
+                  "comme telle dans mon état initial, séparément de ce que j'ai appris.\n\n"
+                  "Ce n'est **pas** un modèle de langage : je comprends ce qui parle de moi (connaissances, règles, "
+                  "suites, stade, limites, curiosité, exploration...), pas n'importe quel sujet. Les mots qui me "
+                  f"manquent, tu peux me les apprendre (j'en ai appris {self.lexicon.size()} de toi).",
+                  f"I understand basic **French** and **English**: it is an **innate** faculty written by my "
+                  f"designers ({m['n_forms']} word forms, {len(m['concepts'])} concepts, plus the grammar of "
+                  "questions, negation, contractions and common typos). It is declared as such in my initial state, "
+                  "separately from what I have learned.\n\n"
+                  "It is **not** a language model: I understand what is about me (knowledge, rules, sequences, "
+                  "stage, limitations, curiosity, exploring...), not any topic. You can teach me the words I lack "
+                  f"(I've learned {self.lexicon.size()} from you)."), {"intent": "languages"}
+
+    def smalltalk(self, p: Parse, lang: str) -> tuple:
+        n_ep = self.ltm.count("episodes")
+        n_val = self.ltm.db.execute("SELECT COUNT(*) FROM knowledge WHERE status='validated' AND kind!='lexical'"
+                                    ).fetchone()[0]
+        extra = _t(lang, f" et {n_val} connaissance(s) validée(s)", f" and {n_val} validated belief(s)")
+        return _t(lang, f"Je n'ai pas d'émotions, donc je ne vais ni bien ni mal. Ce que je peux mesurer : "
+                        f"{n_ep} épisode(s) vécus en mémoire{extra}. Donne-moi une suite si tu veux que j'apprenne "
+                        "quelque chose de nouveau.",
+                  f"I don't have feelings, so I'm neither well nor unwell. What I can measure: {n_ep} episode(s) "
+                  f"experienced in memory{extra}. Give me a sequence if you'd like me to learn something new."), \
+            {"intent": "smalltalk"}
+
+    def bye(self, p: Parse, lang: str) -> tuple:
+        return _t(lang, "Au revoir. Tout ce que j'ai appris aujourd'hui reste dans ma mémoire pour la prochaine fois.",
+                  "Goodbye. Everything I learned today stays in my memory for next time."), {"intent": "bye"}
+
+    def declined(self, p: Parse, lang: str) -> tuple:
+        return _t(lang, "D'accord, je ne le fais pas.", "Alright, I won't."), {"intent": "declined"}
+
+    def unknown_topic(self, p: Parse, lang: str) -> str:
+        words = ", ".join(f"« {w} »" for w in p.topic[:6])
+        if p.qtype:
+            head = _t(lang, f"Je comprends que tu me poses une question à propos de {words}, mais je n'en sais rien : "
+                            "je n'ai aucune expérience de ce sujet et je ne connais que ce que j'ai vécu moi-même.",
+                      f"I understand you are asking me about {words}, but I know nothing about it: I have no "
+                      "experience of that subject and I only know what I have experienced myself.")
+        else:
+            head = _t(lang, f"Je comprends la structure de ta phrase, mais pas les mots {words} : ils ne sont ni "
+                            "dans mon vocabulaire inné ni dans ce que tu m'as appris.",
+                      f"I understand the structure of your sentence, but not the words {words}: they are neither in "
+                      "my innate vocabulary nor among those you taught me.")
+        return head + _t(lang, " Je préfère le dire plutôt que d'inventer une réponse.\n\nSi ta phrase correspond à "
+                               "l'une de mes commandes, choisis-la ci-dessous : j'apprendrai ces mots.",
+                         " I'd rather say so than make up an answer.\n\nIf your sentence matches one of my commands, "
+                         "pick it below and I'll learn those words.")
+
     # ---------------------------------------------------------------- framing
     def intro(self, lang: str) -> str:
         return _t(lang,
                   "Bonjour. Je suis **GENESIS**, un système cognitif expérimental. Je ne suis **pas** un modèle de "
-                  "langage : je comprends quelques commandes simples et j'apprends les mots que tu m'enseignes.\n\n"
-                  "Tout ce que je sais, je l'ai appris par expérience, et je peux montrer les épisodes qui le "
-                  "justifient. Donne-moi une suite de nombres entiers, par exemple `3, 7, 11, 15, 19, 23`, et "
+                  "langage : je comprends le français et l'anglais de base (une faculté innée, limitée à ce qui "
+                  "parle de moi), et j'apprends les mots que tu m'enseignes.\n\n"
+                  "Tout ce que je sais du monde, je l'ai appris par expérience, et je peux montrer les épisodes qui "
+                  "le justifient. Donne-moi une suite de nombres entiers, par exemple `3, 7, 11, 15, 19, 23`, et "
                   "j'essaierai d'en découvrir la règle.",
                   "Hello. I am **GENESIS**, an experimental cognitive system. I am **not** a language model: I "
-                  "understand a few simple commands and learn the words you teach me.\n\n"
-                  "Everything I know I learned from experience, and I can show the episodes that justify it. Give "
-                  "me a sequence of integers, e.g. `3, 7, 11, 15, 19, 23`, and I will try to discover its rule.")
+                  "understand basic French and English (an innate faculty, limited to what is about me), and I learn "
+                  "the words you teach me.\n\n"
+                  "Everything I know about the world I learned from experience, and I can show the episodes that "
+                  "justify it. Give me a sequence of integers, e.g. `3, 7, 11, 15, 19, 23`, and I will try to "
+                  "discover its rule.")
 
     def help(self, lang: str) -> str:
         return _t(lang,
-                  "Ce que je peux faire (commandes fixées par mes concepteurs, pas apprises) :\n"
+                  "Parle-moi normalement en français ou en anglais. Ce que je sais faire :\n"
                   "- une **suite d'entiers** (≥ 4) → je cherche la règle en prédisant chaque terme\n"
-                  "- `suite 30 34` → je lis d'autres termes de la dernière suite\n"
-                  "- `prédis 10` → les 10 termes suivants selon ma règle\n"
-                  "- `explique 12` / `pourquoi` → les épisodes qui justifient la croyance #12\n"
-                  "- `que sais-tu ?` → mes connaissances\n"
-                  "- `explorer 100` → j'expérimente seul dans un monde isolé aux règles cachées\n"
-                  "- `stade` · `limites` · `questions` · `vocabulaire` (les mots appris de toi)\n"
-                  "- une phrase que je ne connais pas → réponds avec la commande voulue : j'apprendrai tes mots",
-                  "What I can do (commands fixed by my designers, not learned):\n"
+                  "- « continue avec 30 34 » → je lis d'autres termes de la dernière suite\n"
+                  "- « prédis les 10 suivants » → la suite selon ma règle\n"
+                  "- « pourquoi ? » / « explique la 12 » → les épisodes qui justifient une croyance\n"
+                  "- « qu'est-ce que tu sais ? » · « où en es-tu ? » · « quelles sont tes limites ? »\n"
+                  "- « qu'est-ce que tu ignores ? » · « quels mots t'ai-je appris ? »\n"
+                  "- « va explorer 100 fois » → j'expérimente seul dans un monde isolé aux règles cachées\n"
+                  "- « c'est quoi une règle ? » → je définis mes propres notions\n"
+                  "- un mot que je ne connais pas → dis-moi quelle commande tu voulais : j'apprendrai ce mot",
+                  "Talk to me normally in English or French. What I can do:\n"
                   "- a **sequence of integers** (≥ 4) → I look for its rule by predicting each term\n"
-                  "- `continue 30 34` → I read more terms of the last sequence\n"
-                  "- `predict 10` → the next 10 terms according to my rule\n"
-                  "- `explain 12` / `why` → the episodes that justify belief #12\n"
-                  "- `what do you know?` → my knowledge\n"
-                  "- `explore 100` → I experiment on my own in a sandboxed world with hidden rules\n"
-                  "- `stage` · `limitations` · `questions` · `vocabulary` (words learned from you)\n"
-                  "- a sentence I don't know → reply with the command you meant: I will learn your words")
+                  "- “continue with 30 34” → I read more terms of the last sequence\n"
+                  "- “predict the next 10” → the sequence according to my rule\n"
+                  "- “why?” / “explain belief 12” → the episodes that justify a belief\n"
+                  "- “what do you know?” · “how far along are you?” · “what are your limitations?”\n"
+                  "- “what don't you know?” · “which words did I teach you?”\n"
+                  "- “go explore 100 times” → I experiment on my own in a sandboxed world with hidden rules\n"
+                  "- “what is a rule?” → I define my own notions\n"
+                  "- a word I don't know → tell me which command you meant: I'll learn that word")
 
     def not_understood(self, lang: str) -> str:
         return _t(lang,
-                  "Je ne comprends pas cette phrase : je n'ai pas de modèle de langage et ces mots me sont "
-                  "inconnus. Je préfère le dire plutôt que de faire semblant.\n\n"
+                  "Je ne comprends pas cette phrase. Je connais le français et l'anglais de base, mais seulement "
+                  "pour parler de moi et de mes expériences, et ces mots-là me sont inconnus. Je préfère le dire "
+                  "plutôt que de faire semblant.\n\n"
                   "**Apprends-les-moi :** réponds avec la commande que tu voulais dire (choisis-la ci-dessous ou "
                   "tape-la) et j'associerai tes mots à cette commande. La prochaine fois, je proposerai cette "
                   "interprétation, puis je l'utiliserai seul une fois validée par mes prédictions.\n\n"
                   + self.help(lang),
-                  "I don't understand that sentence: I have no language model and these words are unknown to me. "
-                  "I'd rather say so than pretend.\n\n"
+                  "I don't understand that sentence. I know basic English and French, but only to talk about myself "
+                  "and my experiences, and these words are unknown to me. I'd rather say so than pretend.\n\n"
                   "**Teach me:** reply with the command you meant (pick it below or type it) and I'll associate "
                   "your words with it. Next time I'll propose that interpretation, and use it on my own once my "
                   "predictions have validated it.\n\n" + self.help(lang))

@@ -32,8 +32,17 @@ python -m venv .venv && .venv/bin/pip install pytest
 ## Chat entry point
 
 `python -m genesis chat` serves a ChatGPT-style page: a sidebar with persistent conversation history, message
-bubbles, suggestions, FR/EN. **There is no language model behind it.** GENESIS understands only a small,
-designer-provided command grammar (innate interface, not acquired knowledge):
+bubbles, suggestions, FR/EN. **There is no language model behind it.** GENESIS is born with an **innate
+bilingual faculty** (`language.py`): a hand-written French/English lexicon (~350 word forms, ~30 concepts) about
+its own interface and cognition, plus grammatical cues: elisions and contractions, interrogatives, verb inversion,
+negation, light stemming and one-typo tolerance. It is declared at birth in `meta.innate_language` (versioned
+digest; upgrades are logged in `innate_language_history`, never silent), and audited to contain **no world
+knowledge** (no digits, no rule vocabulary such as "plus", "double", "fibonacci", no environment terms). You can talk
+naturally ("Qu'as-tu appris jusqu'ici ?", "How far along is your development?", "c'est quoi une règle ?",
+"n'explore pas"). Questions about anything else are parsed and answered honestly ("I understand you are asking about
+« capital », « France », but I know nothing about it"). On 38 held-out sentences written after the parser was frozen:
+38/38 intents correct, language detection 100%, 0 out-of-scope questions answered as if known (`RESULTS.md`).
+What the faculty maps sentences to:
 
 - a sequence of ≥ 4 integers (`3, 7, 11, 15, 19`) is fed term by term through the real cognitive cycle
   (`Genesis.live`): the agent predicts each term *before* reading it, then reports the rule it found (validated,
@@ -43,13 +52,14 @@ designer-provided command grammar (innate interface, not acquired knowledge):
 - `what do you know?`, `stage`, `limitations`, `questions`, `explore 100` (autonomous experimentation in a new
   sandboxed hidden world) answer from long-term memory only.
 
-**Unknown sentences are learned, not guessed** (`lexicon.py`). GENESIS first says it doesn't understand and asks
+**Words outside the innate faculty are learned, not guessed** (`lexicon.py`): slang, jargon, invented words. GENESIS first says it doesn't understand and asks
 which command was meant. It then associates the sentence's words with that command (cross-situational learning,
 naive-Bayes combination). The next time, it *proposes* the interpretation ("do you mean `stage`?"). It acts on
 its own only once the word→command mappings have been validated by ≥ 2 confirmed predictions, says so, and
 accepts `no` as a correction. Repeated errors refute a mapping. Each learned word is a knowledge item
 (`kind="lexical"`, provenance `user-taught`) backed by episodes, so `explain` and `vocabulary` show why it is held.
-This is word→command association only: no syntax, no meaning beyond the innate commands. Numbers typed by the user are
+Learned words are word→command associations only; the innate faculty handles one request per message and has no
+open-domain meaning. Numbers typed by the user are
 stored as episodes with provenance `user-provided`, kept distinct from the agent's own observations. The server
 binds to localhost, accepts only same-origin JSON POSTs ≤ 16 KB, and holds the memory DB for its lifetime (don't
 run `demo`/`approve` on the same DB at the same time).
@@ -113,7 +123,8 @@ genesis/
   autonomy.py        stage 6: learning-progress allocation across worlds, self-generated objectives
   self_improvement.py stage 7: sandboxed evaluation of config variants, human approval, rollback, limitations
   dashboard.py       read-only monitoring web UI + JSON API (stdlib only)
-  chat.py            chat engine: small FR/EN command grammar, user sequences learned via the cognitive cycle
+  language.py        innate FR/EN faculty: lexicon about itself + grammar cues; declared, versioned, audited
+  chat.py            chat engine: maps parses to intents, user sequences learned via the cognitive cycle
   lexicon.py         learned vocabulary: word→command associations taught by the user, validated by predictions
   chat_server.py     ChatGPT-style web UI + JSON API over chat.py (stdlib only)
   experiments.py     benchmarks, baselines and controls

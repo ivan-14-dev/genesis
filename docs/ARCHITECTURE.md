@@ -67,7 +67,8 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Developmental curriculum | `metacognition.py: CURRICULUM` | Piaget-inspired staged development with measurable gates | stages 0–7 gated |
 | Autonomous exploration | `autonomy.py: Explorer` | Learning-progress–driven allocation (Oudeyer & Kaplan, intelligent adaptive curiosity); self-generated objectives | implemented (stage 6) |
 | Self-improvement | `self_improvement.py` | Bounded, reproducible A/B evaluation of allowlisted parameters on trial + holdout seeds; human approval; rollback | implemented (stage 7) |
-| Entry point (chat) | `chat.py`, `chat_server.py` | Interaction channel, not language understanding: a small innate command grammar routes user input to the cycle (`live` on user-provided sequences) or to memory queries (`explain`, knowledge, stage, limitations, curiosity gaps). Unknown sentences are taught by the user and learned as word→command associations (`lexicon.py`, cross-situational learning; Siskind 1996, Yu & Smith 2007), executed autonomously only after validation by confirmed predictions | implemented (no LLM; stdlib HTTP + vanilla JS, ChatGPT-style UI, persistent conversations) |
+| Innate language faculty | `language.py` | Hand-written FR/EN lexicon about the agent itself + grammatical cues → `Parse` (language, concepts, question type, negation, unknown topic words, typo corrections). Like the arithmetic primitives, it is given, declared and audited, not learned. No pretrained model | implemented (59 + 38 test sentences, see RESULTS) |
+| Entry point (chat) | `chat.py`, `chat_server.py` | Interaction channel: the innate language faculty's parse is mapped to an intent that routes user input to the cycle (`live` on user-provided sequences) or to memory queries (`explain`, knowledge, stage, limitations, curiosity gaps). Unknown sentences are taught by the user and learned as word→command associations (`lexicon.py`, cross-situational learning; Siskind 1996, Yu & Smith 2007), executed autonomously only after validation by confirmed predictions | implemented (no LLM; stdlib HTTP + vanilla JS, ChatGPT-style UI, persistent conversations) |
 | Observability | `dashboard.py` | Read-only inspection of memory; every element traceable to DB rows (`explain`) | implemented (stdlib HTTP + vanilla JS) |
 
 ## C. Module diagram
@@ -180,8 +181,15 @@ changes) and audited in `meta.stage0_audit`.
 | Safety policy (frozen) | Which rule *shapes* tend to work (procedural memory) |
 | | Whether something is learnable at all (judged "unpredictable" from evidence) |
 
+| Bilingual FR/EN language faculty (`language.py`): ~350 word forms about GENESIS itself → ~30 concepts, grammar cues (elision, contraction, interrogatives, inversion, negation, stemming, one-typo tolerance) | Any meaning outside that vocabulary (slang, jargon, world topics) – taught by the user (`lexicon.py`) |
+
+The language faculty is recorded separately in `meta.innate_language` (own digest, version, session installed);
+a designer upgrade is allowed but logged in `meta.innate_language_history`. It is interface knowledge, not world
+knowledge: `language.audit()` rejects digits, rule vocabulary (`WORLD_TERMS`: "plus", "double", "modulo",
+"fibonacci", "arithmetic"...) and environment terms (the tests feed it the hidden rule families and kinds).
+
 Stage-0 audit checks (all must pass): empty memory, `domain_knowledge == []`, `pretrained_models == []`, no
-learners. No pretrained model, embedding, dataset or LLM is used anywhere.
+learners, language faculty free of world knowledge. No pretrained model, embedding, dataset or LLM is used anywhere.
 
 ## E. Learning algorithms per developmental stage
 
@@ -223,7 +231,7 @@ Details of the core learner (`RuleLearner`):
 | `learner_state` | Model state | serialised learners (data, hypotheses, statistics) to resume across sessions |
 | `knowledge` (`kind=lexical`) | Learned vocabulary | `lexicon/<word>` → intent, P(intent\|word), support/contra counts, forward predictions right/wrong, status; evidence = `language` episodes (taught/confirmed/rejected) |
 | `conversations` + `chat_messages` | Interaction log | conversation title/lang; messages (role, text, meta JSON with intent, knowledge id, status). Data typed by the user enters `episodes` with provenance `user-provided` (external information, distinct from own observation) |
-| `meta` | Identity | innate manifest + digest, safety digest, stage-0 audit, session counter, review schedule |
+| `meta` | Identity | innate manifest + digest, innate language faculty manifest + upgrade history, safety digest, stage-0 audit, session counter, review schedule |
 
 Consolidation never deletes episodes; refuted beliefs are kept with their refuting evidence.
 `checkpoint()` / `restore()` provide rollback.
@@ -255,7 +263,7 @@ future source must be tagged with provenance `external` and kept separate from e
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
 | 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
 | 7 ✅ | **Observability service**: read-only API over the memory DB + dashboard (stage, curves, beliefs, `explain`). Built with stdlib `http.server` + vanilla JS instead of FastAPI/React: no measured need yet justifies the dependencies | every dashboard element traceable to DB rows |
-| 8 (started) | Simulated physics world; text interaction grounded in learned concepts. *Done so far:* chat entry point with an innate command grammar (FR/EN) routing user sequences through the cycle and answering from memory; word→command associations learned from user teaching (100% on unseen paraphrases, 0 wrong autonomous actions, see RESULTS). No syntax or compositional meaning yet | defined when phase 5 is complete |
+| 8 (started) | Simulated physics world; text interaction grounded in learned concepts. *Done so far:* chat entry point with an innate bilingual FR/EN faculty (rule-based, about the agent itself; out-of-scope questions answered honestly) routing user sequences through the cycle and answering from memory; word→command associations learned from user teaching for words outside the faculty (100% on unseen paraphrases, 0 wrong autonomous actions, see RESULTS). No compositional semantics, one intent per message, no grounding of new concepts in language yet | defined when phase 5 is complete |
 
 Dependencies are added only when their phase begins and a measured need justifies them (PyTorch at phase 5;
 FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when there are services to orchestrate).

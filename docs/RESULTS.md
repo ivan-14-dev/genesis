@@ -179,31 +179,53 @@ more false validations. It is then stored as `pending-approval`; only a named hu
 speed (fewer forward checks), which a human should weigh before approving. Limitations found in its own records
 (stuck problems, streams judged unpredictable, blocked gates) are reported by `limitations()`.
 
+## Innate FR/EN language faculty (`language.py`, `experiments.run_language_understanding`)
+
+This measures a **designer-provided** faculty, not learning: no number here is evidence that GENESIS acquired
+language. Each sentence is sent to a fresh conversation (after a sequence when the intent needs one), and the
+routed intent is compared with the expected one.
+
+| Set | n | Intent accuracy | Language detection | Out-of-scope answered as if known |
+|---|---|---|---|---|
+| Development set (`LANGUAGE_BENCH`, used to find and fix 5 parser bugs, so **not** held-out) | 59 | 100% (91.5% before the fixes) | 100% | 0 |
+| Held-out set (`LANGUAGE_HELDOUT`, written after the fixes, measured once, no tuning afterwards) | 38 | **100%** | 100% | 0 |
+
+The held-out set has 15 FR + 15 EN paraphrases, 2 negations, 2 typos and 4 out-of-scope questions. Both sets were
+written by the same designers as the lexicon, so this measures coverage of *their* phrasing. Failures observed on
+harder probes, kept as known limits:
+- one intent per message ("explore puis dis-moi tes limites" → explore only);
+- negation scope is the whole sentence ("pas besoin d'explorer, dis-moi ce que tu sais" → help);
+- no reference to earlier turns or time ("la suite de tout à l'heure"), no idioms outside the list ("figure
+  out");
+- no SMS spelling ("t es ki");
+- no open-domain meaning: "tu es nul" is only "a sentence about « nul »".
+
 ## Word learning in the chat (`lexicon.py`, `experiments.run_word_learning`)
 
-A simulated user sends 15 training sentences (5 commands × 3 paraphrases, none containing an innate keyword) in
-random order, 4 passes. It answers questions truthfully and names the intended command when GENESIS doesn't
-understand. Evaluation uses 15 **unseen** paraphrases, read without learning, plus 6 unrelated control sentences.
-The figures are the means over seeds 100–109.
+Since the innate faculty understands ordinary French, this experiment uses **slang/jargon outside it** ("balance
+tes trouvailles", "ton palier", "tes galères", "je suis paumé"...). A simulated user sends 15 training sentences
+(5 commands × 3 paraphrases) in random order over 4 passes. It answers questions truthfully and picks the intended
+command when GENESIS doesn't understand. Evaluation uses 15 **unseen** paraphrases, read without learning, plus 6
+unrelated control sentences. The figures are the means over seeds 100–109; seed 100's per-pass trace is:
 
 | Pass | not understood | proposed, wrong | proposed, correct | acted alone, correct | acted alone, wrong |
 |---|---|---|---|---|---|
-| 1 | 9.0 | 4.4 | 1.6 | 0 | 0 |
-| 2 | 0 | 0 | 14.2 | 0.8 | 0 |
-| 3 | 0 | 0 | 12.9 | 2.1 | 0 |
-| 4 | 0 | 0 | 1.2 | 13.8 | 0 |
+| 1 | 8 | 6 | 1 | 0 | 0 |
+| 2 | 0 | 0 | 14 | 1 | 0 |
+| 3 | 0 | 0 | 13 | 2 | 0 |
+| 4 | 0 | 0 | 1 | 14 | 0 |
 
-| Metric | Value |
+| Metric (seeds 100–109) | Value |
 |---|---|
-| Vocabulary learned / validated mappings | 38 words / 28.1 |
+| Vocabulary learned / validated mappings | 35 words / 26 |
 | Unseen paraphrases: top interpretation correct | **100%** (chance 9.1%), min over seeds 100% |
-| Unseen paraphrases: would act alone / precision | 73% / **100%** |
-| Control sentences acted on / asked about | 0 / 1 ("quelle heure est-il", via « est » learned from « qu'est-ce qui… ») |
-| User exchanges for the whole run | 107.7 |
+| Unseen paraphrases: would act alone / precision | 67% / **100%** |
+| Control sentences acted on / asked about | 0 / 0 |
+| Wrong autonomous actions during training | 0 |
+| User exchanges for the whole run | 108 |
 
-Limits: the unseen paraphrases share content words with the training ones by construction. A sentence with no
-taught word stays "not understood". Function words are only diluted statistically, not understood. This is
-association, not language comprehension.
+Limits: the unseen paraphrases share content words with the training ones by construction. Learned words are
+word→command associations, combined statistically; they add no new meaning beyond the innate commands.
 
 ## Developmental gating
 

@@ -228,7 +228,7 @@ const T = FR ? {
          ['explorer 100','expérimenter seul dans un monde caché'],['que sais-tu ?','ce que ma mémoire contient']],
   status:{validated:'validée',candidate:'candidate',unpredictable:'imprévisible',unknown:'inconnue'},
   learnedWord:'mots appris',
-  intents:{clarify:'vérification',vocabulary:'vocabulaire','teach-request':'apprentissage de mots','yes-no':'oui/non',thanks:'merci',continue:'apprentissage','too-short':'trop court',sequence:'apprentissage',explain:'preuves',knowledge:'mémoire',explore:'exploration',stage:'stade',limitations:'limites',questions:'curiosité',predict:'prédiction','not-understood':'non compris',help:'aide',intro:'présentation',refused:'refusé'}
+  intents:{clarify:'vérification',vocabulary:'vocabulaire','teach-request':'apprentissage de mots','yes-no':'oui/non',thanks:'merci',continue:'apprentissage','too-short':'trop court',sequence:'apprentissage',explain:'preuves',knowledge:'mémoire',explore:'exploration',stage:'stade',limitations:'limites',questions:'curiosité',predict:'prédiction','not-understood':'non compris',help:'aide',intro:'présentation',refused:'refusé',define:'définition',languages:'langues',smalltalk:'conversation',bye:'au revoir',declined:'refus','unknown-topic':'hors de mes connaissances'}
 } : {
   new:'New chat', history:'History', model:'· no language model', hello:'What should I learn?',
   sub:"I only know what I learned from experience. Give me a number sequence: I will predict each term before reading it, then tell you which rule I found and on what evidence.",
@@ -239,7 +239,7 @@ const T = FR ? {
   cards:[['3, 7, 11, 15, 19, 23, 27','an arithmetic sequence'],['1 1 2 3 5 8 13 21 34','a recurrence'],
          ['explore 100','experiment alone in a hidden world'],['what do you know?','what my memory holds']],
   learnedWord:'learned words',
-  intents:{clarify:'check',vocabulary:'vocabulary','teach-request':'word learning','yes-no':'yes/no',thanks:'thanks',continue:'learning','too-short':'too short',sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused'}
+  intents:{clarify:'check',vocabulary:'vocabulary','teach-request':'word learning','yes-no':'yes/no',thanks:'thanks',continue:'learning','too-short':'too short',sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused',define:'definition',languages:'languages',smalltalk:'small talk',bye:'goodbye',declined:'declined','unknown-topic':'outside my knowledge'}
 };
 document.querySelectorAll('[data-i]').forEach(e => e.textContent = T[e.dataset.i]);
 const $ = id => document.getElementById(id);

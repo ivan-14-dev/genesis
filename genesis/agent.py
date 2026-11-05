@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from .adapters import LabAdapter, PassiveLabAdapter, SequenceAdapter, sequence_rollout_probes
+from . import language
 from .attention import Attention
 from .consolidation import Consolidation
 from .curiosity import Curiosity
@@ -124,6 +125,7 @@ class Genesis:
         manifest = innate_manifest()
         self.ltm.set_meta("born_ts", time.time())
         self.ltm.set_meta("innate_manifest", manifest)
+        self.ltm.set_meta("innate_language", {**language.faculty_manifest(), "installed_session": 0})
         self.ltm.set_meta("safety_policy_digest", self.safety.digest())
         self.ltm.set_meta("session", 0)
         self.ltm.set_meta("interactions", 0)
@@ -143,8 +145,24 @@ class Genesis:
             "no_domain_knowledge_in_manifest": manifest["domain_knowledge"] == [],
             "no_pretrained_models": manifest["pretrained_models"] == [],
             "no_learners": not self.learners,
+            "language_faculty_has_no_world_knowledge": language.audit()["passed"],
         }
         return {"passed": all(checks.values()), "checks": checks, "counts": counts}
+
+    def _check_language_faculty(self) -> None:
+        """The innate language faculty is versioned separately from the core manifest: a designer upgrade is
+        allowed but never silent (it is logged with the session it was installed in), and it must still pass
+        the no-world-knowledge audit."""
+        current, stored = language.faculty_manifest(), self.ltm.get_meta("innate_language")
+        if not language.audit()["passed"]:
+            raise IntegrityError("innate language faculty contains forbidden content")
+        if stored is None or stored["digest"] != current["digest"]:
+            history = self.ltm.get_meta("innate_language_history") or []
+            history.append({"session": self.session, "ts": time.time(),
+                            "from": stored and stored["digest"], "to": current["digest"]})
+            self.ltm.set_meta("innate_language_history", history)
+            self.ltm.set_meta("innate_language", {**current, "installed_session": self.session})
+            self.ltm.commit()
 
     def _wake(self) -> None:
         if self.ltm.get_meta("innate_manifest")["digest"] != innate_manifest()["digest"]:
@@ -154,6 +172,7 @@ class Genesis:
         self.session = self.ltm.get_meta("session") + 1
         self.interactions = self.ltm.get_meta("interactions")
         self.ltm.set_meta("session", self.session)
+        self._check_language_faculty()
         self.reviews = self.ltm.get_meta("reviews") or {}
         self.resolution_costs = self.ltm.get_meta("resolution_costs") or {}
         self.context_obs = {r[0]: r[1] for r in self.ltm.db.execute(
