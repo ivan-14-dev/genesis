@@ -313,6 +313,101 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
                 "late_worlds_accuracy": _mean(acc[late])}
 
 
+# ============================================================ word learning
+# Test data written by the designers for evaluation only. The agent never sees it as a list: a simulated
+# user sends these sentences one at a time and answers GENESIS's questions truthfully. No sentence contains an
+# innate command keyword, so every success must come from words learned during the run.
+WORD_CORPUS = {
+    "knowledge": (["montre tes souvenirs", "raconte tes découvertes", "liste tes trouvailles"],
+                  ["tes souvenirs stp", "découvertes récentes ?", "tes trouvailles du jour"]),
+    "stage": (["où en es-tu", "ta progression ?", "ton avancement actuel"],
+              ["tu en es où", "où en est ta progression", "avancement ?"]),
+    "limitations": (["tes points faibles", "qu'est-ce qui te pose problème", "tes défauts"],
+                    ["tes défauts principaux", "points faibles ?", "un problème ?"]),
+    "questions": (["qu'est-ce qui t'intrigue", "tes interrogations", "ce qui te rend curieux"],
+                  ["ce qui t'intrigue", "tes interrogations actuelles", "curieux de quoi ?"]),
+    "help": (["je suis perdu", "comment ça marche", "comment t'utiliser"],
+             ["je suis un peu perdu", "ça marche comment ?", "t'utiliser comment ?"]),
+}
+WORD_CONTROL = ["il pleut dehors", "quelle heure est-il", "j'aime le chocolat", "ferme la fenêtre",
+                "le chat dort", "achète du pain"]
+WORD_COMMANDS = {"knowledge": "que sais-tu ?", "stage": "stade", "limitations": "limites",
+                 "questions": "questions", "help": "aide"}
+
+
+def run_word_learning(seed: int, passes: int = 4) -> dict:
+    """Interactive word learning with a truthful simulated user, then evaluation on unseen sentences."""
+    from .chat import ChatEngine
+    from .lexicon import ASK_POSTERIOR
+    rng = random.Random(seed)
+    with _tmpdb() as path:
+        agent = Genesis(path, seed=seed)
+        eng = ChatEngine(agent)
+        cid = eng.new_conversation("fr")["id"]
+        say = lambda t: eng.send(cid, t, "fr")["reply"]["meta"]
+        train = [(i, u) for i, (tr, _) in WORD_CORPUS.items() for u in tr]
+        log = []
+        exchanges = 0
+        for p in range(passes):
+            order = train[:]
+            rng.shuffle(order)
+            for intent, u in order:
+                m = say(u)
+                exchanges += 1
+                if m.get("interpreted"):
+                    ok = m["intent"] == intent
+                    log.append((p, "acted-correct" if ok else "acted-wrong"))
+                    if not ok:
+                        say("non")
+                        say(WORD_COMMANDS[intent])
+                        exchanges += 2
+                elif m["intent"] == "clarify":
+                    ok = m["proposed"] == intent
+                    log.append((p, "asked-correct" if ok else "asked-wrong"))
+                    say("oui" if ok else "non")
+                    exchanges += 1
+                    if not ok:
+                        say(WORD_COMMANDS[intent])
+                        exchanges += 1
+                elif m["intent"] == "not-understood":
+                    log.append((p, "not-understood"))
+                    say(WORD_COMMANDS[intent])
+                    exchanges += 1
+                else:
+                    log.append((p, "innate"))
+        held = [(i, u) for i, (_, ho) in WORD_CORPUS.items() for u in ho]
+        res = {"correct": 0, "would_act_correct": 0, "would_act_wrong": 0, "unknown": 0}
+        for intent, u in held:
+            g = eng.lexicon.interpret(u)
+            if g is None:
+                res["unknown"] += 1
+                continue
+            res["correct"] += g.intent == intent
+            if g.act:
+                res["would_act_correct" if g.intent == intent else "would_act_wrong"] += 1
+        control = [eng.lexicon.interpret(u) for u in WORD_CONTROL]
+        per_pass = {}
+        for p, kind in log:
+            per_pass.setdefault(p, {}).setdefault(kind, 0)
+            per_pass[p][kind] += 1
+        out = {"seed": seed, "train_sentences": len(train), "user_exchanges": exchanges,
+               "per_pass": [per_pass.get(p, {}) for p in range(passes)],
+               "vocabulary": eng.lexicon.size(),
+               "validated_mappings": sum(1 for e in eng.lexicon.entries() if e["status"] == "validated"),
+               "heldout_n": len(held), "heldout_accuracy": round(res["correct"] / len(held), 4),
+               "heldout_unknown": res["unknown"],
+               "heldout_act_precision": round(res["would_act_correct"] /
+                                              max(res["would_act_correct"] + res["would_act_wrong"], 1), 4),
+               "heldout_act_rate": round((res["would_act_correct"] + res["would_act_wrong"]) / len(held), 4),
+               "control_n": len(control),
+               "control_would_act": sum(1 for g in control if g and g.act),
+               "control_would_ask": sum(1 for g in control if g and not g.act and g.posterior >= ASK_POSTERIOR),
+               "chance_accuracy": round(1 / len(eng.lexicon.intents), 4),
+               "acted_wrong_during_training": sum(1 for _, k in log if k == "acted-wrong")}
+        agent.close()
+        return out
+
+
 # ==================================================================== suite
 def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
     seeds = list(seeds)

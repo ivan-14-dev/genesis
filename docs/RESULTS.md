@@ -179,6 +179,32 @@ more false validations. It is then stored as `pending-approval`; only a named hu
 speed (fewer forward checks), which a human should weigh before approving. Limitations found in its own records
 (stuck problems, streams judged unpredictable, blocked gates) are reported by `limitations()`.
 
+## Word learning in the chat (`lexicon.py`, `experiments.run_word_learning`)
+
+A simulated user sends 15 training sentences (5 commands × 3 paraphrases, none containing an innate keyword) in
+random order, 4 passes. It answers questions truthfully and names the intended command when GENESIS doesn't
+understand. Evaluation uses 15 **unseen** paraphrases, read without learning, plus 6 unrelated control sentences.
+The figures are the means over seeds 100–109.
+
+| Pass | not understood | proposed, wrong | proposed, correct | acted alone, correct | acted alone, wrong |
+|---|---|---|---|---|---|
+| 1 | 9.0 | 4.4 | 1.6 | 0 | 0 |
+| 2 | 0 | 0 | 14.2 | 0.8 | 0 |
+| 3 | 0 | 0 | 12.9 | 2.1 | 0 |
+| 4 | 0 | 0 | 1.2 | 13.8 | 0 |
+
+| Metric | Value |
+|---|---|
+| Vocabulary learned / validated mappings | 38 words / 28.1 |
+| Unseen paraphrases: top interpretation correct | **100%** (chance 9.1%), min over seeds 100% |
+| Unseen paraphrases: would act alone / precision | 73% / **100%** |
+| Control sentences acted on / asked about | 0 / 1 ("quelle heure est-il", via « est » learned from « qu'est-ce qui… ») |
+| User exchanges for the whole run | 107.7 |
+
+Limits: the unseen paraphrases share content words with the training ones by construction. A sentence with no
+taught word stays "not understood". Function words are only diluted statistically, not understood. This is
+association, not language comprehension.
+
 ## Developmental gating
 
 On the demo run (seed 0), the agent passes the gates for stages 0–7 one after another, each based on measured

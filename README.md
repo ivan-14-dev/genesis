@@ -43,7 +43,13 @@ designer-provided command grammar (innate interface, not acquired knowledge):
 - `what do you know?`, `stage`, `limitations`, `questions`, `explore 100` (autonomous experimentation in a new
   sandboxed hidden world) answer from long-term memory only.
 
-Anything else gets an explicit "I don't understand; I'm not a language model" reply. Numbers typed by the user are
+**Unknown sentences are learned, not guessed** (`lexicon.py`). GENESIS first says it doesn't understand and asks
+which command was meant. It then associates the sentence's words with that command (cross-situational learning,
+naive-Bayes combination). The next time, it *proposes* the interpretation ("do you mean `stage`?"). It acts on
+its own only once the word→command mappings have been validated by ≥ 2 confirmed predictions, says so, and
+accepts `no` as a correction. Repeated errors refute a mapping. Each learned word is a knowledge item
+(`kind="lexical"`, provenance `user-taught`) backed by episodes, so `explain` and `vocabulary` show why it is held.
+This is word→command association only: no syntax, no meaning beyond the innate commands. Numbers typed by the user are
 stored as episodes with provenance `user-provided`, kept distinct from the agent's own observations. The server
 binds to localhost, accepts only same-origin JSON POSTs ≤ 16 KB, and holds the memory DB for its lifetime (don't
 run `demo`/`approve` on the same DB at the same time).
@@ -108,6 +114,7 @@ genesis/
   self_improvement.py stage 7: sandboxed evaluation of config variants, human approval, rollback, limitations
   dashboard.py       read-only monitoring web UI + JSON API (stdlib only)
   chat.py            chat engine: small FR/EN command grammar, user sequences learned via the cognitive cycle
+  lexicon.py         learned vocabulary: word→command associations taught by the user, validated by predictions
   chat_server.py     ChatGPT-style web UI + JSON API over chat.py (stdlib only)
   experiments.py     benchmarks, baselines and controls
   demo.py, __main__.py

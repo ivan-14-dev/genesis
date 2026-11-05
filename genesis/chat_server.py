@@ -172,6 +172,9 @@ header{height:56px;flex:none;display:flex;align-items:center;gap:8px;padding:0 1
 .body a.kid{color:#7ab7ff;text-decoration:none;cursor:pointer}.body a.kid:hover{text-decoration:underline}
 .actions{display:flex;gap:4px;margin-top:6px;align-items:center;opacity:.0;transition:opacity .15s}
 .msg.genesis:hover .actions,.msg.genesis:last-child .actions{opacity:1}
+.choices{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.choice{background:transparent;color:#ececec;border:1px solid #424242;border-radius:999px;padding:6px 14px;font-size:14px;cursor:pointer}
+.choice:hover{background:#2f2f2f}
 .chip{font-size:11px;color:#8e8e8e;border:1px solid #333;border-radius:999px;padding:1px 8px;margin-left:4px}
 .dots span{display:inline-block;width:8px;height:8px;margin-right:4px;border-radius:50%;background:#b4b4b4;animation:b 1.2s infinite}
 .dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
@@ -218,23 +221,25 @@ const T = FR ? {
   new:'Nouvelle discussion', history:'Historique', model:'· sans modèle de langage', hello:'Que dois-je apprendre ?',
   sub:"Je ne sais que ce que j'ai appris par expérience. Donne-moi une suite de nombres : je prédirai chaque terme avant de le lire, puis je te dirai quelle règle j'ai trouvée, et avec quelles preuves.",
   placeholder:'Envoie une suite de nombres ou une commande…',
-  note:"GENESIS n'utilise aucun modèle de langage : il ne comprend que quelques commandes et n'affirme que ce que sa mémoire justifie.",
+  note:"GENESIS n'utilise aucun modèle de langage : il comprend quelques commandes, apprend les mots que tu lui enseignes et n'affirme que ce que sa mémoire justifie.",
   stage:'Stade', beliefs:'croyances', validated:'validées', episodes:'épisodes', copy:'Copier', copied:'Copié',
   untitled:'Nouvelle discussion', error:'Erreur : ', explain:'explique ',
   cards:[['3, 7, 11, 15, 19, 23, 27','une suite arithmétique'],['1 1 2 3 5 8 13 21 34','une récurrence'],
          ['explorer 100','expérimenter seul dans un monde caché'],['que sais-tu ?','ce que ma mémoire contient']],
   status:{validated:'validée',candidate:'candidate',unpredictable:'imprévisible',unknown:'inconnue'},
-  intents:{sequence:'apprentissage',explain:'preuves',knowledge:'mémoire',explore:'exploration',stage:'stade',limitations:'limites',questions:'curiosité',predict:'prédiction','not-understood':'non compris',help:'aide',intro:'présentation',refused:'refusé'}
+  learnedWord:'mots appris',
+  intents:{clarify:'vérification',vocabulary:'vocabulaire','teach-request':'apprentissage de mots','yes-no':'oui/non',thanks:'merci',continue:'apprentissage','too-short':'trop court',sequence:'apprentissage',explain:'preuves',knowledge:'mémoire',explore:'exploration',stage:'stade',limitations:'limites',questions:'curiosité',predict:'prédiction','not-understood':'non compris',help:'aide',intro:'présentation',refused:'refusé'}
 } : {
   new:'New chat', history:'History', model:'· no language model', hello:'What should I learn?',
   sub:"I only know what I learned from experience. Give me a number sequence: I will predict each term before reading it, then tell you which rule I found and on what evidence.",
   placeholder:'Send a number sequence or a command…',
-  note:'GENESIS uses no language model: it understands only a few commands and only claims what its memory justifies.',
+  note:'GENESIS uses no language model: it understands a few commands, learns the words you teach it, and only claims what its memory justifies.',
   stage:'Stage', beliefs:'beliefs', validated:'validated', episodes:'episodes', copy:'Copy', copied:'Copied',
   untitled:'New chat', error:'Error: ', explain:'explain ',
   cards:[['3, 7, 11, 15, 19, 23, 27','an arithmetic sequence'],['1 1 2 3 5 8 13 21 34','a recurrence'],
          ['explore 100','experiment alone in a hidden world'],['what do you know?','what my memory holds']],
-  intents:{sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused'}
+  learnedWord:'learned words',
+  intents:{clarify:'check',vocabulary:'vocabulary','teach-request':'word learning','yes-no':'yes/no',thanks:'thanks',continue:'learning','too-short':'too short',sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused'}
 };
 document.querySelectorAll('[data-i]').forEach(e => e.textContent = T[e.dataset.i]);
 const $ = id => document.getElementById(id);
@@ -276,6 +281,7 @@ function md(text) {
 function scrollDown() { thread.scrollTop = thread.scrollHeight; }
 function addMsg(m) {
   $('empty').style.display = 'none';
+  msgs.querySelectorAll('.choices').forEach(e => e.remove());
   const div = document.createElement('div');
   div.className = 'msg ' + m.role;
   if (m.role === 'user') {
@@ -286,7 +292,16 @@ function addMsg(m) {
     const st = meta.status ? ' · ' + ((T.status||{})[meta.status] || meta.status) : '';
     div.innerHTML = '<div class="logo">G</div><div class="body">' + md(m.text) +
       '<div class="actions"><button class="icon-btn copy" title="' + T.copy + '"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>' +
-      (intent ? '<span class="chip">' + esc(intent + st) + '</span>' : '') + '</div></div>';
+      (intent ? '<span class="chip">' + esc(intent + st) + '</span>' : '') +
+      (meta.learned_word || meta.interpreted ? '<span class="chip">' + esc(T.learnedWord) + '</span>' : '') + '</div></div>';
+    if (Array.isArray(meta.choices) && meta.choices.length) {
+      const box = document.createElement('div'); box.className = 'choices';
+      for (const c of meta.choices) {
+        const b = document.createElement('button'); b.className = 'choice'; b.textContent = c;
+        b.onclick = () => submit(c); box.appendChild(b);
+      }
+      div.querySelector('.body').insertBefore(box, div.querySelector('.actions'));
+    }
     div.querySelector('.copy').onclick = e => { navigator.clipboard && navigator.clipboard.writeText(m.text); e.currentTarget.title = T.copied; };
   }
   msgs.appendChild(div);
