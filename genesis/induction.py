@@ -14,6 +14,9 @@ Key properties
   were not used to construct it (forward predictions), never from fit alone.
 * Hypotheses that agree on every probe input are merged into one behavioural
   equivalence class, so ``(x + x)`` and ``(x * 2)`` do not split confidence.
+* Procedural memory (meta-learning): rule *shapes* that were validated before
+  are tried first. If an instantiation of a familiar shape explains all the
+  data, the exhaustive search is skipped; otherwise it runs as usual.
 """
 
 from __future__ import annotations
@@ -27,7 +30,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .expressions import Expr, app, const, enumerate_programs, if_eq
+import itertools
+
+from .expressions import (Expr, _trivial, app, const, enumerate_programs, fill_shape, if_eq, parse_shape,
+                          shape_slots)
 from .innate import INNATE_CONSTANTS
 
 
@@ -50,6 +56,8 @@ class InductionConfig:
     shape_bias: float = 1.0
     n_probes: int = 24
     max_proposed_constants: int = 12
+    library_max_shapes: int = 12
+    library_max_instances: int = 20000
 
 
 @dataclass
@@ -99,6 +107,14 @@ class LearnResult:
     refuted: list = field(default_factory=list)
 
 
+def _has_trivial(e: Expr) -> bool:
+    if e.op in ("var", "const"):
+        return False
+    if e.op != "if_eq" and _trivial(e.op, e.args[0], e.args[1]):
+        return True
+    return any(_has_trivial(a) for a in e.args)
+
+
 def _logsumexp(xs: list) -> float:
     m = max(xs)
     return m + math.log(sum(math.exp(x - m) for x in xs))
@@ -107,8 +123,13 @@ def _logsumexp(xs: list) -> float:
 class RuleLearner:
     def __init__(self, key: str, var_names: list, cfg: InductionConfig,
                  shape_prior: Optional[Callable[[str], float]] = None,
-                 probe_fn: Optional[Callable[["RuleLearner", Expr], list]] = None):
+                 probe_fn: Optional[Callable[["RuleLearner", Expr], list]] = None,
+                 shape_library: Optional[Callable[[], list]] = None):
         self.key = key
+        # shape_library() -> shapes from procedural memory, most successful first.
+        self.shape_library = shape_library
+        self.library_searches = 0
+        self.full_searches = 0
         # probe_fn generates the inputs on which behavioural equivalence is judged.
         # Default: independent random values (appropriate when the agent can intervene).
         self.probe_fn = probe_fn
@@ -267,7 +288,9 @@ class RuleLearner:
 
     def _induce(self) -> None:
         cfg = self.cfg
-        if self._prev_top is not None and self._prev_top.fwd_ok < 2 and len(self.data) >= cfg.unpredictable_min_n:
+        # Back off when the previous search failed: nothing survived, or its best rule kept failing.
+        failed = self._prev_top is None or self._prev_top.fwd_ok < 2
+        if self.n_inductions and failed and len(self.data) >= cfg.unpredictable_min_n:
             self.backoff = min(self.backoff * 2, cfg.max_backoff)
         else:
             self.backoff = 1
@@ -276,12 +299,76 @@ class RuleLearner:
         ys = tuple(y for _, y in self.data)
         n = len(ys)
         tol = self._tol(n)
-        en = enumerate_programs(inputs, self.var_names, self._propose_constants(inputs, ys), cfg.max_size,
-                                cfg.max_candidates, cfg.max_seconds)
+        consts = self._propose_constants(inputs, ys)
+        found = self._library_search(inputs, ys, tol, consts)
+        if any(bad == 0 for _, bad, _ in found):
+            self.library_searches += 1
+        else:
+            self.full_searches += 1
+            found = self._full_search(inputs, ys, tol, consts)
+        self._merge(found, n)
+        self._prev_top = self.hyps[0] if self.hyps else None
+        self.last_induction_n = n
+        self.n_inductions += 1
+        self.induction_seconds += time.perf_counter() - t0
+
+    def _approx_prior(self, e: Expr, n_leaves: int) -> float:
+        k = (e.size - 1) // 2
+        n_size = math.comb(2 * k, k) // (k + 1) * 4 ** k * n_leaves ** (k + 1)
+        return -2 * math.log(e.size) - math.log(max(n_size, 1))
+
+    def _library_search(self, inputs: list, ys: tuple, tol: int, consts: set) -> list:
+        """Instantiate previously successful shapes; return those that explain the data."""
+        if self.shape_library is None:
+            return []
+        cfg = self.cfg
+        consts = sorted(consts)
+        n_leaves = len(self.var_names) + len(consts)
+        found, seen = [], set()
+        for shape in self.shape_library()[: cfg.library_max_shapes]:
+            tree = parse_shape(shape)
+            if not cfg.allow_conditionals and "if_eq" in shape:
+                continue
+            nv, nc = shape_slots(tree)
+            # "X + C": fit the additive constant from the residual instead of enumerating it.
+            fit_bias = isinstance(tree, tuple) and tree[0] == "add" and tree[1][1] == "C"
+            n_c_enum = nc - 1 if fit_bias else nc
+            if len(self.var_names) ** nv * len(consts) ** n_c_enum > cfg.library_max_instances:
+                continue
+            for vs in itertools.product(self.var_names, repeat=nv):
+                for cs in itertools.product(consts, repeat=n_c_enum):
+                    if fit_bias:
+                        body = fill_shape(tree[1][0], vs, cs)
+                        if body is None:
+                            continue
+                        sig = [body.evaluate(d) for d in inputs]
+                        if None in sig:
+                            continue
+                        r = Counter(y - v for y, v in zip(ys, sig)).most_common(1)[0][0]
+                        e = app("add", body, const(r))
+                    else:
+                        e = fill_shape(tree, vs, cs)
+                    self.expressions_evaluated += 1
+                    if e is None or _has_trivial(e) or e.size > cfg.max_size + (2 + 2 * cfg.branch_max_size
+                                                                                if e.op == "if_eq" else 0):
+                        continue
+                    k = str(e)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    bad = sum(e.evaluate(d) != y for d, y in zip(inputs, ys))
+                    if bad <= tol:
+                        found.append((e, bad, self._approx_prior(e, n_leaves)))
+        return found
+
+    def _full_search(self, inputs: list, ys: tuple, tol: int, consts: set) -> list:
+        cfg = self.cfg
+        n = len(ys)
+        en = enumerate_programs(inputs, self.var_names, consts, cfg.max_size, cfg.max_candidates, cfg.max_seconds)
         self.expressions_evaluated += en.evaluated
         found = []
         ne = operator.ne
-        offsets = set()
+        offsets: dict = {}  # insertion-ordered: set order would depend on PYTHONHASHSEED
         for e, sig in en.candidates:
             if tol == 0:
                 if sig == ys:
@@ -294,13 +381,16 @@ class RuleLearner:
             if n >= 2 and e.op != "const" and e.size <= cfg.max_size - 2:
                 r = ys[0] - sig[0]
                 if r != 0 and all(y - s == r for y, s in zip(ys, sig)):
-                    offsets.add((e, r))
+                    offsets.setdefault((e, r), None)
         for e, r in offsets:
             fe = app("add", e, const(r))
             found.append((fe, 0, self._base_prior(fe, en.counts)))
         if cfg.allow_conditionals and not any(b == 0 for _, b, _ in found):
             found += self._conditionals(en, inputs, ys)
+        return found
 
+    def _merge(self, found: list, n: int) -> None:
+        cfg = self.cfg
         existing = {str(h.expr): h for h in self.hyps}
         fresh = []
         for e, bad, lp in found:
@@ -316,10 +406,6 @@ class RuleLearner:
         self._make_probes()
         for h in self.hyps:
             h.probe_sig = self._probe_sig(h.expr)
-        self._prev_top = self.hyps[0] if self.hyps else None
-        self.last_induction_n = n
-        self.n_inductions += 1
-        self.induction_seconds += time.perf_counter() - t0
 
     def _conditionals(self, en, inputs: list, ys: tuple) -> list:
         cfg = self.cfg
@@ -359,13 +445,17 @@ class RuleLearner:
             "last_induction_n": self.last_induction_n, "n_inductions": self.n_inductions,
             "expressions_evaluated": self.expressions_evaluated, "induction_seconds": self.induction_seconds,
             "status_history": self.status_history, "refutations": self.refutations, "status": self._status,
+            "library_searches": self.library_searches, "full_searches": self.full_searches,
         }
 
     @classmethod
     def from_state(cls, state: dict, cfg: InductionConfig,
                    shape_prior: Optional[Callable[[str], float]] = None,
-                   probe_fn: Optional[Callable[["RuleLearner", Expr], list]] = None) -> "RuleLearner":
-        lr = cls(state["key"], state["var_names"], cfg, shape_prior, probe_fn)
+                   probe_fn: Optional[Callable[["RuleLearner", Expr], list]] = None,
+                   shape_library: Optional[Callable[[], list]] = None) -> "RuleLearner":
+        lr = cls(state["key"], state["var_names"], cfg, shape_prior, probe_fn, shape_library)
+        lr.library_searches = state.get("library_searches", 0)
+        lr.full_searches = state.get("full_searches", 0)
         lr.data = [(dict(d), y) for d, y in state["data"]]
         lr.episodes = list(state["episodes"])
         lr.provenance = list(state["provenance"])

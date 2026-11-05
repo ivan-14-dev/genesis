@@ -13,9 +13,10 @@ from __future__ import annotations
 import json
 import math
 import random
+import statistics
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from .adapters import LabAdapter, PassiveLabAdapter, SequenceAdapter, sequence_rollout_probes
@@ -38,6 +39,26 @@ def default_configs(safety: SafetyPolicy) -> dict:
     }
 
 
+# The only parameters a model version (stage-7 self-improvement) may change.
+# Safety limits (SafetyPolicy, search budgets) are deliberately absent.
+TUNABLE = {
+    "sequence.validation_k": (2, 8), "sequence.shape_bias": (0.0, 4.0),
+    "sequence.max_proposed_constants": (4, 24), "lab.validation_k": (2, 8), "lab.shape_bias": (0.0, 4.0),
+    "agent.default_resolution_cost": (4, 40), "agent.review_interval": (2, 100),
+    "curiosity.novelty_weight": (0.0, 4.0), "curiosity.review_weight": (0.0, 4.0),
+}
+
+
+def validate_config(config: dict) -> dict:
+    for k, v in config.items():
+        if k not in TUNABLE:
+            raise PermissionError(f"parameter {k!r} is not tunable (safety or architecture)")
+        lo, hi = TUNABLE[k]
+        if not (lo <= v <= hi):
+            raise ValueError(f"{k}={v} outside allowed range [{lo}, {hi}]")
+    return config
+
+
 class IntegrityError(RuntimeError):
     pass
 
@@ -55,8 +76,9 @@ class SessionReport:
 class Genesis:
     def __init__(self, memory_path: str, safety: SafetyPolicy = DEFAULT_SAFETY, seed: int = 0,
                  procedural_prior: bool = True, consolidate_every: int = 50, idle_patience: int = 20,
-                 review_interval: int = 10, reviews_to_graduate: int = 3):
+                 review_interval: int = 10, reviews_to_graduate: int = 3, config: Optional[dict] = None):
         self.safety = safety
+        self.seed = seed
         self.rng = random.Random(seed)
         self.ltm = LongTermMemory(memory_path)
         self.wm = WorkingMemory(capacity=9)
@@ -73,11 +95,25 @@ class Genesis:
         self.reviews_to_graduate = reviews_to_graduate
         # Spaced re-testing of resolved judgements: key -> {"next", "interval", "count"}
         self.reviews: dict = {}
+        # Metacognitive cost model: observations each past problem needed before it was resolved.
+        self.resolution_costs: dict = {}
+        self.context_obs: dict = {}
+        self.default_resolution_cost = 12
         self.learners: dict = {}
         self.learner_env: dict = {}
         self.learner_kind: dict = {}
         self.ltm_retrievals = 0
         self._shape_cache: Optional[dict] = None
+        self.config = validate_config(dict(config if config is not None else
+                                           (self.ltm.get_meta("active_config") or {})))
+        for k, v in self.config.items():
+            scope, name = k.split(".")
+            if scope in self.configs:
+                self.configs[scope] = replace(self.configs[scope], **{name: v})
+            elif scope == "agent":
+                setattr(self, name, v)
+            elif scope == "curiosity":
+                setattr(self.curiosity, name, v)
         if self.ltm.get_meta("born_ts") is None:
             self._birth()
         else:
@@ -119,10 +155,13 @@ class Genesis:
         self.interactions = self.ltm.get_meta("interactions")
         self.ltm.set_meta("session", self.session)
         self.reviews = self.ltm.get_meta("reviews") or {}
+        self.resolution_costs = self.ltm.get_meta("resolution_costs") or {}
+        self.context_obs = {r[0]: r[1] for r in self.ltm.db.execute(
+            "SELECT context, COUNT(*) FROM episodes GROUP BY context")}
         for key, env_id, state in self.ltm.load_learners():
             kind = state["kind"]
             self.learners[key] = RuleLearner.from_state(state, self.configs[kind], self._shape_prior,
-                                                        self._probe_fn(kind))
+                                                        self._probe_fn(kind), self._library())
             self.learner_env[key] = env_id
             self.learner_kind[key] = kind
 
@@ -138,6 +177,15 @@ class Genesis:
             self._shape_cache = self.ltm.shape_successes()
         return math.log1p(self._shape_cache.get(shape, 0))
 
+    def _library(self):
+        return self._shape_library if self.procedural_prior else None
+
+    def _shape_library(self) -> list:
+        """Procedural memory: shapes that led to validated knowledge, most successful first."""
+        if self._shape_cache is None:
+            self._shape_cache = self.ltm.shape_successes()
+        return [s for s, n in sorted(self._shape_cache.items(), key=lambda t: -t[1]) if n > 0]
+
     @staticmethod
     def _probe_fn(kind: str):
         return sequence_rollout_probes if kind == "sequence" else None
@@ -145,7 +193,8 @@ class Genesis:
     def learner(self, key: str, kind: str, env_id: str, var_names: list) -> RuleLearner:
         lr = self.learners.get(key)
         if lr is None:
-            lr = RuleLearner(key, var_names, self.configs[kind], self._shape_prior, self._probe_fn(kind))
+            lr = RuleLearner(key, var_names, self.configs[kind], self._shape_prior, self._probe_fn(kind),
+                             self._library())
             self.learners[key] = lr
             self.learner_env[key] = env_id
             self.learner_kind[key] = kind
@@ -155,11 +204,7 @@ class Genesis:
         self.ltm.record_metric(self.session, metric, value, {"type": "assessment", "detail": detail})
 
     def assessments(self) -> dict:
-        out = {}
-        for r in self.ltm.metrics():
-            if r["context"] and '"assessment"' in r["context"]:
-                out[r["metric"]] = r["value"]
-        return out
+        return self.ltm.assessments()
 
     # --------------------------------------------------- working memory/recall
     def recall_sequence(self, key: str) -> tuple:
@@ -198,20 +243,19 @@ class Genesis:
                 rep.stopped_because = "sandbox budget exhausted"
                 break
             # 4 PREDICT and evaluate options
-            review_due = {k for k, r in self.reviews.items()
-                          if r["next"] is not None and r["next"] <= self.interactions}
-            utils = []
-            for sit in cands:
-                counts, ranges, unresolved = {}, {}, {}
-                for q in sit.queries:
-                    lr = self.learner(q.key, adapter.kind, adapter.env_id, adapter.var_names(q.key))
-                    sit.predictions[q.key] = lr.predict(q.inputs)
-                    counts[q.key] = len(lr.data) if lr.status() not in ("validated", "unpredictable") else 10**9
-                    ranges[q.key] = lr.cfg.outcome_range
-                u, _ = self.curiosity.utility(sit.predictions, counts, ranges, review_due, sit.warmup)
-                utils.append(u)
+            review_due = self._review_due()
+            utils = self._evaluate(adapter, cands, review_due)
             # 5 EXPLORE / DECIDE
-            if strategy == "curiosity":
+            focus = None
+            if strategy == "curiosity" and getattr(adapter, "focusable", False):
+                left = max_steps - rep.steps
+                if hasattr(adapter, "sb"):
+                    left = min(left, adapter.sb.remaining())
+                focus = self._focus(adapter.kind, cands, utils, left)
+            if focus is not None:
+                idx = focus
+                rep.designs["focus"] = rep.designs.get("focus", 0) + 1
+            elif strategy == "curiosity":
                 idx = self.attention.select(cands, utils, self.rng)
             elif strategy == "random":
                 idx = self.rng.randrange(len(cands))
@@ -233,6 +277,7 @@ class Genesis:
                 rep.stopped_because = "sandbox budget exhausted"
                 break
             self.interactions += 1
+            self.context_obs[sit.context] = self.context_obs.get(sit.context, 0) + 1
             rep.steps += 1
             design = sit.action.get("design", sit.provenance)
             rep.designs[design.split(":")[0]] = rep.designs.get(design.split(":")[0], 0) + 1
@@ -263,6 +308,9 @@ class Genesis:
                 res = self.learners[q.key].observe(q.inputs, y, eid, sit.provenance)
                 self.metacog.record_prediction(q.key, p.confidence, p.value == y)
                 self._update_reviews(q.key, res.status_after, q.key in review_due)
+                if res.status_after in ("validated", "unpredictable") and res.status_before != res.status_after \
+                        and res.status_before not in ("validated", "unpredictable"):
+                    self.resolution_costs.setdefault(adapter.kind, []).append(self.context_obs[sit.context])
             adapter.after(sit, outcome)
             if sit.percept:
                 self.perception.register(sit.percept)
@@ -272,6 +320,56 @@ class Genesis:
         self.consolidate()
         rep.seconds = time.perf_counter() - t0
         return rep
+
+    def expected_resolution_cost(self, kind: str) -> float:
+        costs = self.resolution_costs.get(kind) or []
+        return statistics.median(costs) if costs else self.default_resolution_cost
+
+    def _focus(self, kind: str, cands: list, utils: list, budget_left: int) -> Optional[int]:
+        """Budget-aware attention.
+
+        If the remaining budget cannot cover every open problem, finishing a few is worth more
+        than sampling all of them a little: pick the open problem that is cheapest to finish
+        (expected cost learned from past problems). Problems that already took more than twice
+        the expected cost are set aside. Returns None when the budget is sufficient.
+        """
+        est = self.expected_resolution_cost(kind)
+        open_ = []
+        for i, sit in enumerate(cands):
+            keys = [q.key for q in sit.queries] or [sit.context]
+            if all(k in self.learners and self.learners[k].status() in ("validated", "unpredictable")
+                   for k in keys):
+                continue
+            n = self.context_obs.get(sit.context, 0)
+            if n > 2 * est:
+                continue
+            open_.append((max(est - n, 1.0), -utils[i], i))
+        if not open_ or budget_left >= sum(c for c, _, _ in open_):
+            return None
+        feasible = [o for o in open_ if o[0] <= budget_left] or open_
+        return min(feasible)[2]
+
+    def _review_due(self) -> set:
+        return {k for k, r in self.reviews.items() if r["next"] is not None and r["next"] <= self.interactions}
+
+    def _evaluate(self, adapter, cands: list, review_due: set) -> list:
+        """Predict the outcome of every candidate situation and score its curiosity utility."""
+        utils = []
+        for sit in cands:
+            counts, ranges = {}, {}
+            for q in sit.queries:
+                lr = self.learner(q.key, adapter.kind, adapter.env_id, adapter.var_names(q.key))
+                sit.predictions[q.key] = lr.predict(q.inputs)
+                counts[q.key] = len(lr.data) if lr.status() not in ("validated", "unpredictable") else 10**9
+                ranges[q.key] = lr.cfg.outcome_range
+            u, _ = self.curiosity.utility(sit.predictions, counts, ranges, review_due, sit.warmup)
+            utils.append(u)
+        return utils
+
+    def peek(self, adapter) -> float:
+        """Best curiosity utility currently available in a world, without acting."""
+        cands = adapter.candidates()
+        return max(self._evaluate(adapter, cands, self._review_due()), default=0.0)
 
     def _update_reviews(self, key: str, status: str, was_review: bool) -> None:
         resolved = status in ("validated", "unpredictable")
@@ -289,6 +387,7 @@ class Genesis:
     def consolidate(self) -> dict:
         self.ltm.set_meta("interactions", self.interactions)
         self.ltm.set_meta("reviews", self.reviews)
+        self.ltm.set_meta("resolution_costs", self.resolution_costs)
         summary = self.consolidator.run(self)
         self._shape_cache = None
         cal = self.metacog.calibration()

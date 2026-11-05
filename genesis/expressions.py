@@ -98,6 +98,62 @@ def if_eq(q: str, c: int, e1: Expr, e2: Expr) -> Expr:
     return app("if_eq", var(q), const(c), e1, e2)
 
 
+def parse_shape(shape: str):
+    """Parse a procedural-memory shape such as ``add(mul(V,V),C)`` into a nested tuple."""
+    pos = 0
+
+    def node():
+        nonlocal pos
+        if shape[pos] in "VC":
+            pos += 1
+            return shape[pos - 1]
+        j = shape.index("(", pos)
+        op = shape[pos:j]
+        pos = j + 1
+        args = [node()]
+        while shape[pos] == ",":
+            pos += 1
+            args.append(node())
+        pos += 1  # ")"
+        return (op, tuple(args))
+
+    tree = node()
+    if pos != len(shape):
+        raise ValueError(f"bad shape {shape!r}")
+    return tree
+
+
+def shape_slots(tree) -> tuple:
+    """(#variable slots, #constant slots)."""
+    if tree == "V":
+        return 1, 0
+    if tree == "C":
+        return 0, 1
+    nv = nc = 0
+    for a in tree[1]:
+        v, c = shape_slots(a)
+        nv, nc = nv + v, nc + c
+    return nv, nc
+
+
+def fill_shape(tree, vs: Iterable[str], cs: Iterable[int]) -> Optional[Expr]:
+    """Instantiate a shape with concrete variables/constants (in left-to-right slot order)."""
+    vs, cs = iter(vs), iter(cs)
+
+    def build(t):
+        if t == "V":
+            return var(next(vs))
+        if t == "C":
+            return const(next(cs))
+        op, args = t
+        return app(op, *[build(a) for a in args])
+
+    e = build(tree)
+    if e.op == "if_eq" and (e.args[0].op != "var" or e.args[1].op != "const"):
+        return None
+    return e
+
+
 @dataclass
 class Enumeration:
     candidates: list  # list[(Expr, signature tuple)] ordered by size

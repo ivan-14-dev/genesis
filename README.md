@@ -16,10 +16,14 @@ Requires Python ≥ 3.10. Runtime dependencies: none (stdlib + SQLite). pytest i
 
 ```bash
 python -m venv .venv && .venv/bin/pip install pytest
-.venv/bin/python -m genesis demo                    # one agent develops through stages 0–5 (~10 s)
+.venv/bin/python -m genesis demo                    # one agent develops through stages 0–7 (~50 s)
 .venv/bin/python -m genesis inspect --db runs/demo.db --status refuted
 .venv/bin/python -m genesis inspect --db runs/demo.db --explain 12   # why is belief #12 held?
-.venv/bin/python -m genesis benchmark --seeds 100-109                 # full suite (~10 min, CPU)
+.venv/bin/python -m genesis dashboard --db runs/demo.db             # read-only monitor: http://127.0.0.1:8765
+.venv/bin/python -m genesis improve --db runs/demo.db               # stage 7: propose + evaluate, never deploys
+.venv/bin/python -m genesis approve --db runs/demo.db --version 2 --by <name>   # human-only deployment
+.venv/bin/python -m genesis rollback --db runs/demo.db
+.venv/bin/python -m genesis benchmark --seeds 100-109                 # full suite (~15 min, CPU)
 .venv/bin/python -m pytest -q
 ```
 
@@ -37,7 +41,13 @@ python -m venv .venv && .venv/bin/pip install pytest
   correct cause is validated. Held-out accuracy reaches 100%.
 - **Stage 4:** after a restart and after learning a second world, accuracy on the first world is unchanged.
 - **Stage 5:** planning over the learned model reaches unseen goals in every task.
-- **Stage 6:** development stops here explicitly, because that gate is not implemented yet.
+- **Stage 6:** given four new worlds (one pure noise) and one budget, the agent decides where to spend it by
+  measured learning progress and sets its own objectives (34 of 38 achieved here). Controls with fresh agents
+  are shown honestly: on this seed random allocation scores 86.2% vs 84.7% for progress and 80.6% for
+  round-robin.
+- **Stage 7:** it lists its own limitations, then runs a sandboxed self-improvement cycle
+  (`validation_k` 4 → 3: holdout 72% vs 71%). The change is stored as *pending approval* and is **not**
+  deployed; only a named human can approve it, and rollback is available.
 
 Every belief is stored with provenance, confidence, status history, and the episodes that induced, supported
 or refuted it (`inspect --explain`).
@@ -47,10 +57,15 @@ or refuted it (`inspect --explain`).
 - Sequences: 98.75% extrapolation accuracy on hidden rules (baselines 7.6% / 16%); 20/20 noise streams judged
   unpredictable, 0 false validations; 1 failure (an unproposed modulus).
 - Causal world: 0% → 100% held-out accuracy; 100% on out-of-range values (tabular baseline 46%); confounded
-  causes found 0% by watching vs 100% after experiments; curiosity needs 24.5 experiments vs 58.5 for random.
+  causes found 0% by watching vs 100% after experiments; curiosity needs 24.5 experiments vs 51.7 for random.
 - Memory: retention 1.0 across sessions, forgetting 0.0 after a second world. Planning: 100% vs 78.5% random.
-- Negative results, also reported: curiosity loses to random at a very tight budget (60 observations), and the
-  procedural prior has no measurable effect yet.
+- Tight budget (60 observations): curiosity with budget-aware focus validates 60% of rule streams (random 24%,
+  round-robin 0%). Remembered rule shapes cut search 16.7× (CPU −6%).
+- Stage 6: learning-progress allocation beats round-robin at budget 150 (0.849 vs 0.792, half the noise) and
+  stops itself at 300 with equal knowledge.
+- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.702 vs 0.723); remembered
+  shapes do not reduce observations to validation; curiosity spends slightly more on noise; the stage 7 gain is
+  small (+0.007 on holdout) and most tunable parameters have no effect.
 
 ## Layout
 
@@ -68,6 +83,9 @@ genesis/
   adapters.py        bridges between the cognitive cycle and each environment
   agent.py           the 12-step cognitive cycle, persistence, planning
   environments/      sandbox + SequenceWorld + CausalWorld (hidden rules)
+  autonomy.py        stage 6: learning-progress allocation across worlds, self-generated objectives
+  self_improvement.py stage 7: sandboxed evaluation of config variants, human approval, rollback, limitations
+  dashboard.py       read-only monitoring web UI + JSON API (stdlib only)
   experiments.py     benchmarks, baselines and controls
   demo.py, __main__.py
 tests/               pytest suite (incl. a static check that agent code never reads hidden world internals)
@@ -79,5 +97,6 @@ GENESIS learns only what its hypothesis space can express: small integer program
 the causal world. Within that space, learning is genuine. The specific rules are sampled per seed, never given
 to the agent, and recovered from its own interactions. Beyond that space, the agent reports
 "unpredictable". The current zero-forgetting result comes from separate per-context symbolic rules; it is not
-a general solution to catastrophic forgetting. Limitations and planned next steps (noise-robust rules, library
-learning, stage 6–7 autonomy, neural perception, dashboard) are listed in `docs/ARCHITECTURE.md`.
+a general solution to catastrophic forgetting. Self-improvement is limited to a few allowlisted parameters and
+never touches the safety policy or deploys without a human. Limitations and next steps (noise-robust rules,
+sub-program library learning, neural perception) are listed in `docs/ARCHITECTURE.md`.

@@ -8,6 +8,7 @@ the agent can say "I found no pattern" instead of hallucinating one.
 from __future__ import annotations
 
 import random
+import zlib
 
 
 def _arithmetic(rng):
@@ -88,7 +89,7 @@ class SequenceWorld:
         g = self._gens[sid]
         if g["family"] == "noise":
             # Noise has no future to predict; any guess is chance level.
-            r = random.Random(hash((sid, len(self._hist[sid]))))
+            r = random.Random(zlib.crc32(f"{sid}:{len(self._hist[sid])}".encode()))
             return [r.randint(-10**6, 10**6) for _ in range(k)]
         h = list(self._hist[sid])
         out = []

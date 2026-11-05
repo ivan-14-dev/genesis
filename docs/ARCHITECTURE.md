@@ -64,7 +64,10 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Metacognitive engine | `metacognition.py` | Calibration (Brier, ECE), learning progress, knowing-what-you-don't-know | implemented |
 | Consolidation engine | `consolidation.py` | Systems consolidation / hippocampal replay during sleep (McClelland et al. CLS) | implemented |
 | Environments + sandbox | `environments/` | Controlled micro-worlds with hidden, seed-sampled rules | implemented (sequences, causal lab) |
-| Developmental curriculum | `metacognition.py: CURRICULUM` | Piaget-inspired staged development with measurable gates | stages 0–5 gated; 6–7 not yet |
+| Developmental curriculum | `metacognition.py: CURRICULUM` | Piaget-inspired staged development with measurable gates | stages 0–7 gated |
+| Autonomous exploration | `autonomy.py: Explorer` | Learning-progress–driven allocation (Oudeyer & Kaplan, intelligent adaptive curiosity); self-generated objectives | implemented (stage 6) |
+| Self-improvement | `self_improvement.py` | Bounded, reproducible A/B evaluation of allowlisted parameters on trial + holdout seeds; human approval; rollback | implemented (stage 7) |
+| Observability | `dashboard.py` | Read-only inspection of memory; every element traceable to DB rows (`explain`) | implemented (stdlib HTTP + vanilla JS) |
 
 ## C. Module diagram
 
@@ -88,7 +91,11 @@ flowchart LR
         DEC[Decision<br/>choose experiment/action]
         META[Metacognition<br/>calibration · progress ·<br/>stage gates]
         CON[Consolidation<br/>replay · refute · associate]
+        EXP[Autonomy<br/>learning-progress<br/>world selection · objectives]
     end
+    SI[Self-improvement sandbox<br/>isolated trial agents]
+    HUM([Human approval])
+    DASH[Dashboard<br/>read-only]
 
     SB -- observation --> PER --> ATT --> WM
     WM <--> LTM
@@ -105,6 +112,11 @@ flowchart LR
     CON <--> LTM
     CON -- refutations, generalisations --> LRN
     LTM -- procedural prior --> LRN
+    META -- progress --> EXP
+    EXP -- which world --> DEC
+    SI -- pending version --> HUM
+    HUM -- approve / rollback --> LTM
+    LTM -. read only .-> DASH
 ```
 
 ### The 12-step cycle (`Genesis.live`)
@@ -120,7 +132,10 @@ flowchart LR
 9. **Learn** – posterior update; re-induction on surprise.
 10. **Store** – episode (before learning, so knowledge can cite it), learner state.
 11. **Consolidate** – every 50 interactions and at session end.
-12. **Adapt** – spaced-review schedule, procedural prior, idle stop when nothing is left to learn.
+12. **Adapt** – spaced-review schedule, procedural prior, budget-aware focus (finish the cheapest open problem
+    when the budget cannot cover all of them), idle stop when nothing is left to learn. Across worlds, the
+    `Explorer` (stage 6) decides where the next 10 interactions go; across versions, stage 7 proposes
+    configuration changes that a human must approve.
 
 ### Interfaces
 
@@ -170,12 +185,12 @@ learners. No pretrained model, embedding, dataset or LLM is used anywhere.
 |---|---|---|
 | 0 Initialization | Manifest + audit | `stage0_audit_passed ≥ 1` |
 | 1 Pattern discovery | Online Bayesian program induction over sequence features `x[t-1..3], t`; on-manifold rollout probes define behavioural equivalence; curiosity selects which stream to sample | extrapolation accuracy on 10 unseen terms ≥ 0.8 and false-validation rate on noise ≤ 0.05 |
-| 2 Relationships & associations | Same induction over object properties; frame generalisation ("action a can only change {…}"); contrast-based associations Δ = P(change\|q=v) − P(change\|q≠v) | passive prediction accuracy on natural events ≥ 0.9 |
+| 2 Relationships & associations | Same induction over object properties; frame generalisation ("action a can only change {…}"); contrast-based associations Δ = P(change\|q=v) − P(change\|q≠v) | passive prediction accuracy on natural events ≥ 0.8 |
 | 3 Causal discovery | Interventional experiments chosen by expected information gain; conditional rules `if q==c then e1 else e2`; one-variable-change experiment designs; association labelled *causal* only if the interventional contrast survives | held-out accuracy ≥ 0.95 on unseen configurations, and every confounded rule's true cause identified |
-| 4 Memory & knowledge | Persistence, consolidation/replay, refutation tracking, spaced review | retention after reload ≥ 0.95, forgetting after a new world ≤ 0.02 |
-| 5 Reasoning | Forward simulation with learned rules + breadth-first planning to unseen goals | planning success ≥ 0.8 |
-| 6 Autonomous exploration | *planned:* self-generated objectives across multiple worlds, learning-progress–based world selection | not implemented (development stops here, explicitly) |
-| 7 Continuous development | *planned:* sandboxed self-evaluation of learning strategies, library learning | not implemented |
+| 4 Memory & knowledge | Persistence, consolidation/replay, refutation tracking, spaced review | retention after reload ≥ 0.99, forgetting after a new world ≤ 0.02 |
+| 5 Reasoning | Forward simulation with learned rules + breadth-first planning to unseen goals | planning success ≥ 0.9 |
+| 6 Autonomous exploration | Learning-progress allocation of 10-interaction chunks across worlds (2 probe chunks each, then progress + 0.1/√chunks optimism; stop when no world shows progress ≥ 0.05); knowledge gaps → stored objectives | knowledge gain vs round-robin ≥ 0.02 and noise share ≤ 0.25 |
+| 7 Continuous development | One-parameter variants of allowlisted settings, evaluated in isolated agents on trial then holdout seeds (strict gain, no extra false validations); human approval; self-identified limitations | evaluation reproducible, safety policy unchanged, no holdout regression, ≥ 1 limitation identified |
 
 Details of the core learner (`RuleLearner`):
 
@@ -229,15 +244,15 @@ future source must be tagged with provenance `external` and kept separate from e
 |---|---|---|
 | 1 ✅ | Innate core, induction, memory, curiosity, metacognition, consolidation, sequence + causal worlds, benchmarks, demo | stages 0–5 gates pass on held-out seeds |
 | 2 | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise |
-| 3 | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library |
-| 4 | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction |
+| 3 (partial ✅) | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Done so far:* library-first search over remembered shapes cuts search 16.7×; observations unchanged; sub-program promotion still open |
+| 4 ✅ | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction (met at budget 150 and 300; **not** at 100) |
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
-| 6 | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
-| 7 | **Observability service**: FastAPI read-only API over the memory DB + React dashboard (stage, curves, beliefs, `explain`) | every dashboard element traceable to DB rows |
+| 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
+| 7 ✅ | **Observability service**: read-only API over the memory DB + dashboard (stage, curves, beliefs, `explain`). Built with stdlib `http.server` + vanilla JS instead of FastAPI/React: no measured need yet justifies the dependencies | every dashboard element traceable to DB rows |
 | 8 | Simulated physics world; text interaction grounded in learned concepts | defined when phase 5 is complete |
 
-Dependencies are added only when their phase begins (PyTorch at phase 5, FastAPI/React at phase 7, Docker
-when there are services to orchestrate).
+Dependencies are added only when their phase begins and a measured need justifies them (PyTorch at phase 5;
+FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when there are services to orchestrate).
 
 ### Risks
 
@@ -259,4 +274,9 @@ when there are services to orchestrate).
   forgetting.
 - Equivalence for sequence rules is judged on rollouts of the current best rule (on-manifold), so two rules that
   agree on the trajectory but differ elsewhere are treated as the same belief.
-- Stages 6–7, neural perception, dashboard and self-improvement are not implemented yet.
+- Stage 6 allocation needs ≥ 2 probe chunks per world, so it loses to round-robin when the budget is very small
+  (100 interactions for 4 worlds).
+- Stage 7 tunes only a few allowlisted parameters; most have no measurable effect, and the confirmed gain so far
+  is small (+0.007 on holdout). It cannot change algorithms or architecture.
+- Curiosity spends slightly more observations on noise than round-robin.
+- Neural perception is not implemented yet.

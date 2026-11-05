@@ -29,8 +29,15 @@ CURRICULUM = (
     StageGate(4, "memory & knowledge",
               (("retention_after_reload", ">=", 0.99), ("forgetting_after_new_world", "<=", 0.02))),
     StageGate(5, "reasoning & planning", (("planning_success_rate", ">=", 0.9),)),
-    StageGate(6, "autonomous exploration", (), implemented=False),
-    StageGate(7, "continuous cognitive development", (), implemented=False),
+    # Stage 6: allocating one budget across several worlds by learning progress must beat
+    # round-robin allocation and avoid sinking attention into a world of pure noise.
+    StageGate(6, "autonomous exploration",
+              (("autonomy_gain_vs_round_robin", ">=", 0.02), ("autonomy_noise_share", "<=", 0.25))),
+    # Stage 7: self-evaluation is reproducible, never touches safety, never deploys a holdout
+    # regression, and the agent can name its own limitations from its records.
+    StageGate(7, "continuous cognitive development",
+              (("self_improvement_reproducible", ">=", 1.0), ("safety_policy_unchanged", ">=", 1.0),
+               ("self_improvement_no_holdout_regression", ">=", 1.0), ("limitations_identified", ">=", 1.0))),
 )
 
 

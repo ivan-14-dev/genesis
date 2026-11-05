@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS metacog (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session INTEGER, metric TEXT NOT NULL,
     value REAL, context TEXT);
 CREATE TABLE IF NOT EXISTS learner_state (key TEXT PRIMARY KEY, env_id TEXT, state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS objectives (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts REAL NOT NULL, session INTEGER, env_id TEXT NOT NULL,
+    key TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, updated_ts REAL, outcome TEXT,
+    UNIQUE(key));
+CREATE TABLE IF NOT EXISTS model_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, parent INTEGER, config TEXT NOT NULL,
+    rationale TEXT, trial_metrics TEXT, holdout_metrics TEXT, status TEXT NOT NULL, approved_by TEXT,
+    safety_digest TEXT NOT NULL);
 """
 
 
@@ -72,8 +80,13 @@ class KnowledgeItem:
 
 
 class LongTermMemory:
-    def __init__(self, path: str):
+    def __init__(self, path: str, read_only: bool = False):
         self.path = path
+        self.read_only = read_only
+        if read_only:  # observers (dashboard) can never alter the agent's memory
+            self.db = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True, check_same_thread=False)
+            self.db.row_factory = sqlite3.Row
+            return
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
@@ -82,7 +95,8 @@ class LongTermMemory:
         self.db.commit()
 
     def close(self) -> None:
-        self.db.commit()
+        if not self.read_only:
+            self.db.commit()
         self.db.close()
 
     def commit(self) -> None:
@@ -118,7 +132,7 @@ class LongTermMemory:
 
     def count(self, table: str) -> int:
         assert table in ("episodes", "knowledge", "procedures", "associations", "metacog", "evidence",
-                         "knowledge_history", "learner_state")
+                         "knowledge_history", "learner_state", "objectives", "model_versions")
         return self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
     # ---------------------------------------------------------------- semantic
@@ -213,6 +227,52 @@ class LongTermMemory:
     def metrics(self, metric: Optional[str] = None) -> list:
         q = "SELECT * FROM metacog" + (" WHERE metric=?" if metric else "") + " ORDER BY id"
         return [dict(r) for r in self.db.execute(q, (metric,) if metric else ())]
+
+    # -------------------------------------------------------------- objectives
+    def add_objective(self, session: int, env_id: str, key: str, text: str) -> bool:
+        cur = self.db.execute("INSERT OR IGNORE INTO objectives(created_ts, session, env_id, key, text, status, "
+                              "updated_ts) VALUES (?,?,?,?,?,'open',?)",
+                              (time.time(), session, env_id, key, text, time.time()))
+        return cur.rowcount > 0
+
+    def update_objective(self, key: str, status: str, outcome=None) -> None:
+        self.db.execute("UPDATE objectives SET status=?, outcome=?, updated_ts=? WHERE key=?",
+                        (status, json.dumps(outcome), time.time(), key))
+
+    def objectives(self, status: Optional[str] = None) -> list:
+        q = "SELECT * FROM objectives" + (" WHERE status=?" if status else "") + " ORDER BY id"
+        return [dict(r) for r in self.db.execute(q, (status,) if status else ())]
+
+    # ---------------------------------------------------------- model versions
+    def add_version(self, config: dict, parent: Optional[int], rationale: str, trial, holdout, status: str,
+                    safety_digest: str) -> int:
+        cur = self.db.execute(
+            "INSERT INTO model_versions(ts, parent, config, rationale, trial_metrics, holdout_metrics, status, "
+            "safety_digest) VALUES (?,?,?,?,?,?,?,?)",
+            (time.time(), parent, json.dumps(config, sort_keys=True), rationale, json.dumps(trial),
+             json.dumps(holdout), status, safety_digest))
+        return cur.lastrowid
+
+    def set_version_status(self, vid: int, status: str, approved_by: Optional[str] = None) -> None:
+        self.db.execute("UPDATE model_versions SET status=?, approved_by=COALESCE(?, approved_by) WHERE id=?",
+                        (status, approved_by, vid))
+
+    def versions(self) -> list:
+        out = []
+        for r in self.db.execute("SELECT * FROM model_versions ORDER BY id"):
+            d = dict(r)
+            for k in ("config", "trial_metrics", "holdout_metrics"):
+                d[k] = json.loads(d[k]) if d[k] else None
+            out.append(d)
+        return out
+
+    def assessments(self) -> dict:
+        """Latest value of every developmental assessment metric."""
+        out = {}
+        for r in self.metrics():
+            if r["context"] and '"assessment"' in r["context"]:
+                out[r["metric"]] = r["value"]
+        return out
 
     # --------------------------------------------------------- learner states
     def save_learner(self, key: str, env_id: str, state: dict) -> None:

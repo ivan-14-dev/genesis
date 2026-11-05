@@ -13,8 +13,9 @@ import tempfile
 import time
 from contextlib import contextmanager
 
-from .adapters import LabAdapter
+from .adapters import LabAdapter, SequenceAdapter
 from .agent import Genesis
+from .autonomy import Explorer
 from .environments import CausalWorld, SequenceWorld, sandboxed
 
 
@@ -210,6 +211,40 @@ def run_lab_benchmark(seed: int, watch: int = 60, budget: int = 120, strategy: s
         return res
 
 
+# ===================================================================== stage 6
+def run_autonomy(seed: int, budget: int = 300, strategy: str = "progress", agent: Genesis | None = None) -> dict:
+    """Four worlds, one budget: the agent decides where to spend it.
+
+    Knowledge score (harness-only) = mean over the three learnable worlds of
+    rule-stream extrapolation accuracy (sequences) or held-out transition
+    accuracy (labs). The fourth world is pure noise: nothing can be learned.
+    """
+    with _tmpdb() as tmp:
+        own = agent is None
+        agent = agent or Genesis(tmp, seed=seed)
+        seq, noise = SequenceWorld(seed), SequenceWorld(seed + 500, n_rule_streams=0, n_noise_streams=10)
+        labs = [CausalWorld(seed), CausalWorld(seed + 700)]
+        sbs = {w.env_id: sandboxed(w, budget + 50) for w in [seq, noise, *labs]}
+        adapters = {"sequences": SequenceAdapter(agent, sbs[seq.env_id]),
+                    "noise": SequenceAdapter(agent, sbs[noise.env_id]),
+                    "lab-A": LabAdapter(agent, sbs[labs[0].env_id]),
+                    "lab-B": LabAdapter(agent, sbs[labs[1].env_id])}
+        t0 = time.process_time()
+        explorer = Explorer(agent, adapters)
+        res = explorer.run(budget, strategy)
+        seq_eval = evaluate_sequences(agent, seq)
+        lab_scores = [lab_accuracy(agent, w, lab_eval_set(w, 300, seed + 991 + i, 0, w.n_values - 1))
+                      for i, w in enumerate(labs)]
+        res.update(seed=seed, sequences=seq_eval["rule_extrapolation_accuracy"], labs=lab_scores,
+                   knowledge_score=round((seq_eval["rule_extrapolation_accuracy"] + sum(lab_scores)) / 3, 4),
+                   noise_share=round(res["allocation"]["noise"] / max(res["interactions"], 1), 4),
+                   objectives={st: len(agent.ltm.objectives(st)) for st in ("open", "achieved", "abandoned")},
+                   cpu_seconds=round(time.process_time() - t0, 3))
+        if own:
+            agent.ltm.close()
+        return res
+
+
 # ===================================================================== stage 5
 def run_planning(agent: Genesis, sb, world: CausalWorld, n_tasks: int = 20) -> dict:
     planned = [agent.pursue_goal(sb, 1000 + i, "plan") for i in range(n_tasks)]
@@ -249,14 +284,33 @@ def run_memory_benchmark(seed: int) -> dict:
 def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool = True) -> dict:
     with _tmpdb() as path:
         agent = Genesis(path, seed=seed, procedural_prior=procedural_prior)
-        per_world = []
+        per_world, evals, rule_evals, cpu, acc, lib = [], [], [], [], [], []
         for i in range(n_worlds):
             world = SequenceWorld(seed * 100 + i)
+            keys = [f"{world.env_id}/{sid}" for sid in world.stream_ids()]
+            t0 = time.process_time()
             agent.explore_sequences(sandboxed(world, 401), 400)
-            per_world.append(evaluate_sequences(agent, world)["observations_to_validation"])
+            cpu.append(round(time.process_time() - t0, 3))
+            ev = evaluate_sequences(agent, world)
+            per_world.append(ev["observations_to_validation"])
+            acc.append(ev["rule_extrapolation_accuracy"])
+            lrs = [agent.learners[k] for k in keys if k in agent.learners]
+            rule_lrs = [agent.learners[f"{world.env_id}/{sid}"] for sid in world.stream_ids()
+                        if world._family(sid) != "noise" and f"{world.env_id}/{sid}" in agent.learners]
+            evals.append(sum(lr.expressions_evaluated for lr in lrs))
+            rule_evals.append(round(sum(lr.expressions_evaluated for lr in rule_lrs) / max(len(rule_lrs), 1)))
+            searches = sum(lr.library_searches + lr.full_searches for lr in lrs)
+            lib.append(round(sum(lr.library_searches for lr in lrs) / searches, 4) if searches else 0.0)
         agent.ltm.close()
+        late = slice(n_worlds // 2, None)
         return {"observations_to_validation_per_world": per_world,
-                "late_worlds_mean": _mean(per_world[n_worlds // 2:])}
+                "expressions_evaluated_per_world": evals, "cpu_seconds_per_world": cpu,
+                "search_cost_per_rule_stream_per_world": rule_evals,
+                "accuracy_per_world": acc, "library_search_share_per_world": lib,
+                "late_worlds_mean": _mean(per_world[late]),
+                "late_worlds_expressions": _mean(evals[late]), "late_worlds_cpu": _mean(cpu[late]),
+                "late_worlds_search_cost_per_rule_stream": _mean(rule_evals[late]),
+                "late_worlds_accuracy": _mean(acc[late])}
 
 
 # ==================================================================== suite
@@ -279,6 +333,16 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
     proc_seeds = seeds[: 2 if quick else 5]
     proc_on = [run_procedural_transfer(s, procedural_prior=True) for s in proc_seeds]
     proc_off = [run_procedural_transfer(s, procedural_prior=False) for s in proc_seeds]
+    auto_budgets = (150,) if quick else (100, 150, 300)
+    auto = {(b, strat): [run_autonomy(s, b, strat) for s in seeds]
+            for b in auto_budgets for strat in ("progress", "round_robin", "random")}
+    from . import self_improvement as SI
+    factory = lambda s: sandboxed(SequenceWorld(s), 10 ** 6)  # noqa: E731
+    with _tmpdb() as path:
+        Genesis(path).close()
+        improve = SI.improve(path, factory, [9001, 9002] if quick else [9001, 9002, 9003],
+                             [9101, 9102] if quick else [9101, 9102, 9103],
+                             params=("sequence.validation_k",) if quick else SI.DEFAULT_SEARCH)
 
     def curve(runs):
         return [{"experiments": pts[0]["experiments"], "heldout_unseen": _mean([p["heldout_unseen"] for p in pts])}
@@ -357,6 +421,29 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             "without_prior": [p["observations_to_validation_per_world"] for p in proc_off],
             "late_worlds_with_prior": _mean([p["late_worlds_mean"] for p in proc_on]),
             "late_worlds_without_prior": _mean([p["late_worlds_mean"] for p in proc_off]),
+            "late_search_cost_per_rule_stream_with_prior": _mean(
+                [p["late_worlds_search_cost_per_rule_stream"] for p in proc_on]),
+            "late_search_cost_per_rule_stream_without_prior": _mean(
+                [p["late_worlds_search_cost_per_rule_stream"] for p in proc_off]),
+            "late_cpu_seconds_per_world_with_prior": _mean([p["late_worlds_cpu"] for p in proc_on]),
+            "late_cpu_seconds_per_world_without_prior": _mean([p["late_worlds_cpu"] for p in proc_off]),
+            "late_accuracy_with_prior": _mean([p["late_worlds_accuracy"] for p in proc_on]),
+            "late_accuracy_without_prior": _mean([p["late_worlds_accuracy"] for p in proc_off]),
+            "library_search_share_with_prior": [p["library_search_share_per_world"] for p in proc_on],
+        },
+        "stage6_autonomy": {
+            f"budget_{b}/{strat}": {
+                "knowledge_score": _mean([r["knowledge_score"] for r in runs]),
+                "noise_share": _mean([r["noise_share"] for r in runs]),
+                "interactions_used": _mean([r["interactions"] for r in runs]),
+                "objectives_achieved": _mean([r["objectives"]["achieved"] for r in runs]),
+                "per_seed_knowledge": [r["knowledge_score"] for r in runs]}
+            for (b, strat), runs in auto.items()},
+        "stage7_self_improvement": {
+            "reproducible": improve["reproducible"], "decision": improve["decision"],
+            "baseline_trial": improve["baseline"]["score"],
+            "variants": [(v["change"], v["trial"]["score"], v["gain"]) for v in improve.get("variants", [])],
+            "candidate": improve.get("candidate"),
         },
     }
     return summary

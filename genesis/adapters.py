@@ -60,6 +60,7 @@ def sequence_rollout_probes(lr, expr, k: int = 12) -> list:
 
 class SequenceAdapter:
     kind = "sequence"
+    focusable = True  # each candidate is an independent learning problem
 
     def __init__(self, agent, sandbox):
         self.agent = agent

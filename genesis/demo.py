@@ -14,7 +14,9 @@ from .adapters import LabAdapter
 from .agent import Genesis
 from .curiosity import Curiosity
 from .environments import CausalWorld, SequenceWorld, sandboxed
-from .experiments import confound_resolved, evaluate_sequences, lab_accuracy, lab_eval_set
+from .experiments import confound_resolved, evaluate_sequences, lab_accuracy, lab_eval_set, run_autonomy
+from .innate import DEFAULT_SAFETY
+from . import self_improvement as SI
 from .metacognition import Metacognition
 
 
@@ -30,7 +32,7 @@ def _stage(agent, out):
     return st
 
 
-def run_demo(seed: int = 0, db_path: str = "runs/demo.db", fresh: bool = True) -> dict:
+def run_demo(seed: int = 0, db_path: str = "runs/demo.db", fresh: bool = True, improve_params=("sequence.validation_k",)) -> dict:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     if fresh and os.path.exists(db_path):
         os.remove(db_path)
@@ -131,6 +133,63 @@ def run_demo(seed: int = 0, db_path: str = "runs/demo.db", fresh: bool = True) -
     _say(out, f"  e.g. goal {plans[0]['goal']}: plan {plans[0]['plan']} -> success {plans[0]['success']}")
     agent.record_assessment("planning_success_rate", sp)
     results["stage5"] = {"plan_success": sp, "random_success": sr}
+    _stage(agent, out)
+
+    _say(out, "\n=== STAGE 6: four new worlds, one budget, nobody says where to look ===")
+    budget = 150
+    mine = run_autonomy(seed + 6000, budget, "progress", agent=agent)
+    _say(out, f"  this agent's allocation: {mine['allocation']} (stopped: {mine['stopped_because']}); "
+              f"knowledge score {mine['knowledge_score']:.1%}")
+    ctrl = {s: run_autonomy(seed + 6000, budget, s) for s in ("progress", "round_robin", "random")}
+    for s, r in ctrl.items():
+        _say(out, f"  control, fresh agent, {s:<11}: knowledge {r['knowledge_score']:.1%}, "
+                  f"share of budget on the noise world {r['noise_share']:.0%}, allocation {r['allocation']}")
+    objs = agent.ltm.objectives()
+    _say(out, f"  learning objectives it set itself: {len(objs)} "
+              f"({sum(o['status'] == 'achieved' for o in objs)} achieved, "
+              f"{sum(o['status'] == 'abandoned' for o in objs)} abandoned as unpredictable)")
+    for o in [o for o in objs if o["status"] == "open"][:3]:
+        _say(out, f"    open: {o['text']}")
+    gain = ctrl["progress"]["knowledge_score"] - ctrl["round_robin"]["knowledge_score"]
+    agent.record_assessment("autonomy_gain_vs_round_robin", round(gain, 4))
+    agent.record_assessment("autonomy_noise_share", ctrl["progress"]["noise_share"])
+    results["stage6"] = {"own": mine, "controls": ctrl}
+    _stage(agent, out)
+
+    _say(out, "\n=== STAGE 7: self-evaluation, controlled self-improvement, known limitations ===")
+    lim = SI.limitations(agent)
+    _say(out, f"  limitations found in its own records: {len(lim['stuck_problems'])} stuck problems, "
+              f"{len(lim['judged_unpredictable'])} streams judged unpredictable")
+    for st in lim["stuck_problems"][:3]:
+        _say(out, f"    stuck: {st['key']} after {st['observations']} obs (expected {st['expected_cost']}): "
+                  f"best guess {st['best_guess']}")
+    agent.close()
+    factory = lambda s: sandboxed(SequenceWorld(s), 10 ** 6)  # noqa: E731
+    imp = SI.improve(db_path, factory, [seed + 9001, seed + 9002], [seed + 9101, seed + 9102],
+                     params=improve_params)
+    _say(out, f"  evaluation reproducible: {imp['reproducible']}; baseline observable score "
+              f"{imp['baseline']['score']:.1%}")
+    for v in imp.get("variants", []):
+        _say(out, f"    tried {v['change']:<34} trial score {v['trial']['score']:.1%} (gain {v['gain']:+.3f})")
+    if "candidate" in imp:
+        c = imp["candidate"]
+        _say(out, f"  holdout: variant {c['holdout_variant']['score']:.1%} vs baseline "
+                  f"{c['holdout_baseline']['score']:.1%} -> {imp['decision']}")
+        if imp["decision"] == "pending-approval":
+            _say(out, f"  NOT deployed. A human must run: python -m genesis approve --db {db_path} "
+                      f"--version {c['id']} --by <name>")
+    else:
+        _say(out, f"  decision: {imp['decision']}")
+    agent = Genesis(db_path, seed=seed)
+    deployed_regression = any(v["status"] == "deployed" and v["holdout_metrics"] and
+                              v["holdout_metrics"]["variant"]["score"] < v["holdout_metrics"]["baseline"]["score"]
+                              for v in agent.ltm.versions())
+    agent.record_assessment("self_improvement_reproducible", 1.0 if imp["reproducible"] else 0.0)
+    agent.record_assessment("safety_policy_unchanged",
+                            1.0 if agent.ltm.get_meta("safety_policy_digest") == DEFAULT_SAFETY.digest() else 0.0)
+    agent.record_assessment("self_improvement_no_holdout_regression", 0.0 if deployed_regression else 1.0)
+    agent.record_assessment("limitations_identified", 1.0 if lim["n_identified_from_records"] else 0.0)
+    results["stage7"] = {"improvement": imp, "limitations": lim}
     final = _stage(agent, out)
 
     rep = agent.report()

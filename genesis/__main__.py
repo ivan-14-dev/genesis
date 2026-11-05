@@ -1,4 +1,4 @@
-"""Command line: ``python -m genesis {demo,benchmark,inspect}``."""
+"""Command line: ``python -m genesis {demo,benchmark,inspect,improve,approve,rollback,dashboard}``."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ def _seeds(spec: str) -> list:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="genesis")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    d = sub.add_parser("demo", help="developmental run of one agent through stages 0-5")
+    d = sub.add_parser("demo", help="developmental run of one agent through stages 0-7")
     d.add_argument("--seed", type=int, default=0)
     d.add_argument("--db", default="runs/demo.db")
     b = sub.add_parser("benchmark", help="multi-seed benchmarks with baselines and controls")
@@ -29,7 +29,26 @@ def main(argv=None) -> int:
     i.add_argument("--db", default="runs/demo.db")
     i.add_argument("--explain", type=int, help="knowledge id to explain")
     i.add_argument("--status", help="filter knowledge by status")
+    im = sub.add_parser("improve", help="one isolated self-improvement cycle (never deploys)")
+    im.add_argument("--db", default="runs/demo.db")
+    im.add_argument("--trial-seeds", default="9001-9003")
+    im.add_argument("--holdout-seeds", default="9101-9103")
+    im.add_argument("--params", default=None, help="comma-separated tunable parameters")
+    ap_ = sub.add_parser("approve", help="human approval: deploy a pending model version")
+    ap_.add_argument("--db", default="runs/demo.db")
+    ap_.add_argument("--version", type=int, required=True)
+    ap_.add_argument("--by", required=True, help="name of the approving human")
+    rb = sub.add_parser("rollback", help="restore the configuration active before the last deployment")
+    rb.add_argument("--db", default="runs/demo.db")
+    ds = sub.add_parser("dashboard", help="read-only monitoring web interface")
+    ds.add_argument("--db", default="runs/demo.db")
+    ds.add_argument("--host", default="127.0.0.1")
+    ds.add_argument("--port", type=int, default=8765)
     args = ap.parse_args(argv)
+    if getattr(args, "db", None) and args.cmd in ("improve", "approve", "rollback", "dashboard") \
+            and not os.path.exists(args.db):
+        print(f"no memory at {args.db}", file=sys.stderr)
+        return 1
 
     if args.cmd == "demo":
         from .demo import run_demo
@@ -54,6 +73,22 @@ def main(argv=None) -> int:
             for k in ltm.knowledge(status=args.status):
                 print(f"[{k.id:>4}] {k.status:<13} {k.confidence:5.2f}  {k.key}: {k.statement}   ({k.provenance})")
         ltm.close()
+    elif args.cmd == "improve":
+        from . import self_improvement as SI
+        from .environments import SequenceWorld, sandboxed
+        params = tuple(args.params.split(",")) if args.params else SI.DEFAULT_SEARCH
+        res = SI.improve(args.db, lambda s: sandboxed(SequenceWorld(s), 10 ** 6), _seeds(args.trial_seeds),
+                         _seeds(args.holdout_seeds), params=params)
+        print(json.dumps(res, indent=2, default=str))
+    elif args.cmd == "approve":
+        from . import self_improvement as SI
+        print(json.dumps({"deployed_config": SI.approve(args.db, args.version, args.by)}))
+    elif args.cmd == "rollback":
+        from . import self_improvement as SI
+        print(json.dumps({"active_config": SI.rollback(args.db)}))
+    elif args.cmd == "dashboard":
+        from .dashboard import serve
+        serve(args.db, args.host, args.port)
     return 0
 
 

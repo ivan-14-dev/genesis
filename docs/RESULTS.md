@@ -9,8 +9,10 @@ python -m genesis benchmark --seeds 100-109 --out results/benchmark-seeds100-109
 - **Seeds and data:** 10 held-out seeds (100–109), not used during development. Every world's rules are
   sampled from its seed and never shown to the agent. The raw output is in
   [`../results/benchmark-seeds100-109.json`](../results/benchmark-seeds100-109.json).
-- **Runtime:** about 10 minutes wall time on one CPU core for the whole suite (three strategies, budget sweep,
-  ablations).
+- **Runtime:** about 15 minutes wall time on one CPU core for the whole suite (three strategies, budget sweep,
+  ablations, stage 6 allocation, one stage 7 self-improvement cycle).
+- **Determinism:** results do not depend on `PYTHONHASHSEED` (a set ordering that did was fixed; regression
+  test `test_behaviour_independent_of_hash_seed`).
 - **Accuracy definition:** every accuracy below is measured against the *hidden* rules, on inputs the agent has
   not experienced.
 
@@ -37,10 +39,11 @@ python -m genesis benchmark --seeds 100-109 --out results/benchmark-seeds100-109
 
 Cost per seed:
 - **Observations per stream to validation:** 8.4 on average.
-- **Interactions:** 214 in total, including spaced reviews.
-- **Compute:** about 6 s CPU and about 2.1M candidate programs evaluated.
+- **Interactions:** 194 in total, including spaced reviews.
+- **Compute:** about 2.5 s CPU and about 1.2M candidate programs evaluated (procedural memory now shortcuts
+  the search, see below).
 - **Memory:** about 190 KB.
-- **Calibration:** ECE 0.066.
+- **Calibration:** ECE 0.065.
 
 The single failure is seed 104, stream S6 (a modular counter). The needed modulus constant was never
 proposed, so the agent labelled the stream *unpredictable* rather than inventing a rule. This is the honest
@@ -50,18 +53,20 @@ failure mode, but it is still a failure of the constant-proposal heuristic.
 
 | Budget (observations) | Curiosity | Round-robin | Random |
 |---|---|---|---|
-| 60 | 0.0% | 0.0% | **23.8%** |
-| 100 | **96.3%** | 91.3% | 73.8% |
-| 150 | **98.8%** | 96.3% | 90.0% |
+| 60 | **60.0%** | 0.0% | 23.8% |
+| 100 | **92.5%** | 91.3% | 73.8% |
+| 150 | **98.8%** | 96.3% | 91.3% |
 
-Curiosity is best once the budget allows each stream about 11 observations.
+**Fix of the earlier negative result (60 observations: curiosity 0%).** Curiosity used to spread samples
+breadth-first, so no stream reached the validation threshold. The agent now applies *budget-aware focus*
+(`Genesis._focus`): when the remaining budget cannot cover the expected cost of every open problem, it finishes
+the cheapest open problem first. The expected cost is the median number of observations its own past problems
+needed (learned, default 8 before any experience). Problems that already took more than twice that are set
+aside.
 
-**Negative result:** at 60 observations, curiosity spreads its samples breadth-first (like round-robin), so no
-stream reaches the validation threshold. Random sampling validates some streams by chance concentration.
-Curiosity also does not reduce observations spent on noise (about 22 vs 20 for round-robin at budget 100),
-because noise must be observed at least 8 times before it can be judged unpredictable.
-
-Allocation by learning progress (focusing on streams likely to resolve) is on the roadmap (stage 6).
+Remaining negative: curiosity still spends slightly more observations on noise (15.2 vs 12 for round-robin at
+budget 60; 22.1 vs 20 at 100; 32.7 vs 30 at 150), because noise must be observed at least 8 times before it can
+be judged unpredictable.
 
 ## Stages 2–3 — relationships and causal discovery (CausalWorld: 4 properties, 4 actions, ≥ 1 confounded rule)
 
@@ -80,9 +85,10 @@ Learning curve (mean held-out accuracy on unseen configurations, 10 seeds):
 | Experiments | 0 | 5 | 10 | 20 | 40 | 80 | 120 |
 |---|---|---|---|---|---|---|---|
 | Curiosity (EIG) | 27.2% | **99.0%** | 99.3% | 99.3% | 99.3% | 99.7% | 100% |
-| Random experiments | 27.2% | 74.3% | 83.6% | 96.6% | 97.3% | 99.2% | 100% |
+| Random experiments | 27.2% | 74.3% | 83.6% | 96.6% | 97.3% | 99.2% | 99.6% |
 
-Experiments needed to reach 100%: **24.5** with curiosity vs 58.5 with random experiments (mean over seeds).
+Experiments needed to reach 100%: **24.5** with curiosity (10/10 runs) vs 51.7 with random experiments
+(only 9/10 runs reach 100% within 120 experiments).
 
 ### Confounded rules
 
@@ -90,7 +96,7 @@ Experiments needed to reach 100%: **24.5** with curiosity vs 58.5 with random ex
 |---|---|
 | Confounded rules with the true cause identified after passive watching | 0% |
 | Confounded rules with the true cause identified after experiments | **100%** |
-| Associations labelled causal / spurious | 7 / 6 |
+| Associations labelled causal / spurious | 7 / 5 |
 | Spurious labels that coincide with a real rule condition | 0 |
 
 ## Stage 4 — memory
@@ -117,14 +123,65 @@ measure reasoning more seriously.
 
 ## Meta-learning (procedural memory of successful rule shapes)
 
-Mean observations to validation in later worlds (worlds 4–6 of 6, 5 seeds): **8.23 with** the procedural prior
-vs **8.25 without** it.
+Six worlds in sequence, later worlds 4–6, 5 seeds. With the prior, shapes that worked before are instantiated
+first (*library-first search*); full enumeration is skipped when one of them fits the data exactly.
 
-**No measurable effect.** Validation is limited by the forward-evidence requirement (4 correct predictions),
-not by the search. A useful test of this mechanism needs a larger hypothesis space, where the prior changes
-what is found first (roadmap phase 3, library learning).
+| Metric (later worlds) | With procedural memory | Without |
+|---|---|---|
+| Candidate programs evaluated per rule stream | **2,343** | 39,099 (16.7×) |
+| CPU seconds per world | 2.38 | 2.52 (−6%) |
+| Observations to validation | 8.11 | 8.25 |
+| Extrapolation accuracy | 100% | 100% |
+
+**Fixed:** remembering rule shapes now gives a large, measured reduction in search. **Still small:** wall-clock
+gain is only 6% (noise streams, which have no remembered shape, dominate the CPU), and observations to
+validation barely change, because validation requires 4 correct *forward* predictions whatever the search does.
+
+## Stage 6 — autonomous exploration (`autonomy.py`)
+
+Four worlds, one shared budget, no instruction on where to look: a sequence world, a pure-noise world and two
+causal labs. The explorer allocates chunks of 10 interactions. Each world is probed twice, then chosen by
+measured learning progress (|Δ accuracy| per step + newly validated rules; "unpredictable" verdicts don't count)
+plus a small optimism bonus 0.1/√chunks. It stops when no world shows progress ≥ 0.05. Knowledge gaps become
+stored objectives (achieved / abandoned as unpredictable). Knowledge score = mean held-out accuracy over the
+three learnable worlds.
+
+| Budget | Learning progress | Round-robin | Random |
+|---|---|---|---|
+| 100 | 0.702 (noise share 20%) | **0.723** (30%) | 0.663 (31%) |
+| 150 | **0.849** (13%) | 0.792 (28%) | 0.772 (32%) |
+| 300 | 0.980 (18%, stopped itself after 229) | 0.975 (40%, 295) | 0.981 (41%, 295) |
+
+- At 150 it beats round-robin by +5.7 points and spends half as much on noise.
+- At 300 it reaches the same knowledge using 22% fewer interactions, by stopping itself.
+- **Negative:** at 100 it loses to round-robin. The two probe chunks per world cost 80 of the 100 interactions,
+  so there is almost nothing left to exploit.
+- On demo seed 0 at 150, random allocation won (86.2% vs 84.7%); per-seed variance is large.
+
+## Stage 7 — controlled self-improvement (`self_improvement.py`)
+
+Proposes one-parameter variants from an allowlist (safety parameters cannot be changed:
+`PermissionError`). Evaluates each in isolated temporary agents with an *observable* score: predict 5 terms,
+then observe them. It refuses to run if the safety digest has changed, and checks reproducibility by evaluating
+the baseline twice. A variant must gain ≥ 0.01 on trial seeds and be **strictly better** on holdout seeds with no
+more false validations. It is then stored as `pending-approval`; only a named human can `approve` it, and
+`rollback` restores the previous configuration.
+
+| Item | Result |
+|---|---|
+| Evaluation reproducible | yes |
+| Baseline on trial seeds | 0.713 |
+| Best variant | `sequence.validation_k` 4 → 3: trial +0.033 |
+| Holdout (seeds 9101–9103) | 0.747 vs 0.740, same false validations (1) → `pending-approval` |
+| Other variants (`shape_bias`, `default_resolution_cost`, `novelty_weight`) | exactly 0 effect at this budget |
+
+**Honest reading:** the confirmed gain is small (+0.007 on holdout, one prediction in 150). It trades evidence for
+speed (fewer forward checks), which a human should weigh before approving. Limitations found in its own records
+(stuck problems, streams judged unpredictable, blocked gates) are reported by `limitations()`.
 
 ## Developmental gating
 
-On the demo run (seed 0), the agent passes the gates for stages 0–5 one after another, each based on measured
-metrics. It stops at stage 6 because that gate is explicitly *not implemented*.
+On the demo run (seed 0), the agent passes the gates for stages 0–7 one after another, each based on measured
+metrics. The stage 6 gate requires a gain ≥ 0.02 over round-robin and ≤ 25% of the budget spent on noise. The
+stage 7 gate requires a reproducible evaluation, an unchanged safety policy, no holdout regression and at least
+one self-identified limitation. It does **not** require any change to be deployed.
