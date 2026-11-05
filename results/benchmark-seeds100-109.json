@@ -1,0 +1,259 @@
+{
+  "seeds": [
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109
+  ],
+  "wall_seconds": 607.4,
+  "stage1_patterns": {
+    "rule_streams_validated": 0.9875,
+    "rule_extrapolation_accuracy": 0.9875,
+    "validated_rule_extrapolation_accuracy": 1.0,
+    "baseline_repeat_last": 0.0762,
+    "baseline_linear_extrapolation": 0.16,
+    "noise_flagged_unpredictable": 1.0,
+    "false_validation_rate_on_noise": 0.0,
+    "observations_to_validation": 8.4,
+    "interactions_used": 214.5,
+    "cpu_seconds": 6.1857,
+    "expressions_evaluated": 2072772.8,
+    "calibration_ece": 0.0658,
+    "memory_bytes": 188416.0,
+    "failures": [
+      [
+        104,
+        "S6",
+        "modular-counter",
+        "unpredictable",
+        null
+      ]
+    ]
+  },
+  "attention_budget_sweep": {
+    "budget_60/curiosity": {
+      "rule_streams_validated": 0.0,
+      "observations_on_noise": 12.0
+    },
+    "budget_60/round_robin": {
+      "rule_streams_validated": 0.0,
+      "observations_on_noise": 12.0
+    },
+    "budget_60/random": {
+      "rule_streams_validated": 0.2375,
+      "observations_on_noise": 10.6
+    },
+    "budget_100/curiosity": {
+      "rule_streams_validated": 0.9625,
+      "observations_on_noise": 21.9
+    },
+    "budget_100/round_robin": {
+      "rule_streams_validated": 0.9125,
+      "observations_on_noise": 20.0
+    },
+    "budget_100/random": {
+      "rule_streams_validated": 0.7375,
+      "observations_on_noise": 21.1
+    },
+    "budget_150/curiosity": {
+      "rule_streams_validated": 0.9875,
+      "observations_on_noise": 32.9
+    },
+    "budget_150/round_robin": {
+      "rule_streams_validated": 0.9625,
+      "observations_on_noise": 30.0
+    },
+    "budget_150/random": {
+      "rule_streams_validated": 0.9,
+      "observations_on_noise": 31.0
+    }
+  },
+  "stage2_3_causal": {
+    "accuracy_before_experience": 0.0,
+    "after_watching_natural_distribution": 0.9895,
+    "after_watching_interventional_distribution": 0.2777,
+    "confounded_rules_correct_after_watching": 0.0,
+    "confounded_rules_correct_after_experiments": 1.0,
+    "curve_curiosity": [
+      {
+        "experiments": 0,
+        "heldout_unseen": 0.2718
+      },
+      {
+        "experiments": 5,
+        "heldout_unseen": 0.9901
+      },
+      {
+        "experiments": 10,
+        "heldout_unseen": 0.9932
+      },
+      {
+        "experiments": 20,
+        "heldout_unseen": 0.9932
+      },
+      {
+        "experiments": 40,
+        "heldout_unseen": 0.9931
+      },
+      {
+        "experiments": 80,
+        "heldout_unseen": 0.9974
+      },
+      {
+        "experiments": 120,
+        "heldout_unseen": 1.0
+      }
+    ],
+    "curve_random": [
+      {
+        "experiments": 0,
+        "heldout_unseen": 0.2718
+      },
+      {
+        "experiments": 5,
+        "heldout_unseen": 0.7426
+      },
+      {
+        "experiments": 10,
+        "heldout_unseen": 0.8357
+      },
+      {
+        "experiments": 20,
+        "heldout_unseen": 0.9663
+      },
+      {
+        "experiments": 40,
+        "heldout_unseen": 0.9731
+      },
+      {
+        "experiments": 80,
+        "heldout_unseen": 0.9918
+      },
+      {
+        "experiments": 120,
+        "heldout_unseen": 1.0
+      }
+    ],
+    "experiments_to_perfect_curiosity": 24.5,
+    "experiments_to_perfect_random": 58.5,
+    "runs_reaching_perfect_curiosity": 1.0,
+    "runs_reaching_perfect_random": 1.0,
+    "final_heldout_unseen": 1.0,
+    "transfer_out_of_range": 1.0,
+    "tabular_baseline_heldout": 0.4642,
+    "tabular_baseline_transfer": 0.4597,
+    "no_change_baseline": 0.4463,
+    "associations_causal": 7,
+    "associations_spurious": 6,
+    "spurious_associations_matching_a_rule": 0,
+    "cpu_seconds": 0.4712,
+    "calibration_ece": 0.0104
+  },
+  "stage4_memory": {
+    "accuracy_world_a": 1.0,
+    "retention_after_reload": 1.0,
+    "accuracy_world_b": 1.0,
+    "forgetting_after_new_world": 0.0,
+    "replay_consistency": 1.0
+  },
+  "stage5_planning": {
+    "plan_success": 1.0,
+    "random_policy_success": 0.785,
+    "plan_mean_steps": 1.285,
+    "random_policy_mean_steps_when_successful": 3.3517
+  },
+  "procedural_meta_learning": {
+    "with_prior": [
+      [
+        9.25,
+        8.0,
+        8.625,
+        8.0,
+        8.375,
+        8.75
+      ],
+      [
+        8.375,
+        9.75,
+        8.0,
+        8.5,
+        8.5,
+        8.25
+      ],
+      [
+        8.0,
+        8.125,
+        8.375,
+        8.125,
+        8.125,
+        8.0
+      ],
+      [
+        8.25,
+        8.625,
+        8.25,
+        8.125,
+        8.125,
+        8.0
+      ],
+      [
+        8.125,
+        8.375,
+        8.25,
+        8.125,
+        8.25,
+        8.25
+      ]
+    ],
+    "without_prior": [
+      [
+        9.25,
+        8.0,
+        8.625,
+        8.0,
+        8.375,
+        8.875
+      ],
+      [
+        8.375,
+        9.25,
+        8.0,
+        8.625,
+        8.5,
+        8.25
+      ],
+      [
+        8.0,
+        8.125,
+        8.375,
+        8.125,
+        8.125,
+        8.0
+      ],
+      [
+        8.25,
+        8.625,
+        8.25,
+        8.125,
+        8.125,
+        8.0
+      ],
+      [
+        8.125,
+        8.375,
+        8.25,
+        8.125,
+        8.25,
+        8.25
+      ]
+    ],
+    "late_worlds_with_prior": 8.2333,
+    "late_worlds_without_prior": 8.25
+  }
+}
