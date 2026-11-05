@@ -20,12 +20,33 @@ python -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m genesis inspect --db runs/demo.db --status refuted
 .venv/bin/python -m genesis inspect --db runs/demo.db --explain 12   # why is belief #12 held?
 .venv/bin/python -m genesis dashboard --db runs/demo.db             # read-only monitor: http://127.0.0.1:8765
+.venv/bin/python -m genesis chat --db runs/demo.db                  # ChatGPT-style entry point: http://127.0.0.1:8766
+.venv/bin/python -m genesis chat --db runs/demo.db --terminal       # same, in the terminal
 .venv/bin/python -m genesis improve --db runs/demo.db               # stage 7: propose + evaluate, never deploys
 .venv/bin/python -m genesis approve --db runs/demo.db --version 2 --by <name>   # human-only deployment
 .venv/bin/python -m genesis rollback --db runs/demo.db
 .venv/bin/python -m genesis benchmark --seeds 100-109                 # full suite (~15 min, CPU)
 .venv/bin/python -m pytest -q
 ```
+
+## Chat entry point
+
+`python -m genesis chat` serves a ChatGPT-style page: a sidebar with persistent conversation history, message
+bubbles, suggestions, FR/EN. **There is no language model behind it.** GENESIS understands only a small,
+designer-provided command grammar (innate interface, not acquired knowledge):
+
+- a sequence of ≥ 4 integers (`3, 7, 11, 15, 19`) is fed term by term through the real cognitive cycle
+  (`Genesis.live`): the agent predicts each term *before* reading it, then reports the rule it found (validated,
+  candidate or unpredictable), its confidence, its next terms and its prediction trace;
+- `continue 23 27` / a few numbers alone add evidence to the last sequence; `predict 5` rolls it out;
+- `explain 12` / `why` cites the episodes supporting a belief; `#12` links in replies do the same;
+- `what do you know?`, `stage`, `limitations`, `questions`, `explore 100` (autonomous experimentation in a new
+  sandboxed hidden world) answer from long-term memory only.
+
+Anything else gets an explicit "I don't understand; I'm not a language model" reply. Numbers typed by the user are
+stored as episodes with provenance `user-provided`, kept distinct from the agent's own observations. The server
+binds to localhost, accepts only same-origin JSON POSTs ≤ 16 KB, and holds the memory DB for its lifetime (don't
+run `demo`/`approve` on the same DB at the same time).
 
 ## What the demo shows (seed 0)
 
@@ -86,6 +107,8 @@ genesis/
   autonomy.py        stage 6: learning-progress allocation across worlds, self-generated objectives
   self_improvement.py stage 7: sandboxed evaluation of config variants, human approval, rollback, limitations
   dashboard.py       read-only monitoring web UI + JSON API (stdlib only)
+  chat.py            chat engine: small FR/EN command grammar, user sequences learned via the cognitive cycle
+  chat_server.py     ChatGPT-style web UI + JSON API over chat.py (stdlib only)
   experiments.py     benchmarks, baselines and controls
   demo.py, __main__.py
 tests/               pytest suite (incl. a static check that agent code never reads hidden world internals)

@@ -1,4 +1,4 @@
-"""Command line: ``python -m genesis {demo,benchmark,inspect,improve,approve,rollback,dashboard}``."""
+"""Command line: ``python -m genesis {demo,benchmark,inspect,improve,approve,rollback,dashboard,chat}``."""
 
 from __future__ import annotations
 
@@ -13,6 +13,27 @@ def _seeds(spec: str) -> list:
         a, b = spec.split("-")
         return list(range(int(a), int(b) + 1))
     return [int(s) for s in spec.split(",")]
+
+
+def _chat_terminal(db: str, worlds) -> None:
+    from .agent import Genesis
+    from .chat import ChatEngine
+    agent = Genesis(db)
+    engine = ChatEngine(agent, worlds)
+    cid = engine.new_conversation()["id"]
+    print("GENESIS (no language model). Type a number sequence, 'help'/'aide', or Ctrl+D to quit.")
+    try:
+        while True:
+            try:
+                text = input("\nyou> ").strip()
+            except EOFError:
+                break
+            if text:
+                print("\ngenesis> " + engine.send(cid, text)["reply"]["text"])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        agent.close()
 
 
 def main(argv=None) -> int:
@@ -44,6 +65,11 @@ def main(argv=None) -> int:
     ds.add_argument("--db", default="runs/demo.db")
     ds.add_argument("--host", default="127.0.0.1")
     ds.add_argument("--port", type=int, default=8765)
+    ch = sub.add_parser("chat", help="ChatGPT-style entry point (web UI, or --terminal); no language model")
+    ch.add_argument("--db", default="runs/demo.db", help="memory to use (a newborn agent if it does not exist)")
+    ch.add_argument("--host", default="127.0.0.1")
+    ch.add_argument("--port", type=int, default=8766)
+    ch.add_argument("--terminal", action="store_true", help="chat in the terminal instead of the browser")
     args = ap.parse_args(argv)
     if getattr(args, "db", None) and args.cmd in ("improve", "approve", "rollback", "dashboard") \
             and not os.path.exists(args.db):
@@ -89,6 +115,15 @@ def main(argv=None) -> int:
     elif args.cmd == "dashboard":
         from .dashboard import serve
         serve(args.db, args.host, args.port)
+    elif args.cmd == "chat":
+        from .environments import SequenceWorld, sandboxed
+        os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
+        worlds = lambda s: sandboxed(SequenceWorld(s), 1000)  # noqa: E731 - harness supplies sandboxed worlds
+        if args.terminal:
+            _chat_terminal(args.db, worlds)
+        else:
+            from .chat_server import serve as serve_chat
+            serve_chat(args.db, args.host, args.port, worlds)
     return 0
 
 

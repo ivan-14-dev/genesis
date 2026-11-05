@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS model_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, parent INTEGER, config TEXT NOT NULL,
     rationale TEXT, trial_metrics TEXT, holdout_metrics TEXT, status TEXT NOT NULL, approved_by TEXT,
     safety_digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts REAL NOT NULL, updated_ts REAL NOT NULL,
+    title TEXT, lang TEXT);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, ts REAL NOT NULL,
+    role TEXT NOT NULL, text TEXT NOT NULL, meta TEXT);
+CREATE INDEX IF NOT EXISTS ix_chat_conv ON chat_messages(conversation_id, id);
 """
 
 
@@ -263,6 +270,42 @@ class LongTermMemory:
             d = dict(r)
             for k in ("config", "trial_metrics", "holdout_metrics"):
                 d[k] = json.loads(d[k]) if d[k] else None
+            out.append(d)
+        return out
+
+    # ----------------------------------------------------------- conversations
+    # Transcripts of the chat interface. What the agent *learns* from a conversation is stored as episodes
+    # with provenance "user-provided", like any other experience; transcripts are only the dialogue record.
+    def add_conversation(self, title: Optional[str] = None, lang: Optional[str] = None) -> int:
+        now = time.time()
+        return self.db.execute("INSERT INTO conversations(created_ts, updated_ts, title, lang) VALUES (?,?,?,?)",
+                               (now, now, title, lang)).lastrowid
+
+    def conversation(self, cid: int) -> Optional[dict]:
+        r = self.db.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
+        return dict(r) if r else None
+
+    def update_conversation(self, cid: int, **fields) -> None:
+        fields = {k: v for k, v in fields.items() if k in ("title", "lang")}
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE conversations SET updated_ts=?{', ' + sets if sets else ''} WHERE id=?",
+                        (time.time(), *fields.values(), cid))
+
+    def conversations(self, limit: int = 100) -> list:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM conversations ORDER BY updated_ts DESC, id DESC LIMIT ?", (limit,))]
+
+    def add_message(self, cid: int, role: str, text: str, meta=None) -> dict:
+        ts = time.time()
+        mid = self.db.execute("INSERT INTO chat_messages(conversation_id, ts, role, text, meta) VALUES (?,?,?,?,?)",
+                              (cid, ts, role, text, json.dumps(meta) if meta is not None else None)).lastrowid
+        return {"id": mid, "conversation_id": cid, "ts": ts, "role": role, "text": text, "meta": meta}
+
+    def messages(self, cid: int) -> list:
+        out = []
+        for r in self.db.execute("SELECT * FROM chat_messages WHERE conversation_id=? ORDER BY id", (cid,)):
+            d = dict(r)
+            d["meta"] = json.loads(d["meta"]) if d["meta"] else None
             out.append(d)
         return out
 

@@ -67,6 +67,7 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Developmental curriculum | `metacognition.py: CURRICULUM` | Piaget-inspired staged development with measurable gates | stages 0–7 gated |
 | Autonomous exploration | `autonomy.py: Explorer` | Learning-progress–driven allocation (Oudeyer & Kaplan, intelligent adaptive curiosity); self-generated objectives | implemented (stage 6) |
 | Self-improvement | `self_improvement.py` | Bounded, reproducible A/B evaluation of allowlisted parameters on trial + holdout seeds; human approval; rollback | implemented (stage 7) |
+| Entry point (chat) | `chat.py`, `chat_server.py` | Interaction channel, not language understanding: a small innate command grammar routes user input to the cycle (`live` on user-provided sequences) or to memory queries (`explain`, knowledge, stage, limitations, curiosity gaps) | implemented (no LLM; stdlib HTTP + vanilla JS, ChatGPT-style UI, persistent conversations) |
 | Observability | `dashboard.py` | Read-only inspection of memory; every element traceable to DB rows (`explain`) | implemented (stdlib HTTP + vanilla JS) |
 
 ## C. Module diagram
@@ -96,6 +97,7 @@ flowchart LR
     SI[Self-improvement sandbox<br/>isolated trial agents]
     HUM([Human approval])
     DASH[Dashboard<br/>read-only]
+    CHAT([Chat entry point<br/>command grammar · no LLM])
 
     SB -- observation --> PER --> ATT --> WM
     WM <--> LTM
@@ -117,6 +119,8 @@ flowchart LR
     SI -- pending version --> HUM
     HUM -- approve / rollback --> LTM
     LTM -. read only .-> DASH
+    CHAT -- user-provided sequences --> SB
+    CHAT <-- explain · knowledge · gaps --> LTM
 ```
 
 ### The 12-step cycle (`Genesis.live`)
@@ -217,6 +221,7 @@ Details of the core learner (`RuleLearner`):
 | `associations` | Associative | a, b, kind (correlational/causal/spurious/inconclusive), weight, n, contrast details |
 | `metacog` | Metacognitive | session, metric, value, context (calibration, replay consistency, assessments) |
 | `learner_state` | Model state | serialised learners (data, hypotheses, statistics) to resume across sessions |
+| `conversations` + `chat_messages` | Interaction log | conversation title/lang; messages (role, text, meta JSON with intent, knowledge id, status). Data typed by the user enters `episodes` with provenance `user-provided` (external information, distinct from own observation) |
 | `meta` | Identity | innate manifest + digest, safety digest, stage-0 audit, session counter, review schedule |
 
 Consolidation never deletes episodes; refuted beliefs are kept with their refuting evidence.
@@ -249,7 +254,7 @@ future source must be tagged with provenance `external` and kept separate from e
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
 | 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
 | 7 ✅ | **Observability service**: read-only API over the memory DB + dashboard (stage, curves, beliefs, `explain`). Built with stdlib `http.server` + vanilla JS instead of FastAPI/React: no measured need yet justifies the dependencies | every dashboard element traceable to DB rows |
-| 8 | Simulated physics world; text interaction grounded in learned concepts | defined when phase 5 is complete |
+| 8 (started) | Simulated physics world; text interaction grounded in learned concepts. *Done so far:* chat entry point with an innate command grammar (FR/EN) routing user sequences through the cycle and answering from memory; no language is learned yet | defined when phase 5 is complete |
 
 Dependencies are added only when their phase begins and a measured need justifies them (PyTorch at phase 5;
 FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when there are services to orchestrate).
