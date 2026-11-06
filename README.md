@@ -4,7 +4,8 @@ GENESIS is a research prototype. It is **not** a chatbot and does **not** use an
 with a few innate computational primitives: integer `+ − × mod`, equality/conditional selection, and the
 constants 0–3. From there it builds its own model of small worlds whose rules are sampled from a seed and
 hidden from it. It works by observing, predicting, choosing informative experiments, and remembering what it
-learned along with the evidence for it.
+learned along with the evidence for it. A designer-provided bilingual grammar and symbolic inference mechanism
+also let it acquire simple facts from teaching; these external assertions are never labelled as verified observations.
 
 - Architecture, scientific rationale, interfaces, memory model, curriculum, roadmap and risks:
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
@@ -26,6 +27,7 @@ python -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m genesis approve --db runs/demo.db --version 2 --by <name>   # human-only deployment
 .venv/bin/python -m genesis rollback --db runs/demo.db
 .venv/bin/python -m genesis benchmark --seeds 100-109                 # full suite (~15 min, CPU)
+.venv/bin/python -m genesis grounded --seed 100 --db runs/objects.db # new file only; object-concept experiment
 .venv/bin/python -m pytest -q
 ```
 
@@ -41,7 +43,7 @@ knowledge** (no digits, no rule vocabulary such as "plus", "double", "fibonacci"
 naturally ("Qu'as-tu appris jusqu'ici ?", "How far along is your development?", "c'est quoi une règle ?",
 "n'explore pas"). Questions about anything else are parsed and answered honestly ("I understand you are asking about
 « capital », « France », but I know nothing about it"). On 38 held-out sentences written after the parser was frozen:
-38/38 intents correct, language detection 100%, 0 out-of-scope questions answered as if known (`RESULTS.md`).
+38/38 intents correct, language detection 100%, 0 out-of-scope questions answered as if known (`docs/RESULTS.md`).
 What the faculty maps sentences to:
 
 - a sequence of ≥ 4 integers (`3, 7, 11, 15, 19`) is fed term by term through the real cognitive cycle
@@ -58,13 +60,170 @@ naive-Bayes combination). The next time, it *proposes* the interpretation ("do y
 its own only once the word→command mappings have been validated by ≥ 2 confirmed predictions, says so, and
 accepts `no` as a correction. Repeated errors refute a mapping. Each learned word is a knowledge item
 (`kind="lexical"`, provenance `user-taught`) backed by episodes, so `explain` and `vocabulary` show why it is held.
-Learned words are word→command associations only; the innate faculty handles one request per message and has no
-open-domain meaning. Numbers typed by the user are
+These learned word mappings alone add no new facts. The semantic teaching channel below acquires relations
+separately. Ordinary commands still handle one request per message. Numbers typed by the user are
 stored as episodes with provenance `user-provided`, kept distinct from the agent's own observations. The server
 binds to localhost, accepts only same-origin JSON POSTs ≤ 16 KB, and holds the memory DB for its lifetime (don't
 run `demo`/`approve` on the same DB at the same time).
 
+### Teach facts, then ask a new question
+
+The semantic memory (`semantic.py`) starts empty. In the chat, send:
+
+```text
+Nala est un chat; Les chats sont des animaux
+Nala est-elle un animal ?
+pourquoi ?
+Milo est un chat
+Milo est-il un animal ?
+que sais-tu de Nala ?
+```
+
+GENESIS derives membership using the taught relations and cites the premise IDs. Neither the names nor their
+categories are supplied at birth. English equivalents work: `Nala is a cat; All cats are animals`, `Is Nala an
+animal?`, `why?`, `what do you know about Nala?`. The logic of inheritance is innate, **not learned**; this is
+symbolic acquisition and reuse of teachings, not unsupervised language learning or human-level understanding.
+
+- Teach several simple assertions separated by periods or semicolons. Negation belongs to each assertion:
+  `Nala est un chat; Milo n'est pas un chat`. Mixed unsupported clauses are rejected without partial teaching.
+- `Elle est un animal ?` / `Is she an animal?` uses the last unambiguous semantic subject in that conversation,
+  even after restart. Multiple subjects require an explicit name.
+- `Nala est dans Paris` / `Nala is in Paris` stores a spatial relation; no unprovided spatial rules are inferred.
+- `Nala n'est pas un chat` preserves a conflict instead of silently replacing the old assertion. A conflicted
+  premise cannot support downstream conclusions.
+- `correction : Nala n'est pas un chat` explicitly refutes the opposite teaching. `retire le fait 3` /
+  `retract fact 3` retracts a teaching or inclusion rule by its ID. Neither deletes history or episodes.
+- Inferences are recomputed from current premises; old answers remain in the transcript with their proofs.
+  Correcting a premise does not leave an obsolete conclusion active.
+
+Each teaching records source, timestamp, conversation, supporting/contradicting episodes and the prior model's
+agreement or disagreement. It remains **unverified** regardless of repetition. Questions record conditional
+inference episodes, not new observations. Unknown is distinct from false; conflicting evidence is reported.
+The existing knowledge view, `explain N`, CLI inspection and dashboard expose these records.
+
+**Bounds:** 512 distinct assertion/polarity pairs per memory; no eviction of original experiences. Labels are
+single words (hyphens allowed), case/accent-folded, with simple `-s` / French `-aux` plural normalization.
+There is no automatic translation of concepts, irregular morphology, arbitrary predicates, quantifier scope,
+negative universal rules or SMS interpretation. Ask questions separately from teachings.
+
+Reproduce the transfer/retention experiment (invented labels; no target conclusions taught):
+
+```bash
+.venv/bin/python -c 'from genesis.experiments import run_semantic_learning; print(run_semantic_learning(100))'
+```
+
 ## What the demo shows (seed 0)
+
+### A separate grounded object experiment
+
+`python -m genesis grounded --seed 100 --db runs/objects.db` starts with **no learned object concepts**.
+It experiments on simulated specimens with five opaque sensor channels and two opaque actions. Hidden laws are
+sampled by the simulator; the learner receives only sensor readings and action outcomes through the sandbox.
+
+The learner discovers which sensor subsets suffice to predict each action and groups objects by those learned
+projections. Predictions are made before actions. Novel-input forward checks and one-channel interventions
+support validation; repeated identical examples cannot validate an abstraction. Concept records cite the original
+episodes in ordinary GENESIS memory, alongside historical refutations and model revisions.
+
+The command reports accuracy on unseen object IDs with new distractor values, comparison with rote lookup and the
+existing symbolic learner, one-action goal success, persistence, retention across another world and adaptation to
+a changed hidden rule. Evaluation outcomes are not fed back into training. It preserves the database and refuses
+to overwrite an existing file:
+
+```bash
+.venv/bin/python -m genesis inspect --db runs/objects.db --status validated
+.venv/bin/python -m genesis dashboard --db runs/objects.db
+```
+
+In the measured ten-seed experiment, final transfer and goal success were 100%, with no measured forgetting.
+**The existing symbolic learner also reached 100%**. Active exploration was not consistently better than random
+at smaller budgets. See `docs/RESULTS.md` for the controls and limitations.
+
+This adds learned, task-relative representations, **not human-like general comprehension**. Sensor formats,
+feature-subset search and the notion of an action effect are innate. No word such as "fragile" is assigned to the
+learned groups in this experiment; the object workshop below adds explicit lexical teaching.
+The world is deterministic and categorical, with only
+one-step goals. Unknown relevant sensor values lead to abstention. Each world retains at most 512 experimental
+transitions; exceeding the limit stops explicitly without deleting experiences. No pretrained model, neural
+network dependency or external service is used.
+
+### Learning words from objects in the chat
+
+Start `python -m genesis chat --db runs/words.db`, then send these messages separately:
+
+```text
+atelier objets
+explore objets 80
+observe specimen-0
+teste a0
+cet objet est dax
+```
+
+`dax` has **no preset meaning**. Choose a consistent naming convention from the displayed sensor readings or
+observed effects, and teach contrasting examples on different specimens: `cet objet est dax` or
+`cet objet n'est pas dax`. For example, you can choose to label objects whose observed `a0` effect is 1;
+use the negative sentence when that effect is 0, rather than blindly copying the positive example above.
+The suggested next specimen prioritizes ambiguity. One label or repeated labels on the same configuration
+cannot validate a word. At least three correct predictions on new configurations and both label polarities
+are required after the compatible meanings stabilize.
+
+After teaching two words, ask `cet objet est-il dax ?`, `montre un objet dax et pas mip`, or
+`pourquoi le mot dax ?`. English frames include `object workshop`, `explore objects 80`,
+`this object is dax`, `this object is not dax`, `Is this object dax?`, and
+`show an object dax and not mip`. `correction : cet objet est dax` explicitly supersedes earlier annotations
+for that configuration without deleting their history.
+
+The learner links labels to sensor-value or action-effect predicates, **not command names or specimen IDs**.
+It retains competing meanings, abstains on uncertainty, and selects objects only using validated word
+interpretations. New-object effect predictions additionally require a validated action model.
+Annotations remain external teachings; validation measures agreement with the teacher, not universal meaning.
+Evidence and vocabulary persist in SQLite, shared within a world; the selected object is conversation-local.
+An observed change in the world's effects requires new lexical grounding.
+`vocabulaire` / `vocabulary` lists these interpretations separately from word-to-command associations.
+
+In the fixed ten-seed experiment, 48 labels following 80 world experiments yielded 1,280/1,280 correct
+held-out word classifications and 40/40 exact composed selections. This is a small, deliberately constrained
+test, **not human-level general understanding**. Objects are structured sensor vectors, not images;
+the original sentence frames and logical composition operators are supplied. The additional construction
+learner below learns new surface forms, not those underlying operators. See `docs/RESULTS.md`.
+
+```bash
+.venv/bin/python -c 'from genesis.experiments import run_grounded_word_learning; print(run_grounded_word_learning(100))'
+```
+
+### Learning new sentence constructions
+
+After grounding the words `dax`, `mip`, `zup` and `tov` with object examples in the workshop, teach:
+
+```text
+apprends phrase : prends dax sans mip => dax et pas mip
+apprends phrase : prends mip sans dax => mip et pas dax
+apprends phrase : prends zup sans tov => zup et pas tov
+apprends phrase : prends tov sans zup => tov et pas zup
+```
+
+GENESIS induces a reusable construction with word slots, including which slot is negated. It can then interpret
+`prends dax sans tov` without having been taught that sentence. Neither `prends ... sans ...` nor its negation
+assignment is installed as a built-in construction. English teaching uses
+`learn phrase: fetch dax without mip => dax and not mip`.
+
+The right side is an explicit teacher-provided meaning, not a meaning discovered autonomously from raw text.
+All target words must already have object examples. Three correct **prior** predictions on new slot bindings,
+with variation in every slot, are required before automatic selection. Repetition does not validate.
+Conflicting constructions abstain; `correction : apprends phrase : ... => ...` supersedes the earlier
+demonstration of that sentence, preserves history and resets validation. `vocabulaire` and `explain <id>` expose
+the learned forms and evidence. Existing explicit commands retain priority; learned forms can only select objects.
+
+**This does not deliver human-level general understanding.** Flat slot substitution and a small set of logical
+operators remain innate. No recursive syntax, quantifier scope, general reasoning algorithm or open-domain
+semantics is learned. Completely eliminating programmed learning mechanisms is not a meaningful acceptance
+criterion; learning new constructions is a measurable intermediate step, not a solution to general intelligence.
+
+```bash
+.venv/bin/python -c 'from genesis.experiments import run_construction_learning; print(run_construction_learning(100))'
+```
+
+### Original developmental demonstration
 
 - **Stage 0:** the memory starts empty, with no domain knowledge and no pretrained models. This is audited and
   stored at birth.
@@ -119,12 +278,16 @@ genesis/
   consolidation.py   sleep-like replay, refutation, generalisation, causal vs spurious associations
   adapters.py        bridges between the cognitive cycle and each environment
   agent.py           the 12-step cognitive cycle, persistence, planning
-  environments/      sandbox + SequenceWorld + CausalWorld (hidden rules)
+  environments/      sandbox + SequenceWorld + CausalWorld + ObjectWorld (hidden rules)
   autonomy.py        stage 6: learning-progress allocation across worlds, self-generated objectives
   self_improvement.py stage 7: sandboxed evaluation of config variants, human approval, rollback, limitations
   dashboard.py       read-only monitoring web UI + JSON API (stdlib only)
   language.py        innate FR/EN faculty: lexicon about itself + grammar cues; declared, versioned, audited
   chat.py            chat engine: maps parses to intents, user sequences learned via the cognitive cycle
+  semantic.py        taught relations, conditional inference, correction history and dialogue subject
+  grounding.py       learned sensor projections, experimental concepts, revisions and future validation
+  grounded_language.py object/effect word meanings learned from examples; bilingual object workshop
+  constructions.py   induced sentence frames, word slots and negation assignments with prospective validation
   lexicon.py         learned vocabulary: word→command associations taught by the user, validated by predictions
   chat_server.py     ChatGPT-style web UI + JSON API over chat.py (stdlib only)
   experiments.py     benchmarks, baselines and controls
@@ -134,10 +297,12 @@ tests/               pytest suite (incl. a static check that agent code never re
 
 ## Honest scope
 
-GENESIS learns only what its hypothesis space can express: small integer programs, plus one conditional for
-the causal world. Within that space, learning is genuine. The specific rules are sampled per seed, never given
-to the agent, and recovered from its own interactions. Beyond that space, the agent reports
-"unpredictable". The current zero-forgetting result comes from separate per-context symbolic rules; it is not
+GENESIS learns only what its hypothesis spaces can express: small integer programs, conditionals,
+bounded categorical sensor projections, grounded word predicates, and explicitly taught relations.
+Within these bounds, learning is genuine.
+The experimental world rules are sampled per seed, never given to the agent, and recovered from its own
+interactions. Beyond the supported spaces, the agent reports uncertainty or abstains. The current zero-forgetting
+results come from separate per-context models; they are not
 a general solution to catastrophic forgetting. Self-improvement is limited to a few allowlisted parameters and
 never touches the safety policy or deploys without a human. Limitations and next steps (noise-robust rules,
 sub-program library learning, neural perception) are listed in `docs/ARCHITECTURE.md`.

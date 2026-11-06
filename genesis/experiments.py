@@ -507,6 +507,392 @@ def run_language_understanding(bench=None) -> dict:
             "errors": [{k: r[k] for k in ("text", "gold", "got")} for r in rows if not r["ok"]]}
 
 
+def run_semantic_learning(seed: int = 0) -> dict:
+    """Symbolic transfer on invented labels, not a natural-language fluency benchmark.
+
+    Two inclusion rules per group are taught using one entity; a new entity is
+    introduced later. No target conclusion appears in the teaching sentences.
+    """
+    from .chat import ChatEngine
+    rng = random.Random(seed)
+    labels = set()
+    while len(labels) < 30:
+        labels.add("z" + "".join(rng.choice("bcdfghjklmnpqrtvw") for _ in range(7)) + "a")
+    labels = sorted(labels)
+    groups = [labels[i:i + 5] for i in range(0, 30, 5)]
+    started = time.perf_counter()
+    with _tmpdb() as path:
+        agent = Genesis(path, seed=seed)
+        try:
+            eng = ChatEngine(agent)
+            cid = eng.new_conversation("en")["id"]
+
+            def say(text):
+                return eng.send(cid, text)["reply"]["meta"]
+
+            initial = agent.ltm.count("knowledge")
+            queries = [f"Is {new} a {root}?" for _, new, _, _, root in groups]
+            baseline = [say(q)["status"] for q in queries]
+            for old, _, cls, parent, root in groups:
+                say(f"{old} is a {cls}; All {cls}s are {parent}s; All {parent}s are {root}s")
+            for _, new, cls, _, _ in groups:
+                say(f"{new} is a {cls}")
+            transferred = [say(q) for q in queries]
+            controls = [say(f"Is {g[1]} a {groups[(i + 1) % len(groups)][4]}?")["status"]
+                        for i, g in enumerate(groups)]
+            say("Unrelated is in Elsewhere")
+            retained = [say(q)["status"] for q in queries]
+            agent.close()
+            agent = Genesis(path, seed=seed)
+            eng = ChatEngine(agent)
+            reloaded = [say(q)["status"] for q in queries]
+            _, new, cls, _, _ = groups[0]
+            say(f"{new} is not a {cls}")
+            conflict = say(f"Is {new} a {cls}?")["status"]
+            say(f"correction: {new} is not a {cls}")
+            revised = say(queries[0])["status"]
+            unaffected = [say(q)["status"] for q in queries[1:]]
+            result = {
+                "seed": seed, "initial_knowledge": initial, "training_assertions": 24,
+                "heldout_entities": len(groups),
+                "baseline_unknown": baseline.count("unknown"),
+                "transfer_accuracy": sum(r["status"] == "supported" for r in transferred) / len(groups),
+                "proofs_with_three_premises": sum(len(r["knowledge_ids"]) == 3 for r in transferred),
+                "negative_control_false_positives": sum(s != "unknown" for s in controls),
+                "retention_after_unrelated_update": retained.count("supported") / len(groups),
+                "retention_after_reload": reloaded.count("supported") / len(groups),
+                "conflict_detected": conflict == "conflict",
+                "stale_conclusion_removed": revised == "unknown",
+                "unaffected_retention": unaffected.count("supported") / len(unaffected),
+                "episodes": agent.ltm.count("episodes"), "memory_bytes": agent.ltm.size_bytes(),
+                "elapsed_seconds": round(time.perf_counter() - started, 4),
+            }
+            agent.ltm.record_metric(agent.session, "semantic_transfer_accuracy", result["transfer_accuracy"], result)
+            return result
+        finally:
+            agent.close()
+
+
+def run_grounded_learning(seed: int = 0, steps: int = 80, db: str | None = None) -> dict:
+    """Held-out scoring is harness-only and never supplied to the learner.
+
+    An explicit database path must be new: existing memories are never erased.
+    All baselines receive exactly the initial training transitions.
+    """
+    from collections import Counter
+    from dataclasses import replace
+    from .environments import ObjectWorld
+    from .grounding import GroundedExplorer, MAX_EPISODES
+    from .induction import RuleLearner
+
+    if type(steps) is not int or not 1 <= steps <= MAX_EPISODES // 2:
+        raise ValueError(f"steps must be between 1 and {MAX_EPISODES // 2}")
+    if db is None:
+        with _tmpdb() as path:
+            return run_grounded_learning(seed, steps, path)
+    os.makedirs(os.path.dirname(db) or ".", exist_ok=True)
+    # Reserve the path atomically rather than overwriting a previous experiment.
+    fd = os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+    started = time.perf_counter()
+    agent = Genesis(db, seed=seed)
+    try:
+        world = ObjectWorld(seed)
+        learner = GroundedExplorer(agent, sandboxed(world, 4 * steps + 200))
+        heldout = world._heldout(seed + 50000)
+        cases = [(obj, action, world._true_next(obj["features"], action))
+                 for obj in heldout for action in learner.actions]
+
+        def score(predict, sample=cases):
+            values = [predict(obj, action) for obj, action, _ in sample]
+            return {"accuracy": sum(v == y for v, (_, _, y) in zip(values, sample)) / len(sample),
+                    "coverage": sum(v is not None for v in values) / len(values)}
+
+        predict = lambda obj, action: learner.predict(obj["features"], action)["value"]
+        report = {"seed": seed, "initial_knowledge": agent.ltm.count("knowledge"),
+                  "initial": score(predict), "learning_curve": []}
+        remaining = steps
+        while remaining:
+            chunk = min(16, remaining)
+            run = learner.run(chunk)
+            report["learning_curve"].append({"interactions": len(learner.state["rows"]), **score(predict)})
+            remaining -= chunk
+            if run["steps"] != chunk:
+                raise RuntimeError(f"grounded training incomplete: {run['stopped']}")
+        report["transfer"] = score(predict)
+        report["training_interactions"] = len(learner.state["rows"])
+        report["concepts"] = []
+        for action in learner.actions:
+            description = learner.models[action].description()
+            contrasts = learner.models[action].contrasts()
+            report["concepts"].append({"action": action, "representation": description,
+                                       "validation": learner.state["validation"].get(action),
+                                       "contrast_episodes": contrasts})
+        report["correct_feature_sets"] = sum(
+            description is not None and set(description["features"]) == set(world._rules[action]["channels"])
+            for action in learner.actions
+            for description in [learner.models[action].description()])
+        report["validated_concepts"] = len(agent.ltm.knowledge(kind="grounded-concept", status="validated"))
+        unknown = []
+        for obj, action, _ in cases:
+            features = dict(obj["features"])
+            features[world._rules[action]["channels"][0]] = 2
+            unknown.append(learner.predict(features, action)["value"] is None)
+        report["unseen_relevant_value_abstention"] = sum(unknown) / len(unknown)
+
+        rows = list(learner.state["rows"])
+        table, by_id, majority = {}, {}, {}
+        symbolic = {a: RuleLearner(f"baseline/{a}", learner.features,
+                                  replace(agent.configs["lab"], outcome_range=2)) for a in learner.actions}
+        for r in rows:
+            key = tuple(r["features"][f] for f in learner.features)
+            table[(key, r["action"])] = r["effect"]
+            by_id[(r["object_id"], r["action"])] = r["effect"]
+            symbolic[r["action"]].observe(r["features"], r["effect"], r["episode"], "experiment")
+        for action in learner.actions:
+            counts = Counter(r["effect"] for r in rows if r["action"] == action)
+            majority[action] = max(sorted(counts), key=counts.get) if counts else None
+        report["baselines"] = {
+            "object_id_lookup": score(lambda obj, action: by_id.get((obj["id"], action))),
+            "full_state_lookup": score(lambda obj, action: table.get(
+                (tuple(obj["features"][f] for f in learner.features), action))),
+            "majority": score(lambda obj, action: majority[action]),
+            "existing_symbolic": score(lambda obj, action: symbolic[action].predict(obj["features"]).value),
+        }
+        with _tmpdb() as random_path:
+            random_agent = Genesis(random_path, seed=seed)
+            try:
+                random_explorer = GroundedExplorer(
+                    random_agent, sandboxed(ObjectWorld(seed), steps + 1))
+                curve = []
+                remaining = steps
+                while remaining:
+                    chunk = min(16, remaining)
+                    random_explorer.run(chunk, strategy="random")
+                    curve.append({"interactions": len(random_explorer.state["rows"]),
+                                  **score(lambda obj, action:
+                                          random_explorer.predict(obj["features"], action)["value"])})
+                    remaining -= chunk
+                report["random_exploration"] = {"learning_curve": curve, "transfer": curve[-1]}
+            finally:
+                random_agent.close()
+
+        # A fresh specimen per task; evaluation outcomes are logged but never fitted.
+        goals = sandboxed(world, len(heldout))
+        successes, abstentions, random_success = 0, 0, 0.0
+        for i, obj in enumerate(heldout):
+            target = world._true_next(obj["features"], learner.actions[i % len(learner.actions)])
+            action = learner.choose_action(obj["features"], target)
+            random_success += sum(world._true_next(obj["features"], a) == target
+                                  for a in learner.actions) / len(learner.actions)
+            if action is None:
+                abstentions += 1
+                continue
+            outcome = goals.call("experiment", obj["id"], obj["features"], action)
+            success = outcome["effect"] == target
+            successes += success
+            agent.ltm.record_episode(
+                agent.session, world.env_id, "grounded-heldout-goals", "goal-directed",
+                action={"object": obj, "action": action, "target": target},
+                observation=outcome, outcome={"success": success}, reward=float(success))
+            agent.interactions += 1
+        agent.ltm.set_meta("interactions", agent.interactions)
+        report["goals"] = {"success_rate": successes / len(heldout),
+                           "random_expected_success": random_success / len(heldout),
+                           "abstentions": abstentions, "tasks": len(heldout)}
+
+        before = [predict(o, a) for o, a, _ in cases]
+        agent.close()
+        agent = Genesis(db, seed=seed)
+        learner = GroundedExplorer(agent, sandboxed(world, 4 * steps + 100))
+        report["reload_retention"] = sum(predict(o, a) == p for (o, a, _), p in zip(cases, before)) / len(cases)
+        other = GroundedExplorer(agent, sandboxed(ObjectWorld(seed + 10000), steps + 1))
+        other.run(steps)
+        report["other_world_retention"] = sum(predict(o, a) == p for (o, a, _), p in zip(cases, before)) / len(cases)
+
+        world._change("a0")
+        changed_cases = [(o, "a0", world._true_next(o["features"], "a0")) for o in heldout]
+        report["changed_rule_before"] = score(predict, changed_cases)
+        report["adaptation_run"] = learner.run(steps)
+        report["changed_rule_after"] = score(predict, changed_cases)
+        unchanged = [(o, a, y) for o, a, y in cases if a != "a0"]
+        report["unchanged_action_after_revision"] = score(predict, unchanged)
+        report["episodes"] = agent.ltm.count("episodes")
+        report["memory_bytes"] = agent.ltm.size_bytes()
+        report["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+        agent.ltm.set_meta("grounded_evaluation", report)
+        agent.ltm.record_metric(agent.session, "grounded_transfer_accuracy", report["transfer"]["accuracy"], report)
+        agent.ltm.commit()
+        return report
+    finally:
+        agent.close()
+
+
+def run_grounded_word_learning(seed: int = 0) -> dict:
+    """Learn arbitrary labels for observed effects; never teach held-out answers.
+
+    The simulated teacher lives only in this harness. Word/action assignments
+    vary with the seed. Grammar/composition rules themselves are not learned.
+    """
+    from .environments import ObjectWorld
+    from .grounding import GroundedExplorer
+    from .grounded_language import GroundedLexicon
+    started = time.perf_counter()
+    rng = random.Random(seed)
+    with _tmpdb() as path:
+        agent = Genesis(path, seed=seed)
+        try:
+            world = ObjectWorld(seed)
+            g = GroundedExplorer(agent, sandboxed(world, 1000))
+            g.run(80)
+            lex = GroundedLexicon(g)
+            heldout = world._heldout(seed + 70000)
+            actions = list(g.actions)
+            rng.shuffle(actions)
+            meanings = {w: (a, rng.randrange(2)) for w, a in zip(("dax", "mip"), actions)}
+
+            def gold(word, obj):
+                action, value = meanings[word]
+                return world._true_next(obj["features"], action) == value
+
+            def answers():
+                return [lex.predict(w, obj)["value"] for w in meanings for obj in heldout]
+
+            initial = answers()
+            objects = list(g.objects)
+            rng.shuffle(objects)
+            examples = objects[:24]
+            learned = {}
+            for word in meanings:
+                for obj in examples:
+                    learned[word] = lex.teach(word, obj, gold(word, obj), source="simulated-grounded-teaching")
+            expected = [gold(w, o) for w in meanings for o in heldout]
+            predicted = answers()
+            combinations = [[("dax", a), ("mip", b)] for a in (False, True) for b in (False, True)]
+            reference_correct = 0
+            for terms in combinations:
+                selected = {o["id"] for o in lex.select(heldout, terms)}
+                wanted = {o["id"] for o in heldout if all(gold(w, o) != negative for w, negative in terms)}
+                reference_correct += selected == wanted
+            report = {
+                "seed": seed, "initial_word_coverage": sum(v is not None for v in initial) / len(initial),
+                "world_experiments": len(g.state["rows"]), "word_training_examples": 48,
+                "test_objects": len(heldout), "word_predictions": len(predicted),
+                "word_accuracy": sum(a == b for a, b in zip(predicted, expected)) / len(expected),
+                "word_coverage": sum(v is not None for v in predicted) / len(predicted),
+                "exact_compositional_references": reference_correct, "composition_queries": len(combinations),
+                "validated_words": sum(r["validated"] for r in learned.values()),
+                "compatible_meanings": {w: r["candidates"] for w, r in learned.items()},
+                "forward_checks": {w: r["forward_ok"] for w, r in learned.items()},
+                "object_id_lookup_coverage": sum(o["id"] in {e["id"] for e in examples}
+                                                  for o in heldout) / len(heldout),
+                "unknown_negative_references": len(lex.select(heldout, [("unseenword", True)])),
+            }
+            agent.close()
+            agent = Genesis(path, seed=seed)
+            g = GroundedExplorer(agent, sandboxed(world, 1000))
+            lex = GroundedLexicon(g)
+            report["reload_retention"] = sum(a == b for a, b in zip(answers(), predicted)) / len(predicted)
+            victim = examples[0]
+            bad = lex.teach("dax", victim, not gold("dax", victim), source="simulated-grounded-teaching")
+            report["conflict_abstention"] = all(lex.predict("dax", o)["value"] is None for o in heldout)
+            lex.teach("dax", victim, gold("dax", victim), correction=True, source="simulated-grounded-teaching")
+            for obj in objects[24:]:
+                lex.teach("dax", obj, gold("dax", obj), source="simulated-grounded-teaching")
+            report["correction_revalidated"] = lex.predict("dax", heldout[0])["validated"]
+            report["post_correction_accuracy"] = sum(a == b for a, b in zip(answers(), expected)) / len(expected)
+            report["old_annotation_preserved"] = agent.ltm.episode(bad["episode_id"]) is not None
+            report["world_experiments_after_language"] = len(g.state["rows"])
+            report["episodes"] = agent.ltm.count("episodes")
+            report["memory_bytes"] = agent.ltm.size_bytes()
+            report["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+            agent.ltm.record_metric(agent.session, "grounded_word_accuracy", report["word_accuracy"], report)
+            return report
+        finally:
+            agent.close()
+
+
+def run_construction_learning(seed: int = 0) -> dict:
+    """Measure induced forms on lexical substitutions and unlabelled objects."""
+    from .constructions import ConstructionLearner, canonical
+    from .environments import ObjectWorld
+    from .grounded_language import GroundedLexicon
+    from .grounding import GroundedExplorer
+
+    started = time.perf_counter()
+    rng = random.Random(seed)
+    with _tmpdb() as path:
+        agent = Genesis(path, seed=seed)
+        try:
+            world = ObjectWorld(seed)
+            g = GroundedExplorer(agent, sandboxed(world, 1000))
+            g.run(80)
+            lex = GroundedLexicon(g)
+            words = ("dax", "mip", "zup", "tov", "bek", "nif")
+            meanings = {w: (rng.choice(g.actions), rng.randrange(2)) for w in words}
+            objects = list(g.objects)
+            rng.shuffle(objects)
+            for word, (action, value) in meanings.items():
+                for obj in objects[:24]:
+                    lex.teach(word, obj, world._true_next(obj["features"], action) == value,
+                              source="simulated-grounded-teaching")
+            grammar = ConstructionLearner(lex)
+            markers = ["".join(rng.choice("abcdefghijkl") for _ in range(8)) for _ in range(4)]
+            inverted = bool(rng.randrange(2))
+
+            def phrase(a, b, form):
+                return (f"{markers[0]} {a} {markers[1]} {b}" if form == 0 else
+                        f"{b} {markers[2]} {a} {markers[3]}")
+
+            def terms(a, b):
+                return canonical([(a, inverted), (b, not inverted)])
+
+            heldout_pairs = [(a, b) for a in words for b in words if a != b and (a in words[4:] or b in words[4:])]
+            probes = [(phrase(a, b, form), terms(a, b)) for form in range(2) for a, b in heldout_pairs]
+            initial = sum(grammar.parse(text) is not None for text, _ in probes)
+            training = {}
+            for form in range(2):
+                for a, b in ((words[0], words[1]), (words[1], words[0]),
+                             (words[2], words[3]), (words[3], words[2])):
+                    text = phrase(a, b, form)
+                    training[text] = terms(a, b)
+                    grammar.teach(text, terms(a, b), source="simulated-construction-teaching")
+            parsed = [grammar.parse(text) for text, _ in probes]
+            heldout_objects = world._heldout(seed + 81000)
+            exact = 0
+            for (_, target), result in zip(probes, parsed):
+                actual = {o["id"] for o in lex.select(heldout_objects, result["terms"])} if (
+                    result and result["validated"]) else None
+                wanted = {o["id"] for o in heldout_objects if all(
+                    (world._true_next(o["features"], meanings[w][0]) == meanings[w][1]) != negative
+                    for w, negative in target)}
+                exact += actual == wanted
+            report = {
+                "seed": seed, "initial_interpretations": initial, "world_experiments": len(g.state["rows"]),
+                "word_annotations": 144, "construction_annotations": len(training),
+                "heldout_sentences": len(probes), "heldout_objects": len(heldout_objects),
+                "parse_accuracy": sum(r is not None and r["terms"] == target for r, (_, target)
+                                      in zip(parsed, probes)) / len(probes),
+                "validated_coverage": sum(r is not None and r["validated"] for r in parsed) / len(probes),
+                "exact_object_selections": exact, "sentence_lookup_coverage": sum(
+                    text in training for text, _ in probes) / len(probes),
+                "unknown_frame_abstention": grammar.parse(f"unseenframe {words[0]} {words[1]}") is None,
+                "episodes_before_reload": agent.ltm.count("episodes"),
+            }
+            agent.close()
+            agent = Genesis(path, seed=seed)
+            g = GroundedExplorer(agent, sandboxed(world, 1000))
+            lex = GroundedLexicon(g)
+            grammar = ConstructionLearner(lex)
+            report["reload_retention"] = sum(grammar.parse(text) == old for (text, _), old
+                                              in zip(probes, parsed)) / len(probes)
+            report["memory_bytes"] = agent.ltm.size_bytes()
+            report["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+            return report
+        finally:
+            agent.close()
+
+
 # ==================================================================== suite
 def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
     seeds = list(seeds)

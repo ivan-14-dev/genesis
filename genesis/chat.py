@@ -31,6 +31,8 @@ from .language import FUNCTION, INT_RE, Parse
 from .lexicon import ASK_POSTERIOR, Lexicon
 from .metacognition import Metacognition
 from .perception import Perception
+from .semantic import SemanticDialogue
+from .grounded_language import ObjectDialogue
 
 MAX_TEXT = 2000
 MAX_TERMS = 200
@@ -162,11 +164,13 @@ class UserSequenceAdapter:
 class ChatEngine:
     """Turns a message into an action of the agent and an answer grounded in its memory."""
 
-    def __init__(self, agent, world_factory: Optional[Callable] = None):
+    def __init__(self, agent, world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None):
         self.agent = agent
         self.ltm = agent.ltm
         self.world_factory = world_factory
         self.lexicon = Lexicon(self.ltm, TEACHABLE, lambda: agent.session, ignore=YES | NO)
+        self.semantic = SemanticDialogue(agent)
+        self.objects = ObjectDialogue(agent, object_factory)
 
     # ------------------------------------------------------------ transcript
     def new_conversation(self, lang: Optional[str] = None) -> dict:
@@ -289,6 +293,12 @@ class ChatEngine:
             {"intent": "too-short"}
 
     def respond(self, cid: int, text: str, lang: str) -> tuple:
+        objects = self.objects.respond(cid, text, lang)
+        if objects is not None:
+            return objects
+        semantic = self.semantic.respond(cid, text, lang)
+        if semantic is not None:
+            return semantic
         reply, meta = self._respond(cid, text, lang)
         p = language.parse(text, lang)
         if p.corrected and meta.get("intent") not in ("not-understood", "unknown-topic"):
@@ -412,24 +422,41 @@ class ChatEngine:
 
     def vocabulary(self, lang: str) -> tuple:
         es = self.lexicon.entries()
-        if not es:
-            return _t(lang, "Je n'ai appris aucun mot pour l'instant. Quand je ne comprends pas une phrase, réponds "
+        grounded = [k for k in self.ltm.knowledge(kind="grounded-word")
+                    if k.status not in ("refuted", "dormant")]
+        constructions = [k for k in self.ltm.knowledge(kind="construction") if k.status != "refuted"]
+        if not es and not grounded and not constructions:
+            return _t(lang, "Je n'ai aucune interprétation de mot active. Quand je ne comprends pas une phrase, réponds "
                             "avec la commande que tu voulais dire : j'associerai tes mots à cette commande.",
-                      "I haven't learned any words yet. When I don't understand a sentence, reply with the command "
+                     "I have no active word interpretations. When I don't understand a sentence, reply with the command "
                       "you meant and I'll associate your words with it."), {"intent": "vocabulary", "n": 0}
         n_val = sum(1 for e in es if e["status"] == "validated")
-        lines = [_t(lang, f"J'ai appris **{self.lexicon.size()}** mot(s) de toi ({n_val} association(s) validée(s) "
-                          "par mes prédictions). Ce n'est que de l'association mot → commande, pas de la "
-                          "compréhension du langage.",
-                    f"I learned **{self.lexicon.size()}** word(s) from you ({n_val} mapping(s) validated by my "
-                    "predictions). This is word → command association only, not language understanding.")]
+        lines = [_t(lang, f"**{self.lexicon.size()}** mot(s) associé(s) à des commandes "
+                          f"({n_val} association(s) validée(s) par mes prédictions).",
+                    f"**{self.lexicon.size()}** word(s) associated with commands "
+                    f"({n_val} mapping(s) validated by my predictions).")]
         es.sort(key=lambda e: (e["status"] != "validated", -e["p"], e["word"]))
         for e in es[:15]:
             name = INTENT_FR[e["intent"]] if lang == "fr" else e["intent"]
             lines.append(f"- #{e['id']} « {e['word']} » → `{name}` — {_st(lang, e['status'])}, P = {_pct(e['p'])}, "
                          + _t(lang, f"prédictions {e['ok']} justes / {e['bad']} fausses",
                               f"predictions {e['ok']} right / {e['bad']} wrong"))
-        return "\n".join(lines), {"intent": "vocabulary", "n": len(es), "validated": n_val}
+        if grounded:
+            lines.append(_t(lang, "Interprétations apprises à partir d'objets (accord avec les exemples, "
+                                  "pas de définition universelle) :",
+                            "Interpretations learned from objects (agreement with examples, "
+                            "not universal definitions):"))
+            for k in grounded[:15]:
+                lines.append(f"- #{k.id} « {k.expr['word']} » — `{k.context}` — {_st(lang, k.status)}; "
+                             f"`{json.dumps(k.expr['meanings'])}`")
+        if constructions:
+            lines.append(_t(lang, "Constructions apprises (nombres = positions variables) :",
+                            "Learned constructions (numbers = variable slots):"))
+            for k in constructions[:15]:
+                lines.append(f"- #{k.id} `{k.statement}` — `{k.context}` — {_st(lang, k.status)}")
+        return "\n".join(lines), {"intent": "vocabulary", "n": len(es) + len(grounded),
+                                  "grounded": len(grounded), "constructions": len(constructions),
+                                  "validated": n_val + sum(k.status == "validated" for k in grounded)}
 
     def _last(self, cid: int, field: str):
         for m in reversed(self.ltm.messages(cid)):
@@ -555,8 +582,14 @@ class ChatEngine:
             return _t(lang, f"Je n'ai aucune connaissance #{kid} en mémoire.",
                       f"There is no knowledge item #{kid} in my memory."), {"intent": "explain", "found": False}
         it = ex["item"]
-        lines = [_t(lang, f"**#{kid} — `{it['statement']}`** ({_st(lang, it['status'])}, confiance {_pct(it['confidence'])})",
-                    f"**#{kid} — `{it['statement']}`** ({it['status']}, confidence {_pct(it['confidence'])})"),
+        confidence = (_t(lang, "enseignement externe non vérifié", "unverified external teaching")
+                      if it["kind"] == "semantic" else
+                      _t(lang, f"confiance {_pct(it['confidence'])}", f"confidence {_pct(it['confidence'])}"))
+        if it["kind"] in ("grounded-word", "construction"):
+            confidence = _t(
+                lang, f"accord avec les annotations nouvelles {_pct(it['confidence'])}, pas une certitude",
+                f"agreement with novel annotations {_pct(it['confidence'])}, not certainty")
+        lines = [f"**#{kid} — `{it['statement']}`** ({_st(lang, it['status'])}, {confidence})",
                  _t(lang, f"Contexte : `{it['key']}` · {it['provenance']}",
                     f"Context: `{it['key']}` · {it['provenance']}")]
         if it.get("forward_ok") is not None:
@@ -599,9 +632,15 @@ class ChatEngine:
                             for s, n in sorted(by.items(), key=lambda t: -t[1]))
         lines = [_t(lang, f"Ma mémoire contient **{len(items)}** croyances : {summary}.",
                     f"My memory holds **{len(items)}** beliefs: {summary}."),
-                 _t(lang, "Dernières règles validées :", "Latest validated rules:")]
+                 _t(lang, "Dernières croyances validées :", "Latest validated beliefs:")]
         for k in sorted(validated, key=lambda k: -k.id)[:10]:
             lines.append(f"- #{k.id} `{k.key}` : `{k.statement}` ({_pct(k.confidence)})")
+        taught = [k for k in items if k.kind == "semantic"]
+        if taught:
+            lines.append(_t(lang, "Enseignements externes (non vérifiés) :",
+                            "External teachings (unverified):"))
+            for k in taught[-10:]:
+                lines.append(f"- #{k.id} `{k.statement}` ({k.status})")
         if self.lexicon.size():
             lines.append(_t(lang, f"Et **{self.lexicon.size()}** mot(s) appris de toi (voir `vocabulaire`).",
                             f"Plus **{self.lexicon.size()}** word(s) learned from you (see `vocabulary`)."))
@@ -639,12 +678,15 @@ class ChatEngine:
         lines.append(_t(lang, "- limites d'architecture connues :", "- known architectural limits:"))
         lines += [f"  - {NOTES_FR.get(n, n) if lang == 'fr' else n}" for n in lim["architectural_notes"]]
         n = self.lexicon.size()
-        lines.append(_t(lang, f"- je ne comprends pas le langage : en plus de quelques commandes fixées par mes "
-                              f"concepteurs, je n'ai appris que {n} mot(s), associés chacun à une de ces commandes "
-                              f"(pas de grammaire, pas de sens au-delà).",
-                        f"- I do not understand language: besides a few commands fixed by my designers, I learned "
-                        f"only {n} word(s), each associated with one of those commands (no grammar, no meaning "
-                        f"beyond that)."))
+        lines.append(_t(lang, f"- j'ai appris {n} mot(s) associés à des commandes. Je peux aussi acquérir des "
+                              "relations enseignées et des sens de mots liés aux objets de l'atelier. "
+                              "Je peux apprendre des constructions simples par des exemples. "
+                              "L'alignement des mots et les opérations logiques restent fournis par mes concepteurs : "
+                              "ce n'est pas une compréhension humaine générale.",
+                        f"- I learned {n} word(s) associated with commands. I can also acquire taught relations "
+                        "and word meanings linked to workshop objects, and learn simple constructions from examples. "
+                        "Word alignment and logical operations remain designer-provided: "
+                        "this is not human-level general understanding."))
         return "\n".join(lines), {"intent": "limitations", "n": lim["n_identified_from_records"]}
 
     def questions(self, lang: str) -> tuple:
@@ -702,14 +744,16 @@ class ChatEngine:
                   "comme telle dans mon état initial, séparément de ce que j'ai appris.\n\n"
                   "Ce n'est **pas** un modèle de langage : je comprends ce qui parle de moi (connaissances, règles, "
                   "suites, stade, limites, curiosité, exploration...), pas n'importe quel sujet. Les mots qui me "
-                  f"manquent, tu peux me les apprendre (j'en ai appris {self.lexicon.size()} de toi).",
+                  f"manquent, tu peux me les apprendre ({self.lexicon.size()} mots associés aux commandes). "
+                  "Dans `atelier objets`, tu peux aussi m'enseigner des mots à partir d'exemples observés.",
                   f"I understand basic **French** and **English**: it is an **innate** faculty written by my "
                   f"designers ({m['n_forms']} word forms, {len(m['concepts'])} concepts, plus the grammar of "
                   "questions, negation, contractions and common typos). It is declared as such in my initial state, "
                   "separately from what I have learned.\n\n"
                   "It is **not** a language model: I understand what is about me (knowledge, rules, sequences, "
                   "stage, limitations, curiosity, exploring...), not any topic. You can teach me the words I lack "
-                  f"(I've learned {self.lexicon.size()} from you)."), {"intent": "languages"}
+                  f"({self.lexicon.size()} words associated with commands). In `object workshop`, "
+                  "you can also teach me words through observed examples."), {"intent": "languages"}
 
     def smalltalk(self, p: Parse, lang: str) -> tuple:
         n_ep = self.ltm.count("episodes")
@@ -733,10 +777,11 @@ class ChatEngine:
     def unknown_topic(self, p: Parse, lang: str) -> str:
         words = ", ".join(f"« {w} »" for w in p.topic[:6])
         if p.qtype:
-            head = _t(lang, f"Je comprends que tu me poses une question à propos de {words}, mais je n'en sais rien : "
-                            "je n'ai aucune expérience de ce sujet et je ne connais que ce que j'ai vécu moi-même.",
-                      f"I understand you are asking me about {words}, but I know nothing about it: I have no "
-                      "experience of that subject and I only know what I have experienced myself.")
+            head = _t(lang, f"Je repère une question à propos de {words}, mais je ne peux pas répondre à cette "
+                            "formulation depuis ma mémoire. Essaie une question simple comme "
+                            "« Nala est-elle un animal ? » ou « que sais-tu de Nala ? ».",
+                      f"I detect a question about {words}, but I cannot answer this wording from my memory. "
+                      "Try a simple question like “Is Nala an animal?” or “what do you know about Nala?”.")
         else:
             head = _t(lang, f"Je comprends la structure de ta phrase, mais pas les mots {words} : ils ne sont ni "
                             "dans mon vocabulaire inné ni dans ce que tu m'as appris.",
@@ -752,13 +797,14 @@ class ChatEngine:
         return _t(lang,
                   "Bonjour. Je suis **GENESIS**, un système cognitif expérimental. Je ne suis **pas** un modèle de "
                   "langage : je comprends le français et l'anglais de base (une faculté innée, limitée à ce qui "
-                  "parle de moi), et j'apprends les mots que tu m'enseignes.\n\n"
+                  "parle de moi et à des phrases factuelles simples), et j'apprends les mots et les relations "
+                  "que tu m'enseignes.\n\n"
                   "Tout ce que je sais du monde, je l'ai appris par expérience, et je peux montrer les épisodes qui "
                   "le justifient. Donne-moi une suite de nombres entiers, par exemple `3, 7, 11, 15, 19, 23`, et "
                   "j'essaierai d'en découvrir la règle.",
                   "Hello. I am **GENESIS**, an experimental cognitive system. I am **not** a language model: I "
                   "understand basic French and English (an innate faculty, limited to what is about me), and I learn "
-                  "the words you teach me.\n\n"
+                  "the words and simple factual relations you teach me.\n\n"
                   "Everything I know about the world I learned from experience, and I can show the episodes that "
                   "justify it. Give me a sequence of integers, e.g. `3, 7, 11, 15, 19, 23`, and I will try to "
                   "discover its rule.")
@@ -774,6 +820,13 @@ class ChatEngine:
                   "- « qu'est-ce que tu ignores ? » · « quels mots t'ai-je appris ? »\n"
                   "- « va explorer 100 fois » → j'expérimente seul dans un monde isolé aux règles cachées\n"
                   "- « c'est quoi une règle ? » → je définis mes propres notions\n"
+                  "- « Nala est un chat; Les chats sont des animaux » → enseignements non vérifiés\n"
+                  "- « Nala est-elle un animal ? » puis « pourquoi ? » → déduction et prémisses\n"
+                  "- « que sais-tu de Nala ? » → rappel ; « correction : Nala n'est pas un chat » → correction\n"
+                  "- `retire le fait 12` → rétracter un enseignement sans effacer son historique\n"
+                  "- `atelier objets` → apprendre des mots à partir d'objets et de leurs effets observés\n"
+                  "- `apprends phrase : prends dax sans mip => dax et pas mip` → enseigner une construction "
+                  "avec des mots déjà appris dans l'atelier\n"
                   "- un mot que je ne connais pas → dis-moi quelle commande tu voulais : j'apprendrai ce mot",
                   "Talk to me normally in English or French. What I can do:\n"
                   "- a **sequence of integers** (≥ 4) → I look for its rule by predicting each term\n"
@@ -784,6 +837,13 @@ class ChatEngine:
                   "- “what don't you know?” · “which words did I teach you?”\n"
                   "- “go explore 100 times” → I experiment on my own in a sandboxed world with hidden rules\n"
                   "- “what is a rule?” → I define my own notions\n"
+                  "- “Nala is a cat; All cats are animals” → unverified teachings\n"
+                  "- “Is Nala an animal?” then “why?” → deduction and premises\n"
+                  "- “what do you know about Nala?” → recall; “correction: Nala is not a cat” → correction\n"
+                  "- `retract fact 12` → retract a teaching without erasing its history\n"
+                  "- `object workshop` → learn words from objects and their observed effects\n"
+                  "- `learn phrase: fetch dax without mip => dax and not mip` → teach a construction "
+                  "using words already learned in the workshop\n"
                   "- a word I don't know → tell me which command you meant: I'll learn that word")
 
     def not_understood(self, lang: str) -> str:

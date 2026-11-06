@@ -28,6 +28,7 @@ from .environments.base import BudgetExceeded
 from .induction import InductionConfig, RuleLearner
 from .innate import DEFAULT_SAFETY, SafetyPolicy, innate_manifest
 from .memory import LongTermMemory, WorkingMemory
+from . import grounding
 from .metacognition import Metacognition
 from .perception import Perception
 
@@ -126,6 +127,7 @@ class Genesis:
         self.ltm.set_meta("born_ts", time.time())
         self.ltm.set_meta("innate_manifest", manifest)
         self.ltm.set_meta("innate_language", {**language.faculty_manifest(), "installed_session": 0})
+        self.ltm.set_meta("innate_grounding", grounding.manifest())
         self.ltm.set_meta("safety_policy_digest", self.safety.digest())
         self.ltm.set_meta("session", 0)
         self.ltm.set_meta("interactions", 0)
@@ -146,6 +148,7 @@ class Genesis:
             "no_pretrained_models": manifest["pretrained_models"] == [],
             "no_learners": not self.learners,
             "language_faculty_has_no_world_knowledge": language.audit()["passed"],
+            "grounding_has_no_preloaded_facts": grounding.manifest()["domain_knowledge"] == [],
         }
         return {"passed": all(checks.values()), "checks": checks, "counts": counts}
 
@@ -173,6 +176,7 @@ class Genesis:
         self.interactions = self.ltm.get_meta("interactions")
         self.ltm.set_meta("session", self.session)
         self._check_language_faculty()
+        grounding.register(self.ltm, self.session)
         self.reviews = self.ltm.get_meta("reviews") or {}
         self.resolution_costs = self.ltm.get_meta("resolution_costs") or {}
         self.context_obs = {r[0]: r[1] for r in self.ltm.db.execute(

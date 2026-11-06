@@ -114,9 +114,9 @@ def make_handler(engine: ChatEngine):
 
 
 def serve(db_path: str, host: str = "127.0.0.1", port: int = 8766,
-          world_factory: Optional[Callable] = None) -> None:
+          world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None) -> None:
     agent = Genesis(db_path)
-    engine = ChatEngine(agent, world_factory)
+    engine = ChatEngine(agent, world_factory, object_factory)
     srv = HTTPServer((host, port), make_handler(engine))
     print(f"GENESIS chat for {db_path} on http://{host}:{port}  (session {agent.session}; Ctrl+C to stop)",
           flush=True)
@@ -220,27 +220,45 @@ document.documentElement.lang = LANG;
 const T = FR ? {
   new:'Nouvelle discussion', history:'Historique', model:'· sans modèle de langage', hello:'Que dois-je apprendre ?',
   sub:"Je ne sais que ce que j'ai appris par expérience. Donne-moi une suite de nombres : je prédirai chaque terme avant de le lire, puis je te dirai quelle règle j'ai trouvée, et avec quelles preuves.",
-  placeholder:'Envoie une suite de nombres ou une commande…',
+  placeholder:'Enseigne un fait, pose une question ou envoie une suite…',
   note:"GENESIS n'utilise aucun modèle de langage : il comprend quelques commandes, apprend les mots que tu lui enseignes et n'affirme que ce que sa mémoire justifie.",
   stage:'Stade', beliefs:'croyances', validated:'validées', episodes:'épisodes', copy:'Copier', copied:'Copié',
   untitled:'Nouvelle discussion', error:'Erreur : ', explain:'explique ',
-  cards:[['3, 7, 11, 15, 19, 23, 27','une suite arithmétique'],['1 1 2 3 5 8 13 21 34','une récurrence'],
-         ['explorer 100','expérimenter seul dans un monde caché'],['que sais-tu ?','ce que ma mémoire contient']],
+  cards:[['3, 7, 11, 15, 19, 23, 27','une suite arithmétique'],['atelier objets','apprendre des mots à partir des objets'],
+         ['Nala est un chat; Les chats sont des animaux','enseigner deux faits, sans les précharger'],['Nala est-elle un animal ?','déduire à partir des enseignements']],
   status:{validated:'validée',candidate:'candidate',unpredictable:'imprévisible',unknown:'inconnue'},
   learnedWord:'mots appris',
   intents:{clarify:'vérification',vocabulary:'vocabulaire','teach-request':'apprentissage de mots','yes-no':'oui/non',thanks:'merci',continue:'apprentissage','too-short':'trop court',sequence:'apprentissage',explain:'preuves',knowledge:'mémoire',explore:'exploration',stage:'stade',limitations:'limites',questions:'curiosité',predict:'prédiction','not-understood':'non compris',help:'aide',intro:'présentation',refused:'refusé',define:'définition',languages:'langues',smalltalk:'conversation',bye:'au revoir',declined:'refus','unknown-topic':'hors de mes connaissances'}
 } : {
   new:'New chat', history:'History', model:'· no language model', hello:'What should I learn?',
   sub:"I only know what I learned from experience. Give me a number sequence: I will predict each term before reading it, then tell you which rule I found and on what evidence.",
-  placeholder:'Send a number sequence or a command…',
+  placeholder:'Teach a fact, ask a question or send a sequence…',
   note:'GENESIS uses no language model: it understands a few commands, learns the words you teach it, and only claims what its memory justifies.',
   stage:'Stage', beliefs:'beliefs', validated:'validated', episodes:'episodes', copy:'Copy', copied:'Copied',
   untitled:'New chat', error:'Error: ', explain:'explain ',
-  cards:[['3, 7, 11, 15, 19, 23, 27','an arithmetic sequence'],['1 1 2 3 5 8 13 21 34','a recurrence'],
-         ['explore 100','experiment alone in a hidden world'],['what do you know?','what my memory holds']],
+  cards:[['3, 7, 11, 15, 19, 23, 27','an arithmetic sequence'],['object workshop','learn words from objects'],
+         ['Nala is a cat; All cats are animals','teach two facts, not preloaded'],['Is Nala an animal?','deduce from teachings']],
   learnedWord:'learned words',
   intents:{clarify:'check',vocabulary:'vocabulary','teach-request':'word learning','yes-no':'yes/no',thanks:'thanks',continue:'learning','too-short':'too short',sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused',define:'definition',languages:'languages',smalltalk:'small talk',bye:'goodbye',declined:'declined','unknown-topic':'outside my knowledge'}
 };
+Object.assign(T.intents, FR ? {
+  'semantic-teach':'enseignement', 'semantic-query':'raisonnement', 'semantic-clarify':'précision',
+  'semantic-explain':'prémisses', 'semantic-recall':'rappel', 'semantic-retract':'rétractation'
+} : {
+  'semantic-teach':'teaching', 'semantic-query':'reasoning', 'semantic-clarify':'clarification',
+  'semantic-explain':'premises', 'semantic-recall':'recall', 'semantic-retract':'retraction'
+});
+Object.assign(T.intents, FR ? {
+  'object-workshop':'atelier objets', 'object-explore':'expériences', 'object-observe':'objet observé',
+  'object-test':'manipulation', 'object-select':'référence composée', 'object-word-teach':'sens appris',
+  'object-word-query':'interprétation', 'object-word-explain':'origine du sens',
+  'construction-teach':'construction apprise', 'construction-uncertain':'construction incertaine'
+} : {
+  'object-workshop':'object workshop', 'object-explore':'experiments', 'object-observe':'observed object',
+  'object-test':'manipulation', 'object-select':'composed reference', 'object-word-teach':'learned meaning',
+  'object-word-query':'interpretation', 'object-word-explain':'meaning evidence',
+  'construction-teach':'learned construction', 'construction-uncertain':'uncertain construction'
+});
 document.querySelectorAll('[data-i]').forEach(e => e.textContent = T[e.dataset.i]);
 const $ = id => document.getElementById(id);
 const input = $('input'), send = $('send'), msgs = $('msgs'), thread = $('thread');

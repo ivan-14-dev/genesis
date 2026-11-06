@@ -299,6 +299,11 @@ def words_of(concept: str) -> set:
 
 def faculty_manifest() -> dict:
     body = {"version": VERSION, "languages": ["fr", "en"],
+            "semantic_mechanisms": {
+                "version": 1,
+                "grammar": "explicit membership, class inclusion and location; no supplied facts",
+                "reasoning": "conditional class inheritance with premise IDs; open-world queries",
+                "dialogue": "single-subject reference; explicit correction; preserved contradictions"},
             "kind": "hand-written lexicon + grammatical cues (designer-provided, no learned weights)",
             "concepts": sorted(set(LEXICON) | set(IDIOMS.values())),
             "n_forms": len(FORMS), "n_idioms": len(IDIOMS),
