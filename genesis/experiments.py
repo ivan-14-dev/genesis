@@ -11,12 +11,14 @@ import random
 import statistics
 import tempfile
 import time
+from collections import Counter
 from contextlib import contextmanager
 
 from .adapters import LabAdapter, SequenceAdapter
 from .agent import Genesis
 from .autonomy import Explorer
 from .environments import CausalWorld, SequenceWorld, sandboxed
+from .environments.sequence_world import DEEP_FAMILIES
 
 
 @contextmanager
@@ -83,10 +85,16 @@ def evaluate_sequences(agent: Genesis, world: SequenceWorld, horizon: int = 10) 
 
 
 def run_sequence_benchmark(seed: int, budget: int = 400, strategy: str = "curiosity",
-                           stop_when_idle: bool = True, db: str | None = None) -> dict:
+                           stop_when_idle: bool = True, db: str | None = None, world_options: dict | None = None,
+                           overrides: dict | None = None) -> dict:
+    """``world_options`` go to :class:`SequenceWorld` (families, noise, stream counts); ``overrides`` set
+    ``"family.attribute"`` of the agent's induction configs, for ablations."""
     with _tmpdb() as tmp:
         agent = Genesis(db or tmp, seed=seed)
-        world = SequenceWorld(seed)
+        for key, value in (overrides or {}).items():
+            family, attr = key.split(".")
+            setattr(agent.configs[family], attr, value)
+        world = SequenceWorld(seed, **(world_options or {}))
         sb = sandboxed(world, budget + 1)
         t0 = time.process_time()
         rep = agent.explore_sequences(sb, budget, strategy, stop_when_idle=stop_when_idle)
@@ -94,9 +102,48 @@ def run_sequence_benchmark(seed: int, budget: int = 400, strategy: str = "curios
         res.update(interactions=rep.steps, stopped_because=rep.stopped_because,
                    cpu_seconds=round(time.process_time() - t0, 3),
                    expressions_evaluated=sum(lr.expressions_evaluated for lr in agent.learners.values()),
+                   deep_searches=sum(getattr(lr, "deep_searches", 0) for lr in agent.learners.values()),
+                   corrupted_observations=sum(world.corrupted.values()),
                    calibration=agent.metacog.calibration(), memory_bytes=agent.ltm.size_bytes())
         agent.ltm.close()
         return res
+
+
+ROBUSTNESS_CONDITIONS = {
+    # name: (world options, agent config overrides)
+    "clean": ({}, {}),
+    "noise_10": ({"noise": 0.1}, {}),
+    "noise_20": ({"noise": 0.2}, {}),
+    "mostly_noise_20": ({"noise": 0.2, "n_rule_streams": 2, "n_noise_streams": 8}, {}),
+    "deep": ({"families": DEEP_FAMILIES}, {}),
+    "deep_noise_10": ({"families": DEEP_FAMILIES, "noise": 0.1}, {}),
+    "deep_without_deepening": ({"families": DEEP_FAMILIES}, {"sequence.deepen_size": 0}),
+}
+
+
+def run_robustness_benchmark(seeds, conditions=None) -> dict:
+    """Stage-1 learning under innovation noise (corrupted observations that also feed later terms), on
+    size-7 rule families, and with mostly-noise worlds; the ablation shows what deepening contributes.
+    Validation must stay sound: ``false_validation_rate`` counts noise streams declared validated."""
+    out = {}
+    for name in conditions or ROBUSTNESS_CONDITIONS:
+        world_options, overrides = ROBUSTNESS_CONDITIONS[name]
+        runs = [run_sequence_benchmark(s, world_options=world_options, overrides=overrides) for s in seeds]
+        out[name] = {
+            "rule_streams_validated": _mean([r["rule_streams_validated"] for r in runs]),
+            "rule_extrapolation_accuracy": _mean([r["rule_extrapolation_accuracy"] for r in runs]),
+            "validated_rule_extrapolation_accuracy": _mean([r["validated_rule_extrapolation_accuracy"]
+                                                            for r in runs]),
+            "false_validation_rate_on_noise": _mean([r["false_validation_rate"] for r in runs]),
+            "noise_streams": sum(r2["is_noise"] for r in runs for r2 in r["streams"]),
+            "corrupted_observations": _mean([r["corrupted_observations"] for r in runs]),
+            "cpu_seconds": _mean([r["cpu_seconds"] for r in runs]),
+            "deep_searches": _mean([r["deep_searches"] for r in runs]),
+            "failures_by_family": dict(sorted(Counter(r2["family"] for r in runs for r2 in r["streams"]
+                                                      if not r2["is_noise"] and r2["status"] != "validated")
+                                              .items())),
+        }
+    return out
 
 
 # ================================================================== stage 2-3
@@ -281,12 +328,13 @@ def run_memory_benchmark(seed: int) -> dict:
 
 
 # ================================================================ meta-learning
-def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool = True) -> dict:
+def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool = True,
+                            world_options: dict | None = None) -> dict:
     with _tmpdb() as path:
         agent = Genesis(path, seed=seed, procedural_prior=procedural_prior)
         per_world, evals, rule_evals, cpu, acc, lib = [], [], [], [], [], []
         for i in range(n_worlds):
-            world = SequenceWorld(seed * 100 + i)
+            world = SequenceWorld(seed * 100 + i, **(world_options or {}))
             keys = [f"{world.env_id}/{sid}" for sid in world.stream_ids()]
             t0 = time.process_time()
             agent.explore_sequences(sandboxed(world, 401), 400)
@@ -910,9 +958,14 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             plan.append(run_planning(agent, sb, world))
             agent.ltm.close()
     mem = [run_memory_benchmark(s) for s in seeds]
+    robustness = run_robustness_benchmark(seeds[: 3 if quick else len(seeds)],
+                                          ("clean", "noise_20", "deep") if quick else None)
     proc_seeds = seeds[: 2 if quick else 5]
     proc_on = [run_procedural_transfer(s, procedural_prior=True) for s in proc_seeds]
     proc_off = [run_procedural_transfer(s, procedural_prior=False) for s in proc_seeds]
+    deep_worlds = {"families": DEEP_FAMILIES}
+    deep_on = [run_procedural_transfer(s, procedural_prior=True, world_options=deep_worlds) for s in proc_seeds]
+    deep_off = [run_procedural_transfer(s, procedural_prior=False, world_options=deep_worlds) for s in proc_seeds]
     auto_budgets = (150,) if quick else (100, 150, 300)
     auto = {(b, strat): [run_autonomy(s, b, strat) for s in seeds]
             for b in auto_budgets for strat in ("progress", "round_robin", "random")}
@@ -982,6 +1035,7 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             "cpu_seconds": _mean([r["cpu_seconds"] for r in lab_c]),
             "calibration_ece": _mean([r["calibration"]["ece"] for r in lab_c]),
         },
+        "stage1_robustness": robustness,
         "stage4_memory": {
             "accuracy_world_a": _mean([m["accuracy_world_a"] for m in mem]),
             "retention_after_reload": _mean([m["accuracy_world_a_after_reload"] / m["accuracy_world_a"]
@@ -1010,6 +1064,11 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             "late_accuracy_with_prior": _mean([p["late_worlds_accuracy"] for p in proc_on]),
             "late_accuracy_without_prior": _mean([p["late_worlds_accuracy"] for p in proc_off]),
             "library_search_share_with_prior": [p["library_search_share_per_world"] for p in proc_on],
+            "deep_worlds": {
+                key: _mean([p[field] for p in runs])
+                for field in ("late_worlds_mean", "late_worlds_search_cost_per_rule_stream", "late_worlds_cpu",
+                              "late_worlds_accuracy")
+                for key, runs in ((f"{field}_with_prior", deep_on), (f"{field}_without_prior", deep_off))},
         },
         "stage6_autonomy": {
             f"budget_{b}/{strat}": {

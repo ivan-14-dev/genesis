@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genesis-cognitive"
-version = "0.2.0"
+version = "0.3.0"
 description = "GENESIS: an experimental cognitive architecture that learns world rules from experience, starting from innate primitives only"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ genesis = "genesis.__main__:main"
 include = ["genesis*"]
 
 [tool.setuptools.package-data]
+"genesis" = ["_search.c"]
 "genesis.nn" = ["_kernels.c"]
 
 [tool.pytest.ini_options]

@@ -22,7 +22,6 @@ Key properties
 from __future__ import annotations
 
 import math
-import operator
 import random
 import time
 import zlib
@@ -35,6 +34,7 @@ import itertools
 from .expressions import (Expr, _trivial, app, const, enumerate_programs, fill_shape, if_eq, parse_shape,
                           shape_slots)
 from .innate import INNATE_CONSTANTS
+from .search import match_shape, search_programs
 
 
 @dataclass
@@ -50,7 +50,18 @@ class InductionConfig:
     max_seconds: float = 5.0
     validation_k: int = 4
     validation_posterior: float = 0.9
-    max_mismatch_frac: float = 0.2
+    # Forward-prediction error rate still compatible with "the rule is right, the world is noisy". Errors must
+    # also be unstructured (see RuleLearner._structured_errors), so a systematic misfit is never validated.
+    validation_max_error: float = 0.25
+    max_mismatch_frac: float = 0.4
+    # Deepening (genesis.search): when no enumerated rule mispredicts at most deepen_below * n observations,
+    # look for rules of deepen_size nodes by meet-in-the-middle, within the same candidate budget.
+    deepen_size: int = 7
+    deepen_below: float = 0.25
+    deepen_min_n: int = 6
+    deepen_window: int = 8
+    deepen_windows: int = 4
+    deepen_growth: float = 0.5   # after a deep search at n, the next one waits until n * (1 + deepen_growth)
     unpredictable_min_n: int = 8
     max_backoff: int = 8
     shape_bias: float = 1.0
@@ -130,6 +141,8 @@ class RuleLearner:
         self.shape_library = shape_library
         self.library_searches = 0
         self.full_searches = 0
+        self.deep_searches = 0
+        self.next_deep_n = 0
         # probe_fn generates the inputs on which behavioural equivalence is judged.
         # Default: independent random values (appropriate when the agent can intervene).
         self.probe_fn = probe_fn
@@ -150,6 +163,7 @@ class RuleLearner:
         self._prev_top: Optional[Hypothesis] = None
         self._probes: list = []
         self._status = "unknown"
+        self.last_search: dict = {}
 
     # ------------------------------------------------------------------ beliefs
     def posterior(self) -> tuple:
@@ -197,11 +211,25 @@ class RuleLearner:
         if top is not None:
             fwd = top.fwd_ok + top.fwd_bad
             if (mass >= self.cfg.validation_posterior and top.fwd_ok >= self.cfg.validation_k
-                    and top.fwd_bad <= int(0.1 * fwd)):
+                    and top.fwd_bad <= int(self.cfg.validation_max_error * fwd) and not self._structured_errors(top)):
                 return "validated"
             if mass >= 0.5:
                 return "candidate"
         return "unknown"
+
+    def _structured_errors(self, h: Hypothesis) -> bool:
+        """Noise is unstructured: when most of a rule's errors share one residual (a missed wrap-around, an
+        off-by-one branch), the rule is incomplete and must not be validated, whatever its error rate."""
+        if h.n_bad < 2:
+            return False
+        residuals: Counter = Counter()
+        for d, y in self.data:
+            v = h.expr.evaluate(d)
+            if v != y:
+                residuals[None if v is None else y - v] += 1
+        if not residuals:
+            return False
+        return residuals.most_common(1)[0][1] > max(1, sum(residuals.values()) // 2)
 
     # ----------------------------------------------------------------- learning
     def _tol(self, n: int) -> int:
@@ -265,8 +293,14 @@ class RuleLearner:
         consts |= set(common)
         # Contrast between salient values (e.g. a regular step and a wrap-around jump).
         consts |= {abs(a - b) for i, a in enumerate(common[:4]) for b in common[i + 1:4] if a != b}
+        # Per input: contrast between its two most frequent residuals (a regular step and a wrap-around jump).
+        for v in self.var_names:
+            res = Counter(y - inp[v] for inp, y in zip(inputs, ys) if inp.get(v) is not None).most_common(2)
+            if len(res) == 2 and res[1][1] >= 2 and abs(res[0][0] - res[1][0]) <= 10**6:
+                consts.add(abs(res[0][0] - res[1][0]))
         if ys:
-            consts.add(max(ys) + 1)  # perceived range: candidate modulus
+            # Perceived range: candidate modulus. The few largest values guard against one corrupted maximum.
+            consts |= {v + 1 for v in sorted(set(ys))[-3:]}
         return consts
 
     def _make_probes(self) -> None:
@@ -324,6 +358,7 @@ class RuleLearner:
         cfg = self.cfg
         consts = sorted(consts)
         n_leaves = len(self.var_names) + len(consts)
+        size_bound = max(cfg.max_size, cfg.deepen_size)
         found, seen = [], set()
         for shape in self.shape_library()[: cfg.library_max_shapes]:
             tree = parse_shape(shape)
@@ -334,6 +369,23 @@ class RuleLearner:
             fit_bias = isinstance(tree, tuple) and tree[0] == "add" and tree[1][1] == "C"
             n_c_enum = nc - 1 if fit_bias else nc
             if len(self.var_names) ** nv * len(consts) ** n_c_enum > cfg.library_max_instances:
+                continue
+            body = tree[1][0] if fit_bias else tree
+            matched = match_shape(body, inputs, ys, self.var_names, consts, tol, fit_bias)
+            if matched is not None:
+                # Kernel path (genesis.search): only the instances within tolerance become expressions.
+                hits, evaluated, _ = matched
+                self.expressions_evaluated += evaluated
+                for vs, cs, r, bad in hits:
+                    e = fill_shape(body, vs, cs)
+                    if fit_bias:
+                        e = app("add", e, const(r))
+                    if _has_trivial(e) or e.size > size_bound:
+                        continue
+                    k = str(e)
+                    if k not in seen:
+                        seen.add(k)
+                        found.append((e, bad, self._approx_prior(e, n_leaves)))
                 continue
             for vs in itertools.product(self.var_names, repeat=nv):
                 for cs in itertools.product(consts, repeat=n_c_enum):
@@ -349,8 +401,8 @@ class RuleLearner:
                     else:
                         e = fill_shape(tree, vs, cs)
                     self.expressions_evaluated += 1
-                    if e is None or _has_trivial(e) or e.size > cfg.max_size + (2 + 2 * cfg.branch_max_size
-                                                                                if e.op == "if_eq" else 0):
+                    if e is None or _has_trivial(e) or e.size > size_bound + (
+                            2 + 2 * cfg.branch_max_size if e.op == "if_eq" else 0):
                         continue
                     k = str(e)
                     if k in seen:
@@ -363,30 +415,28 @@ class RuleLearner:
 
     def _full_search(self, inputs: list, ys: tuple, tol: int, consts: set) -> list:
         cfg = self.cfg
+        # Candidates within the mismatch tolerance, plus bias fits: when y - e(x) is the same constant r on all
+        # but <= tol observations, propose e + r (see genesis.search; the C kernel and the Python reference agree).
         n = len(ys)
-        en = enumerate_programs(inputs, self.var_names, consts, cfg.max_size, cfg.max_candidates, cfg.max_seconds)
-        self.expressions_evaluated += en.evaluated
-        found = []
-        ne = operator.ne
-        offsets: dict = {}  # insertion-ordered: set order would depend on PYTHONHASHSEED
-        for e, sig in en.candidates:
-            if tol == 0:
-                if sig == ys:
-                    found.append((e, 0, self._base_prior(e, en.counts)))
-            else:
-                bad = sum(map(ne, sig, ys))
-                if bad <= tol:
-                    found.append((e, bad, self._base_prior(e, en.counts)))
-            # Bias fitting: if y - e(x) is the same constant r on every observation, propose e + r.
-            if n >= 2 and e.op != "const" and e.size <= cfg.max_size - 2:
-                r = ys[0] - sig[0]
-                if r != 0 and all(y - s == r for y, s in zip(ys, sig)):
-                    offsets.setdefault((e, r), None)
-        for e, r in offsets:
+        deepen = cfg.deepen_size > cfg.max_size and n >= max(cfg.deepen_min_n, self.next_deep_n)
+        sr = search_programs(inputs, ys, self.var_names, sorted(consts), tol, cfg.max_size, cfg.max_candidates,
+                             cfg.max_seconds, cfg.max_size - 2, deepen_bad=int(cfg.deepen_below * n) if deepen else -1,
+                             deep_size=cfg.deepen_size, window=cfg.deepen_window, n_windows=cfg.deepen_windows)
+        self.expressions_evaluated += sr.evaluated
+        self.last_search = {"backend": sr.backend, "evaluated": sr.evaluated, "truncated": sr.truncated,
+                            "seconds": round(sr.seconds, 4), "max_size": cfg.max_size, "deep_found": len(sr.deep)}
+        if sr.deep_ran:
+            self.deep_searches += 1
+            self.next_deep_n = n + max(1, int(n * cfg.deepen_growth))
+        found = [(e, bad, self._base_prior(e, sr.counts)) for e, bad in sr.matches]
+        for e, r, bad in sr.offsets:
             fe = app("add", e, const(r))
-            found.append((fe, 0, self._base_prior(fe, en.counts)))
+            found.append((fe, bad, self._base_prior(fe, sr.counts)))
+        found += [(e, bad, self._base_prior(e, sr.counts)) for e, bad in sr.deep]
         if cfg.allow_conditionals and not any(b == 0 for _, b, _ in found):
-            found += self._conditionals(en, inputs, ys)
+            blocks = enumerate_programs(inputs, self.var_names, consts, cfg.branch_max_size, cfg.max_candidates,
+                                        cfg.max_seconds)
+            found += self._conditionals(blocks, sr.counts, inputs, ys)
         return found
 
     def _merge(self, found: list, n: int) -> None:
@@ -407,7 +457,7 @@ class RuleLearner:
         for h in self.hyps:
             h.probe_sig = self._probe_sig(h.expr)
 
-    def _conditionals(self, en, inputs: list, ys: tuple) -> list:
+    def _conditionals(self, en, counts: dict, inputs: list, ys: tuple) -> list:
         cfg = self.cfg
         blocks = [(e, sig) for e, sig in en.candidates if e.size <= cfg.branch_max_size]
         conditions = []
@@ -433,7 +483,7 @@ class RuleLearner:
                 for e0 in m0:
                     if e1 == e0:
                         continue
-                    lp = (-log_nc - math.log(4) + self._base_prior(e1, en.counts) + self._base_prior(e0, en.counts))
+                    lp = (-log_nc - math.log(4) + self._base_prior(e1, counts) + self._base_prior(e0, counts))
                     out.append((if_eq(q, c, e1, e0), 0, lp))
         return out
 
@@ -446,6 +496,7 @@ class RuleLearner:
             "expressions_evaluated": self.expressions_evaluated, "induction_seconds": self.induction_seconds,
             "status_history": self.status_history, "refutations": self.refutations, "status": self._status,
             "library_searches": self.library_searches, "full_searches": self.full_searches,
+            "deep_searches": self.deep_searches, "next_deep_n": self.next_deep_n,
         }
 
     @classmethod
@@ -456,6 +507,8 @@ class RuleLearner:
         lr = cls(state["key"], state["var_names"], cfg, shape_prior, probe_fn, shape_library)
         lr.library_searches = state.get("library_searches", 0)
         lr.full_searches = state.get("full_searches", 0)
+        lr.deep_searches = state.get("deep_searches", 0)
+        lr.next_deep_n = state.get("next_deep_n", 0)
         lr.data = [(dict(d), y) for d, y in state["data"]]
         lr.episodes = list(state["episodes"])
         lr.provenance = list(state["provenance"])

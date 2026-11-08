@@ -1,8 +1,10 @@
 import random
 
+import pytest
+
 from genesis.adapters import SEQ_VARS, sequence_rollout_probes
 from genesis.expressions import app, const, enumerate_programs, if_eq, var
-from genesis.induction import InductionConfig, RuleLearner
+from genesis.induction import Hypothesis, InductionConfig, RuleLearner
 
 
 def seq_learner(key="s"):
@@ -96,3 +98,44 @@ def test_learner_state_round_trip():
     x = {"x[t-1]": 30, "x[t-2]": 27, "x[t-3]": 24, "t": 11}
     assert clone.predict(x).value == learner.predict(x).value == 33
     assert clone.status() == learner.status()
+
+
+def test_learns_through_corrupted_observations():
+    rng = random.Random(4)
+    terms = []
+    for t in range(40):
+        terms.append(4 * t - 9 + (rng.choice([-7, 3, 11]) if t > 2 and rng.random() < 0.2 else 0))
+    learner = seq_learner()
+    feed_sequence(learner, terms)
+    assert learner.status() == "validated"
+    assert str(learner.best()[0].expr) in ("(x[t-1] + 4)", "((4 * t) + -9)", "((t * 4) + -9)")
+    assert learner.best()[0].expr.evaluate({"x[t-1]": 151, "x[t-2]": 147, "x[t-3]": 143, "t": 40}) == 151
+
+
+def test_structured_errors_block_validation_of_incomplete_rules():
+    learner = seq_learner()
+    feed_sequence(learner, [t % 5 for t in range(30)])
+    assert learner.status() == "validated"
+    incomplete = Hypothesis(app("add", var("x[t-1]"), const(1)), 0.0, n_ok=21, n_bad=6, fwd_ok=21, fwd_bad=6)
+    assert learner._structured_errors(incomplete)
+    assert not learner._structured_errors(learner.best()[0])
+
+
+@pytest.mark.parametrize("family,make", [
+    ("quadratic-linear", lambda t, h: t * (t + 3) - 4),
+    ("second-order", lambda t, h: 2 * h[-1] - h[-2] + 3),
+    ("affine-modular", lambda t, h: (2 * h[-1] + 5) % 11),
+])
+def test_deepening_learns_size_seven_rules(family, make):
+    terms = [1, 4, 2]
+    for t in range(3, 40):
+        terms.append(make(t, terms))
+    learner = seq_learner()
+    feed_sequence(learner, terms)
+    assert learner.status() == "validated", (family, learner.best()[0])
+    assert learner.best()[0].expr.size == 7 and learner.deep_searches >= 1
+    h = terms[-3:]
+    x = {"x[t-1]": h[-1], "x[t-2]": h[-2], "x[t-3]": h[-3], "t": 40}
+    assert learner.predict(x).value == make(40, terms)
+    clone = RuleLearner.from_state(learner.to_state(), learner.cfg, probe_fn=sequence_rollout_probes)
+    assert clone.next_deep_n == learner.next_deep_n and clone.predict(x).value == make(40, terms)

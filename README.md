@@ -177,8 +177,10 @@ dataset, and no dependency beyond the standard library:
 - `lm/ngram.py`: n-gram language model with interpolated Kneser–Ney smoothing (+ unigram baseline);
 - `nn/`: tensors with reverse-mode autograd, AdamW, a decoder-only Transformer (`TinyGPT`: learned positions,
   causal self-attention, LayerNorm, GELU MLP, tied input/output embeddings), deterministic training loops, a
-  pickle-free weight format, and a
-  matmul kernel in C (`nn/_kernels.c`) compiled locally on first use, with a pure-Python fallback;
+  pickle-free weight format, and C kernels (`nn/_kernels.c`: tiled/AVX matmul with optional 2-thread split,
+  attention, layer norm, GELU, cross-entropy, AdamW) compiled locally on first use, self-tested against a
+  pure-Python fallback, bit-for-bit deterministic whatever the SIMD level or thread count
+  (`GENESIS_NN_THREADS`);
 - `corpus.py`: what the model may learn from. Submitted documents are normalised, scrubbed of personal data
   (e-mails, phone numbers, IBANs, Luhn-valid card numbers, IP addresses), deduplicated, split train/valid/test
   by hash, and **used only once the admin has signed their exact SHA-256**; the test split is read only for final
@@ -189,7 +191,8 @@ dataset, and no dependency beyond the standard library:
   re-hashed and the signature re-checked every time the model is loaded.
 
 Scale is deliberately modest (2 CPUs, no GPU): an n-gram model trains in well under a second on thousands of
-sentences; a ~100 k-parameter TinyGPT step takes ~0.2 s with the C kernel. On the synthetic test corpus
+sentences; an ~80 k-parameter TinyGPT training step (4 windows × 64 tokens) takes ~13 ms with the C kernels
+versus ~1.6 s in pure Python. On the synthetic test corpus
 (subject–verb–object sentences), the 3-gram model reaches a validation perplexity of ≈2.6 versus ≈19 for the
 unigram baseline. This is a small text predictor, not a general assistant: its output is shown as unverified text
 and never enters the agent's knowledge, whose beliefs still come only from evidence.
@@ -321,29 +324,35 @@ criterion; learning new constructions is a measurable intermediate step, not a s
 - **Stage 5:** planning over the learned model reaches unseen goals in every task.
 - **Stage 6:** given four new worlds (one pure noise) and one budget, the agent decides where to spend it by
   measured learning progress and sets its own objectives (34 of 38 achieved here). Controls with fresh agents
-  are shown honestly: on this seed random allocation scores 86.2% vs 84.7% for progress and 80.6% for
+  are shown honestly: on this seed random allocation scores 86.6% vs 84.7% for progress and 80.6% for
   round-robin.
-- **Stage 7:** it lists its own limitations, then runs a sandboxed self-improvement cycle
-  (`validation_k` 4 → 3: holdout 72% vs 71%). The change is stored as *pending approval* and is **not**
-  deployed; only a named human can approve it, and rollback is available.
+- **Stage 7:** it lists its own limitations, then runs a sandboxed self-improvement cycle. `validation_k` 4 → 3
+  wins on trial seeds (+0.05) but not on holdout (76% vs 76%), so it is *rejected*. A variant that passes would be
+  stored as *pending approval*, **never** deployed automatically; only a named human can approve it, and rollback
+  is available.
 
 Every belief is stored with provenance, confidence, status history, and the episodes that induced, supported
 or refuted it (`inspect --explain`).
 
 ## Headline results (10 held-out seeds, see docs/RESULTS.md)
 
-- Sequences: 98.75% extrapolation accuracy on hidden rules (baselines 7.6% / 16%); 20/20 noise streams judged
-  unpredictable, 0 false validations; 1 failure (an unproposed modulus).
+- Sequences: 100% extrapolation accuracy on hidden rules (baselines 7.6% / 17%); 20/20 noise streams judged
+  unpredictable, 0 false validations; 0.23 s CPU per seed (12× less than v0.2.0, C search kernel).
+- Robustness: with 10% corrupted observations, 100% of rule streams validated; with 20%, 85% (98.8% accuracy of
+  validated rules). 7-node rules: 98.75% validated with deepening vs 37.5% without. 0 false validations on noise
+  in every condition.
 - Causal world: 0% → 100% held-out accuracy; 100% on out-of-range values (tabular baseline 46%); confounded
   causes found 0% by watching vs 100% after experiments; curiosity needs 24.5 experiments vs 51.7 for random.
 - Memory: retention 1.0 across sessions, forgetting 0.0 after a second world. Planning: 100% vs 78.5% random.
 - Tight budget (60 observations): curiosity with budget-aware focus validates 60% of rule streams (random 24%,
-  round-robin 0%). Remembered rule shapes cut search 16.7× (CPU −6%).
+  round-robin 0%). Remembered rule shapes cut search 16.5× (CPU −17%); on 7-node worlds they also cut
+  observations to validation by 25% (11.6 → 8.8).
 - Stage 6: learning-progress allocation beats round-robin at budget 150 (0.849 vs 0.792, half the noise) and
   stops itself at 300 with equal knowledge.
-- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.702 vs 0.723); remembered
-  shapes do not reduce observations to validation; curiosity spends slightly more on noise; the stage 7 gain is
-  small (+0.007 on holdout) and most tunable parameters have no effect.
+- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.702 vs 0.723); on standard
+  worlds remembered shapes do not reduce observations to validation; curiosity spends slightly more on noise and
+  only ties round-robin at budget 100; at 20% noise, geometric streams overflow before they can be learned; stage 7
+  finds no variant that survives holdout, and most tunable parameters have no effect.
 
 ## Layout
 
@@ -351,7 +360,9 @@ or refuted it (`inspect --explain`).
 genesis/
   innate.py          innate primitives, constants, frozen safety policy, manifest
   expressions.py     program representation + enumeration
-  induction.py       learning engine: online Bayesian program induction
+  induction.py       learning engine: online Bayesian program induction (noise-tolerant, deepening)
+  search.py          program search: Python reference + C kernel (_search.c), deepening, shape instantiation
+  native.py          hardened local compilation/loading of the C kernels (private cache, digest-checked)
   perception.py      features, novelty
   attention.py       salience
   memory.py          working memory + SQLite long-term memory (5 memory systems + evidence)
@@ -376,7 +387,7 @@ genesis/
   governance.py      admin policy, roles, limits, guard, tamper-evident audit chain, signed approvals
   corpus.py          admin-approved training corpus: hygiene, PII redaction, dedup, splits, signatures
   lm/                BPE tokenizer, Kneser–Ney n-gram LM, model registry (train/approve/load/generate)
-  nn/                from-scratch autograd, AdamW, TinyGPT Transformer, C matmul kernel, safe weight format
+  nn/                from-scratch autograd, AdamW, TinyGPT Transformer, C kernels, safe weight format
   cli_admin.py       `admin`, `audit`, `corpus`, `lm` commands
   experiments.py     benchmarks, baselines and controls
   demo.py, __main__.py
@@ -396,5 +407,5 @@ never touches the safety policy or deploys without a human. The in-house languag
 as the approved corpus; it predicts text, it does not reason, and its output is never treated as knowledge.
 Governance assumes the admin key stays secret and the host is trusted: someone with write access to the DB can
 still delete data (detected by `audit verify`, not prevented) and delete seals, so keep the last sealed head hash
-outside the DB. Limitations and next steps (noise-robust rules,
+outside the DB. Limitations and next steps (noise-tolerant conditionals, rules beyond 7 nodes,
 sub-program library learning, neural perception) are listed in `docs/ARCHITECTURE.md`.

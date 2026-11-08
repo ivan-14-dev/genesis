@@ -74,7 +74,7 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Observability | `dashboard.py` | Read-only inspection of memory; every element traceable to DB rows (`explain`) | implemented (stdlib HTTP + vanilla JS) |
 | Governance | `governance.py`, `crypto.py` | Admin-defined rules: signed policy (roles → actions, domains, limits, blocked terms, hashed tokens), default-deny guard before every write, hash-chained audit log with signed seals, signed approvals bound to one memory | implemented (Ed25519 from RFC 8032, stdlib) |
 | Training corpus | `corpus.py` | Data governance: normalisation, PII redaction, dedup, hash-based train/valid/test split, admin signature over each document's hash, sealed test split | implemented |
-| In-house language model | `lm/`, `nn/` | Statistical language modelling built here: byte-level BPE, interpolated Kneser–Ney n-grams, decoder-only Transformer with autograd + AdamW, C matmul kernel; provenance, baselines, signed activation (`lm/registry.py`) | implemented at small scale; output unverified, never knowledge |
+| In-house language model | `lm/`, `nn/` | Statistical language modelling built here: byte-level BPE, interpolated Kneser–Ney n-grams, decoder-only Transformer with autograd + AdamW, C kernels (tiled matmul, attention, layer norm, GELU, cross-entropy, AdamW); provenance, baselines, signed activation (`lm/registry.py`) | implemented at small scale; output unverified, never knowledge |
 
 ## C. Module diagram
 
@@ -365,9 +365,27 @@ Details of the core learner (`RuleLearner`):
 - **Likelihood:** `(1−ε)` if the program predicts the observation, `ε/R` otherwise. A **null hypothesis**
   ("unpredictable", uniform over R outcomes) competes with every program.
 - **Proposal:** bottom-up enumeration with observational-equivalence pruning; constants proposed from data
-  (frequent values, differences, ratios, contrasts, max+1) besides innate ones; bias fitting (e + r).
-- **Validation:** equivalence-class posterior ≥ 0.9 **and** ≥ 4 correct forward predictions **and** ≤ 10%
-  forward errors. **Unpredictable:** p(null) ≥ 0.9 with ≥ 8 observations.
+  (frequent values, differences, ratios, contrasts, the per-input contrast of the two most frequent residuals,
+  the three largest values + 1) besides innate ones; bias fitting `e + r` where `r` is the majority residual, so
+  a few corrupted observations do not prevent the fit.
+- **Search kernel (`search.py`, `_search.c`):** the enumeration, scoring and bias fits run in C (compiled locally
+  with the same hardened loader as the NN kernels, `native.py`), 10–40× faster than Python. The pure-Python
+  version is the specification: both give identical results (fuzzed, and checked by a self-test at load);
+  values beyond ±2⁶¹ always use the exact Python path. `GENESIS_SEARCH_BACKEND=python` forces it.
+- **Deepening:** when no enumerated rule (≤ 5 nodes) mispredicts at most 25% of the observations, the kernel
+  looks for 7-node rules without enumerating them: bias fits and `mod c` on the largest level, then a
+  meet-in-the-middle step (for each candidate A and operator, the output B would need on a window of recent
+  observations is looked up in a hash table of enumerated signatures). Every hit is checked on all observations.
+  Deep searches back off geometrically (next one at n·1.5), and the candidate budget is unchanged, so the
+  frozen safety policy and its digest are untouched.
+- **Noise tolerance:** a hypothesis survives up to 40% mismatches (`max_mismatch_frac`). Noise is
+  *unstructured*: a rule whose errors mostly share one residual (a missed wrap-around, an off-by-one) is
+  incomplete and is never validated, whatever its error rate.
+- **Validation:** equivalence-class posterior ≥ 0.9 **and** ≥ 4 correct forward predictions **and** ≤ 25%
+  forward errors (`validation_max_error`) **and** no structured errors. **Unpredictable:** p(null) ≥ 0.9 with
+  ≥ 8 observations.
+- **Procedural memory:** remembered shapes (up to 7 nodes) are instantiated first; a C kernel evaluates every
+  instance and only those within tolerance become expressions (identical results to the former Python loop).
 - **Re-induction** on surprise with exponential backoff; previously proposed hypotheses keep their statistics.
 - **Curiosity:** EIG of the next observation about the hypothesis variable; novelty bonus `1/(1+n)`; resolved
   questions are revisited on a spaced schedule (10, 20, 40 interactions, then graduate).
@@ -415,8 +433,8 @@ future source must be tagged with provenance `external` and kept separate from e
 | Phase | Content | Acceptance criterion |
 |---|---|---|
 | 1 ✅ | Innate core, induction, memory, curiosity, metacognition, consolidation, sequence + causal worlds, benchmarks, demo | stages 0–5 gates pass on held-out seeds |
-| 2 | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise |
-| 3 (partial ✅) | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Done so far:* library-first search over remembered shapes cuts search 16.7×; observations unchanged; sub-program promotion still open |
+| 2 (partial ✅) | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Done for sequences:* majority-residual fits, structured-error check, 40% tolerance — ≥ 0.98 extrapolation accuracy at 10% innovation noise, 0 false validations (RESULTS, robustness). Conditionals still exact |
+| 3 (partial ✅) | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Done so far:* library-first search over remembered shapes (now up to 7 nodes, evaluated by a C kernel) cuts search 16.5× on standard worlds; on 7-node worlds it also cuts observations to validation (11.6 → 8.8, −25%) and CPU (−32%); sub-program promotion and wake-sleep (dreaming) still open |
 | 4 ✅ | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction (met at budget 150 and 300; **not** at 100) |
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
 | 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
@@ -442,17 +460,22 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 
 ### Known limitations of the current prototype
 
-- Hypothesis space: integer arithmetic/logic, size ≤ 5 (sequences) or ≤ 3 + one conditional (lab).
-- Conditional rules require exact branch matches (not noise-tolerant).
-- Modulus constants are found heuristically (max+1, differences); an unusual modulus may be missed.
+- Hypothesis space: integer arithmetic/logic, size ≤ 5 enumerated plus size 7 by deepening (sequences), or ≤ 3
+  + one conditional (lab, no deepening). Rules of 9+ nodes are out of reach.
+- Conditional rules require exact branch matches (not noise-tolerant). Sequence rules tolerate innovation noise
+  up to ~20%; a stream whose actual corruption rate reaches ~30% usually stays *candidate*.
+- Values are bounded by ±10¹⁸: a geometric stream beyond that can no longer be predicted, and once values
+  exceed ±2⁶¹ the search falls back to the exact (slow) Python path.
+- Modulus constants are found heuristically (three largest values + 1, differences, contrasts); an unusual modulus
+  may be missed.
 - Zero forgetting is a property of per-context symbolic knowledge, not a general solution to catastrophic
   forgetting.
 - Equivalence for sequence rules is judged on rollouts of the current best rule (on-manifold), so two rules that
   agree on the trajectory but differ elsewhere are treated as the same belief.
 - Stage 6 allocation needs ≥ 2 probe chunks per world, so it loses to round-robin when the budget is very small
   (100 interactions for 4 worlds).
-- Stage 7 tunes only a few allowlisted parameters; most have no measurable effect, and the confirmed gain so far
-  is small (+0.007 on holdout). It cannot change algorithms or architecture.
+- Stage 7 tunes only a few allowlisted parameters; most have no measurable effect. Since the v0.3 learner
+  improvements, no variant survives holdout on the benchmark seeds. It cannot change algorithms or architecture.
 - Curiosity spends slightly more observations on noise than round-robin.
 - Neural perception is not implemented yet.
 - The in-house language model is small (n-gram or ~10⁵-parameter Transformer on 2 CPUs) and only as good as the
