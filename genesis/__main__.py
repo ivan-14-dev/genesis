@@ -1,4 +1,5 @@
-"""Command line: ``python -m genesis {demo,benchmark,grounded,inspect,improve,approve,rollback,dashboard,chat}``."""
+"""Command line: ``python -m genesis {demo,benchmark,grounded,inspect,improve,approve,rollback,dashboard,chat}``
+and administration: ``python -m genesis {admin,audit,corpus,lm}`` (see :mod:`genesis.cli_admin`)."""
 
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ def _chat_terminal(db: str, worlds, objects=None) -> None:
     agent = Genesis(db)
     engine = ChatEngine(agent, worlds, objects)
     cid = engine.new_conversation()["id"]
-    print("GENESIS (no language model). Type a number sequence, 'help'/'aide', or Ctrl+D to quit.")
+    print("GENESIS (no external language model). Type a number sequence, 'help'/'aide', or Ctrl+D to quit.")
     try:
         while True:
             try:
@@ -63,18 +64,26 @@ def main(argv=None) -> int:
     ap_.add_argument("--db", default="runs/demo.db")
     ap_.add_argument("--version", type=int, required=True)
     ap_.add_argument("--by", required=True, help="name of the approving human")
+    ap_.add_argument("--key", help="admin private key (required once an admin key is pinned)")
     rb = sub.add_parser("rollback", help="restore the configuration active before the last deployment")
     rb.add_argument("--db", default="runs/demo.db")
     ds = sub.add_parser("dashboard", help="read-only monitoring web interface")
     ds.add_argument("--db", default="runs/demo.db")
     ds.add_argument("--host", default="127.0.0.1")
     ds.add_argument("--port", type=int, default=8765)
-    ch = sub.add_parser("chat", help="ChatGPT-style entry point (web UI, or --terminal); no language model")
+    ds.add_argument("--allow-host", action="append", default=[], help="extra accepted Host header (repeatable)")
+    ch = sub.add_parser("chat", help="ChatGPT-style entry point (web UI, or --terminal); no external LLM")
     ch.add_argument("--db", default="runs/demo.db", help="memory to use (a newborn agent if it does not exist)")
     ch.add_argument("--host", default="127.0.0.1")
     ch.add_argument("--port", type=int, default=8766)
     ch.add_argument("--terminal", action="store_true", help="chat in the terminal instead of the browser")
+    ch.add_argument("--allow-host", action="append", default=[], help="extra accepted Host header (repeatable)")
+    ch.add_argument("--admin-pub", help="expected admin public key (file or hex); refuse to start otherwise")
+    from .cli_admin import add_parsers, run as run_admin
+    add_parsers(sub)
     args = ap.parse_args(argv)
+    if args.cmd in ("admin", "audit", "corpus", "lm"):
+        return run_admin(args)
     if getattr(args, "db", None) and args.cmd in ("improve", "approve", "rollback", "dashboard") \
             and not os.path.exists(args.db):
         print(f"no memory at {args.db}", file=sys.stderr)
@@ -120,13 +129,19 @@ def main(argv=None) -> int:
         print(json.dumps(res, indent=2, default=str))
     elif args.cmd == "approve":
         from . import self_improvement as SI
-        print(json.dumps({"deployed_config": SI.approve(args.db, args.version, args.by)}))
+        from .crypto import load_private
+        seed = load_private(args.key) if args.key else None
+        try:
+            print(json.dumps({"deployed_config": SI.approve(args.db, args.version, args.by, seed)}))
+        except PermissionError as exc:
+            print(f"approval refused: {exc}", file=sys.stderr)
+            return 1
     elif args.cmd == "rollback":
         from . import self_improvement as SI
         print(json.dumps({"active_config": SI.rollback(args.db)}))
     elif args.cmd == "dashboard":
         from .dashboard import serve
-        serve(args.db, args.host, args.port)
+        serve(args.db, args.host, args.port, args.allow_host)
     elif args.cmd == "chat":
         from .environments import ObjectWorld, SequenceWorld, sandboxed
         os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
@@ -136,7 +151,9 @@ def main(argv=None) -> int:
             _chat_terminal(args.db, worlds, objects)
         else:
             from .chat_server import serve as serve_chat
-            serve_chat(args.db, args.host, args.port, worlds, objects)
+            from .crypto import load_public
+            pub = load_public(args.admin_pub) if args.admin_pub else None
+            serve_chat(args.db, args.host, args.port, worlds, objects, args.allow_host, pub)
     return 0
 
 

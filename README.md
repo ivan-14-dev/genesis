@@ -1,6 +1,9 @@
 # GENESIS — an experimental cognitive architecture that learns from (almost) nothing
 
-GENESIS is a research prototype. It is **not** a chatbot and does **not** use any pretrained model. It starts
+GENESIS is a research prototype. It is **not** a chatbot and does **not** use any external or pretrained model:
+every model, tokenizer and weight it has is built and trained in this repository, on data its administrator
+approved (see [Governance](#governance-the-admin-sets-the-rules) and
+[In-house language model](#in-house-language-model-built-here-nothing-pretrained)). It starts
 with a few innate computational primitives: integer `+ − × mod`, equality/conditional selection, and the
 constants 0–3. From there it builds its own model of small worlds whose rules are sampled from a seed and
 hidden from it. It works by observing, predicting, choosing informative experiments, and remembering what it
@@ -31,10 +34,29 @@ python -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m pytest -q
 ```
 
+Administration (all signed with an Ed25519 admin key generated locally; see [Governance](#governance-the-admin-sets-the-rules)):
+
+```bash
+G=".venv/bin/python -m genesis"
+$G admin keygen                                   # ~/.genesis/admin.key (0600) + admin.pub
+$G admin pin --db runs/demo.db                    # pin the admin public key in this memory
+$G admin policy-template > policy.json            # edit roles, domains, limits, blocked terms, users
+$G admin token --name alice --role user           # token for alice + the hash to paste into policy.json
+$G admin policy-install --db runs/demo.db --file policy.json
+$G corpus add --db runs/demo.db notes/*.txt       # documents the language model may learn from (pending)
+$G corpus list --db runs/demo.db
+$G corpus approve --db runs/demo.db --by ivan 1 2 3
+$G lm train --db runs/demo.db --kind ngram        # or --kind gpt --dim 64 --n-layers 2 --steps 300
+$G lm approve 1 --db runs/demo.db --by ivan       # signed activation (must beat the unigram baseline)
+$G lm eval 1 --db runs/demo.db                    # final, audited measurement on the sealed test split
+$G audit seal --db runs/demo.db && $G audit verify --db runs/demo.db --pub ~/.genesis/admin.pub
+$G chat --db runs/demo.db --admin-pub ~/.genesis/admin.pub   # refuses to start under another admin key
+```
+
 ## Chat entry point
 
 `python -m genesis chat` serves a ChatGPT-style page: a sidebar with persistent conversation history, message
-bubbles, suggestions, FR/EN. **There is no language model behind it.** GENESIS is born with an **innate
+bubbles, suggestions, FR/EN. **No external language model is behind it.** GENESIS is born with an **innate
 bilingual faculty** (`language.py`): a hand-written French/English lexicon (~350 word forms, ~30 concepts) about
 its own interface and cognition, plus grammatical cues: elisions and contractions, interrogatives, verb inversion,
 negation, light stemming and one-typo tolerance. It is declared at birth in `meta.innate_language` (versioned
@@ -62,9 +84,19 @@ accepts `no` as a correction. Repeated errors refute a mapping. Each learned wor
 (`kind="lexical"`, provenance `user-taught`) backed by episodes, so `explain` and `vocabulary` show why it is held.
 These learned word mappings alone add no new facts. The semantic teaching channel below acquires relations
 separately. Ordinary commands still handle one request per message. Numbers typed by the user are
-stored as episodes with provenance `user-provided`, kept distinct from the agent's own observations. The server
-binds to localhost, accepts only same-origin JSON POSTs ≤ 16 KB, and holds the memory DB for its lifetime (don't
-run `demo`/`approve` on the same DB at the same time).
+stored as episodes with provenance `user-provided`, kept distinct from the agent's own observations.
+
+`complète : …` / `complete: …` (explicit prefix only) continues a text with the in-house language model, if the
+admin approved one. The reply is labelled *unverified, not knowledge*, filtered (personal data, blocked terms),
+bounded by the policy (`max_generate_tokens`, time budget) and never stored as a belief.
+
+The server binds to localhost and holds the memory DB for its lifetime (don't run `demo`/`approve` on the same DB
+at the same time). Defences, in order: Host allowlist on the bound port (defeats DNS rebinding; add names with
+`--allow-host`), same-origin JSON POSTs only (Origin / `Sec-Fetch-Site`), validated `Content-Length` ≤ 16 KB,
+socket timeouts, bearer-token identity from the signed policy (`/?token=…` is moved into an HttpOnly SameSite=Strict
+cookie), per-identity rate limit, per-message time budget, conversations visible only to their owner, a strict
+hash-pinned Content-Security-Policy, and opaque 500 errors (details only in the server log). If the stored policy
+no longer verifies, the server answers 503 instead of guessing.
 
 ### Teach facts, then ask a new question
 
@@ -111,6 +143,56 @@ Reproduce the transfer/retention experiment (invented labels; no target conclusi
 ```bash
 .venv/bin/python -c 'from genesis.experiments import run_semantic_learning; print(run_semantic_learning(100))'
 ```
+
+## Governance: the admin sets the rules
+
+GENESIS learns in any domain it is given, **but only under rules its administrator defines** (`governance.py`):
+
+- **Admin key.** `admin keygen` creates an Ed25519 key pair (RFC 8032, implemented in `crypto.py`, stdlib only);
+  `admin pin` stores the public key in the memory. Every admin decision (policy, corpus approval, model
+  activation, version deployment, audit seal) is a statement signed with it and bound to that memory's random
+  id, so it cannot be forged by editing the database or replayed on another memory.
+- **Policy** (`admin policy-template` → edit → `admin policy-install`): roles (`admin`, `teacher`, `user`,
+  `auditor` by default, or your own) granting actions such as `semantic.teach`, `sequence.learn`,
+  `objects.*`, `lm.generate`, `corpus.submit`; domains the admin can switch off (`semantic`, `objects`, `world`,
+  `lm`, ...); limits (message size, sequence length, exploration budget, seconds per message, generated tokens,
+  requests per minute) that can be lowered but never raised above frozen ceilings; blocked terms; users with
+  hashed bearer tokens; whether authentication is required. Unknown keys are rejected, unknown actions denied by
+  default, and the serial must increase (no rollback to an older policy).
+- **Enforcement** happens inside the engine before any write: a refused request is answered ("I can't do that
+  (`semantic.teach`): your role does not allow it; nothing was learned or changed"), and a message containing a
+  blocked term is not even stored in the transcript.
+- **Audit chain.** Every write and every refusal is appended to `audit_log`, each entry hashing the previous one.
+  `audit verify` detects edits, deletions and (with `audit seal`) truncation; it also re-checks corpus documents,
+  model weights and the policy signature. The DB file and checkpoints are created with mode 0600.
+- Without an installed policy, the built-in default applies (local user with the `teacher` role, no auth), which
+  preserves the original single-user behaviour.
+
+## In-house language model (built here, nothing pretrained)
+
+The GPT-like part is written from scratch in this repository, with no external model, tokenizer, weights or
+dataset, and no dependency beyond the standard library:
+
+- `lm/bpe.py`: byte-level BPE tokenizer whose merges are learned from the approved documents;
+- `lm/ngram.py`: n-gram language model with interpolated Kneser–Ney smoothing (+ unigram baseline);
+- `nn/`: tensors with reverse-mode autograd, AdamW, a decoder-only Transformer (`TinyGPT`: learned positions,
+  causal self-attention, LayerNorm, GELU MLP, tied input/output embeddings), deterministic training loops, a
+  pickle-free weight format, and a
+  matmul kernel in C (`nn/_kernels.c`) compiled locally on first use, with a pure-Python fallback;
+- `corpus.py`: what the model may learn from. Submitted documents are normalised, scrubbed of personal data
+  (e-mails, phone numbers, IBANs, Luhn-valid card numbers, IP addresses), deduplicated, split train/valid/test
+  by hash, and **used only once the admin has signed their exact SHA-256**; the test split is read only for final
+  evaluation, and each read is audited;
+- `lm/registry.py`: training records full provenance (document hashes, tokenizer digest, code and kernel digests,
+  seed, `pretrained: null`) and reports validation perplexity and bits per byte next to a unigram baseline. A model
+  becomes active only by admin signature, and only if it beats that baseline (unless `--force`). The weights are
+  re-hashed and the signature re-checked every time the model is loaded.
+
+Scale is deliberately modest (2 CPUs, no GPU): an n-gram model trains in well under a second on thousands of
+sentences; a ~100 k-parameter TinyGPT step takes ~0.2 s with the C kernel. On the synthetic test corpus
+(subject–verb–object sentences), the 3-gram model reaches a validation perplexity of ≈2.6 versus ≈19 for the
+unigram baseline. This is a small text predictor, not a general assistant: its output is shown as unverified text
+and never enters the agent's knowledge, whose beliefs still come only from evidence.
 
 ## What the demo shows (seed 0)
 
@@ -289,7 +371,13 @@ genesis/
   grounded_language.py object/effect word meanings learned from examples; bilingual object workshop
   constructions.py   induced sentence frames, word slots and negation assignments with prospective validation
   lexicon.py         learned vocabulary: word→command associations taught by the user, validated by predictions
-  chat_server.py     ChatGPT-style web UI + JSON API over chat.py (stdlib only)
+  chat_server.py     ChatGPT-style web UI + JSON API over chat.py (stdlib only), hardened (see above)
+  crypto.py          Ed25519 signatures (RFC 8032) and signed statements, stdlib only
+  governance.py      admin policy, roles, limits, guard, tamper-evident audit chain, signed approvals
+  corpus.py          admin-approved training corpus: hygiene, PII redaction, dedup, splits, signatures
+  lm/                BPE tokenizer, Kneser–Ney n-gram LM, model registry (train/approve/load/generate)
+  nn/                from-scratch autograd, AdamW, TinyGPT Transformer, C matmul kernel, safe weight format
+  cli_admin.py       `admin`, `audit`, `corpus`, `lm` commands
   experiments.py     benchmarks, baselines and controls
   demo.py, __main__.py
 tests/               pytest suite (incl. a static check that agent code never reads hidden world internals)
@@ -304,5 +392,9 @@ The experimental world rules are sampled per seed, never given to the agent, and
 interactions. Beyond the supported spaces, the agent reports uncertainty or abstains. The current zero-forgetting
 results come from separate per-context models; they are not
 a general solution to catastrophic forgetting. Self-improvement is limited to a few allowlisted parameters and
-never touches the safety policy or deploys without a human. Limitations and next steps (noise-robust rules,
+never touches the safety policy or deploys without a human. The in-house language model is small and only as good
+as the approved corpus; it predicts text, it does not reason, and its output is never treated as knowledge.
+Governance assumes the admin key stays secret and the host is trusted: someone with write access to the DB can
+still delete data (detected by `audit verify`, not prevented) and delete seals, so keep the last sealed head hash
+outside the DB. Limitations and next steps (noise-robust rules,
 sub-program library learning, neural perception) are listed in `docs/ARCHITECTURE.md`.

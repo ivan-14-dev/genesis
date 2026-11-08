@@ -72,6 +72,9 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Semantic teaching | `semantic.py` | Explicit membership, inclusion and location; conditional forward inference with premise IDs, conflict blocking, correction history and conversational references | implemented, empty at birth; external teachings stay unverified |
 | Grounded representation learning | `grounding.py` | Minimal consistent sensor projections, learned action-relative groups, forward checks and one-channel contrasts; revised on incompatible repeated states | implemented as a bounded object experiment, not general language grounding |
 | Observability | `dashboard.py` | Read-only inspection of memory; every element traceable to DB rows (`explain`) | implemented (stdlib HTTP + vanilla JS) |
+| Governance | `governance.py`, `crypto.py` | Admin-defined rules: signed policy (roles → actions, domains, limits, blocked terms, hashed tokens), default-deny guard before every write, hash-chained audit log with signed seals, signed approvals bound to one memory | implemented (Ed25519 from RFC 8032, stdlib) |
+| Training corpus | `corpus.py` | Data governance: normalisation, PII redaction, dedup, hash-based train/valid/test split, admin signature over each document's hash, sealed test split | implemented |
+| In-house language model | `lm/`, `nn/` | Statistical language modelling built here: byte-level BPE, interpolated Kneser–Ney n-grams, decoder-only Transformer with autograd + AdamW, C matmul kernel; provenance, baselines, signed activation (`lm/registry.py`) | implemented at small scale; output unverified, never knowledge |
 
 ## C. Module diagram
 
@@ -201,6 +204,8 @@ knowledge: `language.audit()` rejects digits, rule vocabulary (`WORLD_TERMS`: "p
 
 Stage-0 audit checks (all must pass): empty memory, `domain_knowledge == []`, `pretrained_models == []`, no
 learners, language faculty free of world knowledge. No pretrained model, embedding, dataset or LLM is used anywhere.
+The in-house language model (§I) does not change this: it is born empty, learns its tokenizer and weights here
+from admin-approved documents only, and records `pretrained: null` with the hashes of everything it read.
 
 ### Semantic teaching and reasoning
 
@@ -430,7 +435,10 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 | Designer bias in the hypothesis space | "learning" limited to what designers anticipated | explicit manifest; report "unpredictable" honestly; expand primitives only via documented versions |
 | Benchmark overfitting during development | inflated results | report held-out seeds (100–109) not used during development |
 | Symbolic-neural bridge | perception may not yield usable symbols | phase 5 has its own measurable criterion |
-| Unsafe self-modification | loss of control | frozen safety digest; self-improvement only in sandbox + human approval |
+| Unsafe self-modification | loss of control | frozen safety digest; self-improvement only in sandbox + human approval (signed once an admin key is pinned) |
+| Learning outside the admin's rules | unwanted knowledge or behaviour | signed policy checked before every write; default deny; refusals answered and audited |
+| Poisoned or personal training data | model reproduces it | corpus gate: admin signature over each document hash, PII redaction, blocked terms, output filtering |
+| Local web attacks (DNS rebinding, CSRF, DoS) | memory written by a hostile page, server stalled | Host allowlist, same-origin JSON only, Content-Length validation, timeouts, rate limit, time budget, CSP |
 
 ### Known limitations of the current prototype
 
@@ -447,3 +455,51 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
   is small (+0.007 on holdout). It cannot change algorithms or architecture.
 - Curiosity spends slightly more observations on noise than round-robin.
 - Neural perception is not implemented yet.
+- The in-house language model is small (n-gram or ~10⁵-parameter Transformer on 2 CPUs) and only as good as the
+  approved corpus. It predicts text; it does not reason, and the chat never stores its output as knowledge.
+- Governance trusts the host and the admin key: DB write access can still delete rows and seals (detected by
+  `audit verify`, not prevented); keep the last sealed head outside the DB. There is a single admin key (no
+  quorum, no rotation command yet).
+- The chat server runs one engine behind a lock: a message that uses its whole time budget
+  (`max_seconds_per_message`, 30 s by default) delays other clients by that long.
+
+## I. Governance, security and the in-house language model
+
+### Trust model
+
+The admin holds an Ed25519 private key (`admin keygen`, file mode 0600, refused if group/world-readable). Its
+public key is pinned in `meta.admin_pubkey`, together with a random `meta.memory_id`. Every admin decision is a
+statement `{…, memory_id, ts, by}` signed over `"genesis-v1/" + purpose + "\n" + canonical JSON`, so a signature
+cannot be reused for another purpose, another target or another memory:
+
+| Purpose | Signed target | Checked when |
+|---|---|---|
+| `policy` | the whole normalised policy (serial must increase) | every load; the chat server re-checks on change and answers 503 if it fails |
+| `corpus-approval` | document id + SHA-256 + decision | every time training or evaluation reads the document |
+| `lm-approval` | model id + SHA-256 of the weights blob | every time the active model is loaded |
+| `version-approval` | self-improvement version id + config | deployment (`approve --key`) |
+| `audit-seal` | last audit entry id + head hash | `audit verify` (detects truncation) |
+
+### Policy and guard
+
+`validate_policy` rejects unknown keys, unknown actions, limits above the frozen ceilings (`HARD_LIMITS`) and
+reserved user names. `Guard.require(action)` is called by the chat engine, the semantic and object dialogues, the
+corpus and the model registry **before** anything is written. It denies unknown actions, actions missing from
+the caller's role, and actions in a disabled domain. Allowed writes and all refusals go to `audit_log`. Each entry
+stores `sha256(prev_hash + canonical(entry))`, so editing or deleting an entry breaks the chain. Identity comes
+from bearer tokens whose SHA-256 is listed in the policy, compared in constant time.
+
+### Language-model pipeline
+
+```
+documents ──submit──▶ normalise · redact PII · blocked terms · dedup · split by hash ──▶ pending
+pending ──admin signs sha256──▶ approved ──(train split only)──▶ BPE merges ──▶ n-gram / TinyGPT
+model ──▶ valid PPL + bits/byte vs unigram ──admin signs weights sha256──▶ active ──▶ `complète : …` in chat
+test split ──(audited read)──▶ final evaluation only
+```
+
+Weights are stored as a zlib-compressed blob (`GLM1` header + JSON tokenizer/n-gram tables + `GNNW1` tensors, no
+pickle). Decompression is capped (256 MiB), and the deserialiser accepts only whitelisted model classes. Training
+is deterministic: the same corpus, config and seed give the same weights hash. Generation is seeded by the
+prompt's hash, bounded by `max_generate_tokens` and the per-message time budget, filtered for PII and blocked
+terms, and labelled as unverified text.

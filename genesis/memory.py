@@ -10,19 +10,26 @@ Long-term memory is a single SQLite file with five stores:
 
 ``evidence`` links every knowledge item to the episodes that support or
 contradict it; ``knowledge_history`` audits every status change.
+
+Governance stores (schema v2): ``audit_log`` is an append-only, hash-chained journal of policy decisions and
+admin actions (any edit or deletion breaks the chain; admin-signed ``audit_seals`` pin its head);
+``corpus_docs`` holds the admin-approved texts the in-house language models may be trained on, and
+``lm_models`` the models trained here with their provenance.
+
+The database file is created owner-only (0600): it contains conversation transcripts.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -66,7 +73,35 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, ts REAL NOT NULL,
     role TEXT NOT NULL, text TEXT NOT NULL, meta TEXT);
 CREATE INDEX IF NOT EXISTS ix_chat_conv ON chat_messages(conversation_id, id);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, actor TEXT, role TEXT, action TEXT NOT NULL, target TEXT,
+    decision TEXT NOT NULL, detail TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit_seals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, entry_id INTEGER NOT NULL, head_hash TEXT NOT NULL,
+    signed TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS corpus_docs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, name TEXT NOT NULL, source TEXT NOT NULL,
+    license TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, text TEXT NOT NULL, n_chars INTEGER NOT NULL,
+    submitted_by TEXT, status TEXT NOT NULL, split TEXT NOT NULL, redactions TEXT, approval TEXT,
+    updated_ts REAL);
+CREATE TABLE IF NOT EXISTS lm_models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, kind TEXT NOT NULL, config TEXT NOT NULL,
+    corpus TEXT NOT NULL, weights BLOB NOT NULL, weights_sha256 TEXT NOT NULL, metrics TEXT,
+    status TEXT NOT NULL, approval TEXT, provenance TEXT NOT NULL);
 """
+
+# Applied in order to databases created with an older schema (version -> statements).
+MIGRATIONS = {
+    2: ("ALTER TABLE model_versions ADD COLUMN approval TEXT",
+        "ALTER TABLE conversations ADD COLUMN owner TEXT"),
+}
+GENESIS_HASH = "0" * 64
+AUDIT_FIELDS = ("id", "ts", "actor", "role", "action", "target", "decision", "detail", "prev_hash")
+
+
+def audit_hash(row) -> str:
+    payload = json.dumps([row[k] for k in AUDIT_FIELDS], separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -87,19 +122,30 @@ class KnowledgeItem:
 
 
 class LongTermMemory:
-    def __init__(self, path: str, read_only: bool = False):
+    def __init__(self, path: str, read_only: bool = False, check_same_thread: bool = True):
         self.path = path
         self.read_only = read_only
         if read_only:  # observers (dashboard) can never alter the agent's memory
             self.db = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True, check_same_thread=False)
             self.db.row_factory = sqlite3.Row
             return
-        self.db = sqlite3.connect(path)
+        if path != ":memory:" and not os.path.exists(path):
+            # Owner-only from the first byte; SQLite gives its journal files the same mode.
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        self.db = sqlite3.connect(path, check_same_thread=check_same_thread)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        if self.get_meta("schema_version") is None:
-            self.set_meta("schema_version", SCHEMA_VERSION)
+        self._migrate()
         self.db.commit()
+
+    def _migrate(self) -> None:
+        version = self.get_meta("schema_version") or 1
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(f"memory schema v{version} is newer than this code (v{SCHEMA_VERSION})")
+        for v in range(version + 1, SCHEMA_VERSION + 1):
+            for stmt in MIGRATIONS.get(v, ()):
+                self.db.execute(stmt)
+        self.set_meta("schema_version", SCHEMA_VERSION)
 
     def close(self) -> None:
         if not self.read_only:
@@ -139,7 +185,8 @@ class LongTermMemory:
 
     def count(self, table: str) -> int:
         assert table in ("episodes", "knowledge", "procedures", "associations", "metacog", "evidence",
-                         "knowledge_history", "learner_state", "objectives", "model_versions")
+                         "knowledge_history", "learner_state", "objectives", "model_versions", "audit_log",
+                         "audit_seals", "corpus_docs", "lm_models")
         return self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
     # ---------------------------------------------------------------- semantic
@@ -276,14 +323,19 @@ class LongTermMemory:
     # ----------------------------------------------------------- conversations
     # Transcripts of the chat interface. What the agent *learns* from a conversation is stored as episodes
     # with provenance "user-provided", like any other experience; transcripts are only the dialogue record.
-    def add_conversation(self, title: Optional[str] = None, lang: Optional[str] = None) -> int:
+    def add_conversation(self, title: Optional[str] = None, lang: Optional[str] = None,
+                         owner: Optional[str] = None) -> int:
         now = time.time()
-        return self.db.execute("INSERT INTO conversations(created_ts, updated_ts, title, lang) VALUES (?,?,?,?)",
-                               (now, now, title, lang)).lastrowid
+        return self.db.execute("INSERT INTO conversations(created_ts, updated_ts, title, lang, owner) "
+                               "VALUES (?,?,?,?,?)", (now, now, title, lang, owner)).lastrowid
 
-    def conversation(self, cid: int) -> Optional[dict]:
+    def conversation(self, cid: int, owner: Optional[str] = None) -> Optional[dict]:
+        """``owner`` restricts access to that user's conversations (``None`` = unrestricted, e.g. admin).
+        Conversations created before ownership existed belong to the local user."""
         r = self.db.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
-        return dict(r) if r else None
+        if r is None or (owner is not None and (r["owner"] or "local") != owner):
+            return None
+        return dict(r)
 
     def update_conversation(self, cid: int, **fields) -> None:
         fields = {k: v for k, v in fields.items() if k in ("title", "lang")}
@@ -291,9 +343,13 @@ class LongTermMemory:
         self.db.execute(f"UPDATE conversations SET updated_ts=?{', ' + sets if sets else ''} WHERE id=?",
                         (time.time(), *fields.values(), cid))
 
-    def conversations(self, limit: int = 100) -> list:
+    def conversations(self, limit: int = 100, owner: Optional[str] = None) -> list:
+        if owner is None:
+            return [dict(r) for r in self.db.execute(
+                "SELECT * FROM conversations ORDER BY updated_ts DESC, id DESC LIMIT ?", (limit,))]
         return [dict(r) for r in self.db.execute(
-            "SELECT * FROM conversations ORDER BY updated_ts DESC, id DESC LIMIT ?", (limit,))]
+            "SELECT * FROM conversations WHERE COALESCE(owner, 'local')=? ORDER BY updated_ts DESC, id DESC "
+            "LIMIT ?", (owner, limit))]
 
     def add_message(self, cid: int, role: str, text: str, meta=None) -> dict:
         ts = time.time()
@@ -324,9 +380,33 @@ class LongTermMemory:
     def load_learners(self) -> list:
         return [(r["key"], r["env_id"], json.loads(r["state"])) for r in self.db.execute("SELECT * FROM learner_state")]
 
+    # ------------------------------------------------------------- audit log
+    def append_audit(self, action: str, decision: str, actor: Optional[str] = None, role: Optional[str] = None,
+                     target=None, detail=None) -> dict:
+        """Appends one entry to the hash chain: each entry's hash covers its content and the previous hash."""
+        last = self.db.execute("SELECT id, hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        row = {"id": (last["id"] + 1) if last else 1, "ts": time.time(), "actor": actor, "role": role,
+               "action": action, "target": None if target is None else str(target), "decision": decision,
+               "detail": None if detail is None else json.dumps(detail, sort_keys=True, default=str),
+               "prev_hash": last["hash"] if last else GENESIS_HASH}
+        row["hash"] = audit_hash(row)
+        self.db.execute("INSERT INTO audit_log VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(row[k] for k in (
+            *AUDIT_FIELDS, "hash")))
+        return row
+
+    def audit_entries(self, since_id: int = 0, limit: Optional[int] = None) -> list:
+        q = "SELECT * FROM audit_log WHERE id>? ORDER BY id" + (" LIMIT ?" if limit else "")
+        return [dict(r) for r in self.db.execute(q, (since_id, limit) if limit else (since_id,))]
+
+    def audit_head(self) -> tuple:
+        last = self.db.execute("SELECT id, hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        return (last["id"], last["hash"]) if last else (0, GENESIS_HASH)
+
     # ------------------------------------------------------ checkpoint/rollback
     def checkpoint(self, dest: str) -> str:
         self.db.commit()
+        if not os.path.exists(dest):  # a checkpoint is a full copy of the memory: same 0600 permissions
+            os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         target = sqlite3.connect(dest)
         with target:
             self.db.backup(target)
@@ -335,7 +415,16 @@ class LongTermMemory:
 
     @staticmethod
     def restore(checkpoint_path: str, live_path: str) -> None:
-        shutil.copyfile(checkpoint_path, live_path)
+        """Copies a checkpoint into the live database through SQLite's backup API, which takes the database
+        locks (a plain file copy could tear a database another process is writing)."""
+        from urllib.request import pathname2url
+        src = sqlite3.connect(f"file:{pathname2url(os.path.abspath(checkpoint_path))}?mode=ro", uri=True)
+        dst = sqlite3.connect(live_path)
+        try:
+            src.backup(dst)
+        finally:
+            src.close()
+            dst.close()
 
     def size_bytes(self) -> int:
         self.db.commit()

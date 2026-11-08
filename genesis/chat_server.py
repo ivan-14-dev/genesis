@@ -3,29 +3,52 @@
 ``python -m genesis chat --db runs/demo.db`` serves a single page and a small JSON API:
 
     GET  /api/status                         stage and memory counts
-    GET  /api/conversations                  conversation list (most recent first)
+    GET  /api/whoami                         identity, role and permissions under the admin policy
+    GET  /api/conversations                  the caller's conversations (most recent first)
     POST /api/conversations                  {"lang": "fr"|"en"} -> new conversation
-    GET  /api/conversations/<id>             messages of a conversation
+    GET  /api/conversations/<id>             messages of one of the caller's conversations
     POST /api/conversations/<id>/messages    {"text": "...", "lang": "fr"|"en"} -> agent reply
 
 Unlike the read-only dashboard, this interface *does* let the agent act and learn, so it holds one
-``Genesis`` instance (one session) for the life of the server. Requests are served one at a time on the
-thread that owns the SQLite connection. It binds to localhost by default; POSTs must be JSON and, when the
-browser sends an Origin header, come from the same origin.
+``Genesis`` instance for the life of the server; requests are served on threads but the engine is used by one
+at a time. Defences, in the order a request meets them:
+
+* **Host allowlist** (127.0.0.1 / localhost / [::1] on the bound port, plus ``--allow-host``): defeats DNS
+  rebinding, where a hostile page re-points its own name at 127.0.0.1.
+* **Same-origin writes**: POSTs must be JSON, and Origin / Sec-Fetch-Site must not be cross-site.
+* **Identity** from the admin policy (``governance.py``): a bearer token (``Authorization`` header, or
+  ``/?token=…`` once, which sets an HttpOnly SameSite=Strict cookie). Without a token the policy's default
+  role applies, unless the policy requires authentication.
+* **Rate limit** per identity, bounded body size and socket timeouts, a per-message time budget in the engine.
+* **Policy guard** inside the engine: default deny, every refusal and write in the audit chain.
+* Responses carry a strict CSP (hash-pinned inline script/style), no-store and anti-framing headers; internal
+  errors return an opaque id, details go to the server log only.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Callable, Optional
-from urllib.parse import urlparse
+import secrets
+import sys
+import threading
+import time
+import traceback
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable, Iterable, Optional
+from urllib.parse import parse_qs, urlparse
 
+from . import governance
 from .agent import Genesis
 from .chat import ChatEngine
 from .metacognition import Metacognition
 
 MAX_BODY = 16 * 1024
+SOCKET_TIMEOUT = 10
+COOKIE = "genesis_token"
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
 
 
 def status(engine: ChatEngine) -> dict:
@@ -37,52 +60,216 @@ def status(engine: ChatEngine) -> dict:
             "session": a.session}
 
 
-def make_handler(engine: ChatEngine):
+def _hash_source(tag: str) -> str:
+    body = PAGE.split(f"<{tag}>", 1)[1].split(f"</{tag}>", 1)[0]
+    return "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
+
+
+def allowed_hosts(server_address, extra: Iterable[str] = ()) -> set:
+    host, port = server_address[0], server_address[1]
+    names = {"127.0.0.1", "localhost", "[::1]"}
+    if host not in ("", "0.0.0.0", "::"):
+        names.add(f"[{host}]" if ":" in host else host)
+    out = set()
+    for n in names | {h.lower() for h in extra}:
+        if re.fullmatch(r"(\[[0-9a-f:]+\]|[^:\[\]]+):\d+", n):
+            out.add(n)
+            continue
+        out.add(f"{n}:{port}")
+        if port == 80:
+            out.add(n)
+    return out
+
+
+class PolicyCache:
+    """Re-verifies the signed policy only when it changes in memory (an admin may install one while serving)."""
+
+    def __init__(self, ltm, expected_pub: Optional[bytes] = None):
+        self.ltm, self.expected_pub, self.raw, self.policy = ltm, expected_pub, object(), None
+
+    def get(self) -> governance.Policy:
+        raw = (self.ltm.db.execute("SELECT value FROM meta WHERE key='policy'").fetchone() or [None])[0], \
+            self.ltm.get_meta("admin_pubkey")
+        if raw != self.raw:
+            self.policy = governance.load_policy(self.ltm, self.expected_pub)  # raises if tampered
+            self.raw = raw
+        return self.policy
+
+
+class RateLimiter:
+    def __init__(self):
+        self.hits, self.lock = {}, threading.Lock()
+
+    def allow(self, who: str, per_minute: int) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            q = self.hits.setdefault(who, deque())
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) >= per_minute:
+                return False
+            q.append(now)
+            return True
+
+
+def make_handler(engine: ChatEngine, allow_hosts: Iterable[str] = (), expected_pub: Optional[bytes] = None):
+    lock = threading.RLock()
+    policies = PolicyCache(engine.ltm, expected_pub)
+    limiter = RateLimiter()
+    extra_hosts = tuple(allow_hosts)
+    csp = ("default-src 'none'; script-src " + _hash_source("script") + "; style-src " + _hash_source("style")
+           + "; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; "
+           "frame-ancestors 'none'")
+
     class Handler(BaseHTTPRequestHandler):
+        timeout = SOCKET_TIMEOUT
+        server_version = "GENESIS"
+        sys_version = ""
+
         def log_message(self, *a):
             pass
 
-        def _send(self, code: int, data, ctype: str = "application/json"):
+        def _send(self, code: int, data, ctype: str = "application/json", headers: Optional[dict] = None):
             body = data if isinstance(data, bytes) else json.dumps(data, default=str).encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            if ctype.startswith("text/html"):
+                self.send_header("Content-Security-Policy", csp)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
+        def _fail(self, exc: BaseException):
+            ref = secrets.token_hex(4)
+            print(f"[genesis chat] error {ref}: " + "".join(traceback.format_exception(exc)), file=sys.stderr,
+                  flush=True)
+            return self._send(500, {"error": f"internal error (ref {ref})"})
+
+        # ------------------------------------------------------------ checks
+        def _host_ok(self) -> bool:
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host in allowed_hosts(self.server.server_address, extra_hosts):
+                return True
+            self._send(421, {"error": "unrecognised Host header"})
+            return False
+
+        def _token(self) -> Optional[str]:
+            auth = self.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                return auth[7:].strip() or None
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == COOKIE and v:
+                    return v
+            return None
+
+        def _identify(self):
+            """Returns a Guard for the caller, or sends the error response and returns None."""
+            try:
+                with lock:
+                    policy = policies.get()
+                    actor, role = policy.identify(self._token())
+            except governance.PolicyIntegrityError as exc:
+                print(f"[genesis chat] policy integrity failure: {exc}", file=sys.stderr, flush=True)
+                self._send(503, {"error": "policy integrity check failed; refusing to serve"})
+                return None
+            except governance.AuthError as exc:
+                self._send(401, {"error": str(exc)}, headers={"WWW-Authenticate": "Bearer"})
+                return None
+            if not limiter.allow(actor, policy.limit("requests_per_minute")):
+                self._send(429, {"error": "too many requests"}, headers={"Retry-After": "60"})
+                return None
+            return governance.Guard(policy, engine.ltm, actor, role)
+
+        def _call(self, guard, fn, *args):
+            with lock:
+                engine.guard = guard
+                return fn(*args)
+
+        # -------------------------------------------------------------- GET
         def do_GET(self):
-            path = urlparse(self.path).path
+            if not self._host_ok():
+                return
+            url = urlparse(self.path)
+            path, query = url.path, parse_qs(url.query)
             if path in ("/", "/index.html"):
+                token = (query.get("token") or [None])[0]
+                if token:  # move the token out of the URL (history, logs) into an HttpOnly cookie
+                    if not TOKEN_RE.fullmatch(token):
+                        return self._send(401, {"error": "unknown token"})
+                    try:
+                        with lock:
+                            policies.get().identify(token)
+                    except (governance.AuthError, governance.PolicyIntegrityError):
+                        return self._send(401, {"error": "unknown token"})
+                    return self._send(303, b"", "text/plain", {
+                        "Location": "/", "Set-Cookie": f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/"})
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
-            if path == "/api/status":
-                return self._send(200, status(engine))
-            if path == "/api/conversations":
-                return self._send(200, engine.conversations())
-            m = re.fullmatch(r"/api/conversations/(\d+)", path)
-            if m:
-                conv = engine.ltm.conversation(int(m.group(1)))
-                if conv is None:
-                    return self._send(404, {"error": "not found"})
-                return self._send(200, {"conversation": conv, "messages": engine.messages(conv["id"])})
+            if not path.startswith("/api/"):
+                return self._send(404, {"error": "not found"})
+            guard = self._identify()
+            if guard is None:
+                return
+
+            def checked_status():
+                guard.require("chat.read")
+                return status(engine)
+            try:
+                if path == "/api/status":
+                    return self._send(200, self._call(guard, checked_status))
+                if path == "/api/whoami":
+                    p = guard.policy
+                    return self._send(200, {"user": guard.actor, "role": guard.role, "policy": p.doc["name"],
+                                            "serial": p.serial, "signed": p.signed,
+                                            "permissions": sorted(a for a in governance.ACTIONS if guard.allowed(a))})
+                if path == "/api/conversations":
+                    return self._send(200, self._call(guard, engine.conversations))
+                m = re.fullmatch(r"/api/conversations/(\d{1,12})", path)
+                if m:
+                    def read():
+                        conv = engine.conversation(int(m.group(1)))
+                        return conv and {"conversation": conv, "messages": engine.messages(conv["id"])}
+                    data = self._call(guard, read)
+                    return self._send(200, data) if data else self._send(404, {"error": "not found"})
+            except governance.PolicyDenied as exc:
+                return self._send(403, {"error": str(exc)})
+            except Exception as exc:
+                return self._fail(exc)
             self._send(404, {"error": "not found"})
 
+        # ------------------------------------------------------------- POST
         def _body(self) -> Optional[dict]:
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._send(415, {"error": "JSON required"})
                 return None
             origin = self.headers.get("Origin")
-            if origin and urlparse(origin).netloc != self.headers.get("Host"):
+            if origin and urlparse(origin).netloc.lower() != (self.headers.get("Host") or "").lower():
                 self._send(403, {"error": "cross-origin request refused"})
                 return None
-            n = int(self.headers.get("Content-Length") or 0)
+            if self.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+                self._send(403, {"error": "cross-site request refused"})
+                return None
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0:
+                self._send(400, {"error": "invalid Content-Length"})
+                return None
             if n > MAX_BODY:
                 self._send(413, {"error": "message too large"})
                 return None
             try:
                 data = json.loads(self.rfile.read(n) or b"{}")
-            except ValueError:
+            except (ValueError, OSError):
                 self._send(400, {"error": "invalid JSON"})
                 return None
             if not isinstance(data, dict):
@@ -91,33 +278,44 @@ def make_handler(engine: ChatEngine):
             return data
 
         def do_POST(self):
-            path = urlparse(self.path).path
+            if not self._host_ok():
+                return
+            url = urlparse(self.path)
             data = self._body()
             if data is None:
                 return
+            guard = self._identify()
+            if guard is None:
+                return
+            path = url.path
             try:
                 if path == "/api/conversations":
-                    return self._send(200, engine.new_conversation(data.get("lang")))
-                m = re.fullmatch(r"/api/conversations/(\d+)/messages", path)
+                    return self._send(200, self._call(guard, engine.new_conversation, data.get("lang")))
+                m = re.fullmatch(r"/api/conversations/(\d{1,12})/messages", path)
                 if m:
                     text = data.get("text")
                     if not isinstance(text, str) or not text.strip():
                         return self._send(400, {"error": "text required"})
-                    return self._send(200, engine.send(int(m.group(1)), text, data.get("lang")))
+                    return self._send(200, self._call(guard, engine.send, int(m.group(1)), text, data.get("lang")))
             except KeyError:
                 return self._send(404, {"error": "conversation not found"})
-            except Exception as e:  # report, never crash the server
-                return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            except governance.PolicyDenied as exc:
+                return self._send(403, {"error": str(exc)})
+            except Exception as exc:  # report, never crash the server, never leak internals
+                return self._fail(exc)
             self._send(404, {"error": "not found"})
 
     return Handler
 
 
 def serve(db_path: str, host: str = "127.0.0.1", port: int = 8766,
-          world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None) -> None:
-    agent = Genesis(db_path)
+          world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None,
+          allow_hosts: Iterable[str] = (), expected_pub: Optional[bytes] = None) -> None:
+    agent = Genesis(db_path, check_same_thread=False)  # used by one request thread at a time (engine lock)
+    governance.load_policy(agent.ltm, expected_pub)  # refuse to start under a tampered policy
     engine = ChatEngine(agent, world_factory, object_factory)
-    srv = HTTPServer((host, port), make_handler(engine))
+    srv = ThreadingHTTPServer((host, port), make_handler(engine, allow_hosts, expected_pub))
+    srv.daemon_threads = True
     print(f"GENESIS chat for {db_path} on http://{host}:{port}  (session {agent.session}; Ctrl+C to stop)",
           flush=True)
     try:
@@ -218,10 +416,10 @@ const FR = (navigator.language||'').toLowerCase().startsWith('fr');
 const LANG = FR ? 'fr' : 'en';
 document.documentElement.lang = LANG;
 const T = FR ? {
-  new:'Nouvelle discussion', history:'Historique', model:'· sans modèle de langage', hello:'Que dois-je apprendre ?',
+  new:'Nouvelle discussion', history:'Historique', model:'· aucun LLM externe', hello:'Que dois-je apprendre ?',
   sub:"Je ne sais que ce que j'ai appris par expérience. Donne-moi une suite de nombres : je prédirai chaque terme avant de le lire, puis je te dirai quelle règle j'ai trouvée, et avec quelles preuves.",
   placeholder:'Enseigne un fait, pose une question ou envoie une suite…',
-  note:"GENESIS n'utilise aucun modèle de langage : il comprend quelques commandes, apprend les mots que tu lui enseignes et n'affirme que ce que sa mémoire justifie.",
+  note:"GENESIS n'utilise aucun modèle de langage externe ni pré-entraîné : il comprend quelques commandes, apprend les mots que tu lui enseignes et n'affirme que ce que sa mémoire justifie. Le texte de son petit modèle interne (« complète : … ») est marqué non vérifié.",
   stage:'Stade', beliefs:'croyances', validated:'validées', episodes:'épisodes', copy:'Copier', copied:'Copié',
   untitled:'Nouvelle discussion', error:'Erreur : ', explain:'explique ',
   cards:[['3, 7, 11, 15, 19, 23, 27','une suite arithmétique'],['atelier objets','apprendre des mots à partir des objets'],
@@ -230,10 +428,10 @@ const T = FR ? {
   learnedWord:'mots appris',
   intents:{clarify:'vérification',vocabulary:'vocabulaire','teach-request':'apprentissage de mots','yes-no':'oui/non',thanks:'merci',continue:'apprentissage','too-short':'trop court',sequence:'apprentissage',explain:'preuves',knowledge:'mémoire',explore:'exploration',stage:'stade',limitations:'limites',questions:'curiosité',predict:'prédiction','not-understood':'non compris',help:'aide',intro:'présentation',refused:'refusé',define:'définition',languages:'langues',smalltalk:'conversation',bye:'au revoir',declined:'refus','unknown-topic':'hors de mes connaissances'}
 } : {
-  new:'New chat', history:'History', model:'· no language model', hello:'What should I learn?',
+  new:'New chat', history:'History', model:'· no external LLM', hello:'What should I learn?',
   sub:"I only know what I learned from experience. Give me a number sequence: I will predict each term before reading it, then tell you which rule I found and on what evidence.",
   placeholder:'Teach a fact, ask a question or send a sequence…',
-  note:'GENESIS uses no language model: it understands a few commands, learns the words you teach it, and only claims what its memory justifies.',
+  note:'GENESIS uses no external or pretrained language model: it understands a few commands, learns the words you teach it, and only claims what its memory justifies. Text from its small in-house model ("complete: …") is labelled unverified.',
   stage:'Stage', beliefs:'beliefs', validated:'validated', episodes:'episodes', copy:'Copy', copied:'Copied',
   untitled:'New chat', error:'Error: ', explain:'explain ',
   cards:[['3, 7, 11, 15, 19, 23, 27','an arithmetic sequence'],['object workshop','learn words from objects'],
@@ -241,6 +439,11 @@ const T = FR ? {
   learnedWord:'learned words',
   intents:{clarify:'check',vocabulary:'vocabulary','teach-request':'word learning','yes-no':'yes/no',thanks:'thanks',continue:'learning','too-short':'too short',sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused',define:'definition',languages:'languages',smalltalk:'small talk',bye:'goodbye',declined:'declined','unknown-topic':'outside my knowledge'}
 };
+Object.assign(T.intents, FR ? {
+  'policy-denied':'refusé par la politique', 'lm-generate':'texte généré (non vérifié)'
+} : {
+  'policy-denied':'refused by policy', 'lm-generate':'generated text (unverified)'
+});
 Object.assign(T.intents, FR ? {
   'semantic-teach':'enseignement', 'semantic-query':'raisonnement', 'semantic-clarify':'précision',
   'semantic-explain':'prémisses', 'semantic-recall':'rappel', 'semantic-retract':'rétractation'

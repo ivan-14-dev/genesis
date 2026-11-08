@@ -4,13 +4,23 @@
 small JSON API. The memory database is opened with SQLite's ``mode=ro`` for
 every request, so observing the agent can never change it (nor does the
 dashboard instantiate an agent, which would start a new session).
+
+Read-only is not harmless: the memory holds conversations. The server therefore only answers requests whose
+Host header names it (127.0.0.1 / localhost / [::1], plus ``allow_hosts``), which defeats DNS rebinding;
+pages carry a strict CSP; query sizes are clamped; internal errors return an opaque id.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
+import secrets
+import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .memory import LongTermMemory
@@ -59,10 +69,22 @@ def episodes(ltm: LongTermMemory, limit: int = 50, env=None) -> list:
     return [_episode(dict(r)) for r in rows]
 
 
+MAX_LIMIT = 500
+SCAN_LIMIT = 20000
+
+
+def _limit(value, default: int = 50) -> int:
+    try:
+        return min(max(int(value), 1), MAX_LIMIT)
+    except (TypeError, ValueError):
+        return default
+
+
 def failures(ltm: LongTermMemory, limit: int = 50) -> dict:
-    """Confident predictions that turned out wrong, and refuted beliefs."""
+    """Confident predictions that turned out wrong (among the latest episodes), and refuted beliefs."""
     wrong = []
-    for r in ltm.db.execute("SELECT * FROM episodes WHERE predictions LIKE '%confidence%' ORDER BY id DESC"):
+    for r in ltm.db.execute("SELECT * FROM episodes WHERE predictions LIKE '%confidence%' ORDER BY id DESC LIMIT ?",
+                            (SCAN_LIMIT,)):
         preds = _j(r["predictions"]) or {}
         bad = {k: p for k, p in preds.items()
                if p and p.get("predicted") is not None and p["predicted"] != p.get("actual")
@@ -110,7 +132,7 @@ def performance(ltm: LongTermMemory, bucket: int = 25) -> dict:
 ROUTES = {
     "summary": lambda ltm, q: summary(ltm),
     "knowledge": lambda ltm, q: knowledge(ltm, q.get("status")),
-    "episodes": lambda ltm, q: episodes(ltm, int(q.get("limit", 50)), q.get("env")),
+    "episodes": lambda ltm, q: episodes(ltm, _limit(q.get("limit")), q.get("env")),
     "failures": lambda ltm, q: failures(ltm),
     "performance": lambda ltm, q: performance(ltm),
     "objectives": lambda ltm, q: ltm.objectives(q.get("status")),
@@ -135,8 +157,22 @@ def api(db_path: str, path: str, query: dict):
         ltm.close()
 
 
-def make_handler(db_path: str):
+def _script_hash() -> str:
+    body = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
+    return "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
+
+
+def make_handler(db_path: str, allow_hosts: Iterable[str] = ()):
+    from .chat_server import allowed_hosts
+    extra = tuple(allow_hosts)
+    csp = (f"default-src 'none'; script-src {_script_hash()}; style-src 'unsafe-inline'; connect-src 'self'; "
+           "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10
+        server_version = "GENESIS"
+        sys_version = ""
+
         def log_message(self, *a):
             pass
 
@@ -145,10 +181,18 @@ def make_handler(db_path: str):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if ctype.startswith("text/html"):
+                self.send_header("Content-Security-Policy", csp)
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host not in allowed_hosts(self.server.server_address, extra):
+                return self._send(421, b'{"error": "unrecognised Host header"}', "application/json")
             u = urlparse(self.path)
             if u.path in ("/", "/index.html"):
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
@@ -156,8 +200,12 @@ def make_handler(db_path: str):
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
                 try:
                     data = api(db_path, u.path, q)
-                except Exception as e:  # report, never crash the server
-                    return self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+                except Exception as e:  # report, never crash the server, never leak internals
+                    ref = secrets.token_hex(4)
+                    print(f"[genesis dashboard] error {ref}: " + "".join(traceback.format_exception(e)),
+                          file=sys.stderr, flush=True)
+                    return self._send(500, json.dumps({"error": f"internal error (ref {ref})"}).encode(),
+                                      "application/json")
                 if data is None:
                     return self._send(404, b'{"error": "not found"}', "application/json")
                 return self._send(200, json.dumps(data, default=str).encode(), "application/json")
@@ -169,8 +217,9 @@ def make_handler(db_path: str):
     return Handler
 
 
-def serve(db_path: str, host: str = "127.0.0.1", port: int = 8765) -> None:
-    srv = ThreadingHTTPServer((host, port), make_handler(db_path))
+def serve(db_path: str, host: str = "127.0.0.1", port: int = 8765, allow_hosts: Iterable[str] = ()) -> None:
+    srv = ThreadingHTTPServer((host, port), make_handler(db_path, allow_hosts))
+    srv.daemon_threads = True
     print(f"GENESIS dashboard (read-only) for {db_path} on http://{host}:{port}", flush=True)
     try:
         srv.serve_forever()
@@ -214,7 +263,7 @@ select{background:#0f1419;color:#d8dee9;border:1px solid #2c3540}
 <div id="explain"></div>
 <script>
 const $=id=>document.getElementById(id);
-const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const get=p=>fetch("/api/"+p).then(r=>r.json());
 const num=v=>v==null?"<span class=dim>n/a</span>":(typeof v=="number"?(+v.toFixed(4)):esc(v));
 const table=(cols,rows)=>"<table><tr>"+cols.map(c=>"<th>"+c[0]+"</th>").join("")+"</tr>"+
@@ -229,7 +278,7 @@ function chart(h){ if(!h.length) return "<p class=dim>no predictions yet</p>";
   return `<svg width="${W}" height="${H}"><line x1=20 x2=${W-10} y1=${y(0)} y2=${y(0)} stroke="#2c3540"/><line x1=20 x2=${W-10} y1=${y(1)} y2=${y(1)} stroke="#2c3540"/>
   <text x=0 y=${y(1)+4} fill="#6b7785" font-size=10>1</text><text x=0 y=${y(0)+4} fill="#6b7785" font-size=10>0</text>
   <polyline points="${line}" fill="none" stroke="#4c566a"/>${pts}</svg><div>`+envs.map((e,i)=>`<span style="color:${col[i%6]}">● ${esc(e)}</span> `).join("")+"</div>";}
-async function explain(id){ const e=await get("explain/"+id), it=e.item; let h=`<a onclick="$('explain').style.display='none'">✕ close</a>
+async function explain(id){ const e=await get("explain/"+id), it=e.item; let h=`<a class="close">✕ close</a>
   <h2>#${it.id} ${esc(it.key)}: <code>${esc(it.statement)}</code> ${tag(it.status)}</h2>
   <p>confidence ${it.kind==="semantic"?"unverified (not calibrated)":num(it.confidence)} · provenance <b>${esc(it.provenance)}</b> · support ${it.n_support} · contradictions ${it.n_contra} · forward predictions ${it.forward_ok} ok / ${it.forward_bad} wrong</p>
   <h2>Status history</h2>`+table([["time",r=>new Date(r.ts*1000).toLocaleTimeString()],["from",r=>esc(r.old_status)],["to",r=>tag(r.new_status)],["reason",r=>esc(r.reason)]],e.history);
@@ -263,7 +312,7 @@ async function refresh(){
     `<p>active config (approved self-improvements): <code>${esc(JSON.stringify(s.active_config))}</code></p>`+
     `<p class=dim>innate: ${esc(Object.keys(s.innate?.arithmetic_primitives||{}).join(", "))}; domain knowledge: ${(s.innate?.domain_knowledge||[]).length?esc(s.innate.domain_knowledge.join(", ")):"none (empty at birth)"}; innate language faculty: ${s.innate_language?esc(s.innate_language.languages.join("/")+" — "+s.innate_language.n_forms+" word forms about itself, no world knowledge, no pretrained model (v"+s.innate_language.version+", installed session "+s.innate_language.installed_session+")"):"none"}</p>`;
   const k=await get("knowledge"+($("kstatus").value?"?status="+$("kstatus").value:""));
-  $("knowledge").innerHTML=table([["id",r=>`<a onclick="explain(${r.id})">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["status",r=>tag(r.status)],["conf",r=>r.kind==="semantic"?"unverified":num(r.confidence)],["source",r=>esc(r.provenance)]],k.slice().reverse());
+  $("knowledge").innerHTML=table([["id",r=>`<a class="kid" data-k="${+r.id}">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["status",r=>tag(r.status)],["conf",r=>r.kind==="semantic"?"unverified":num(r.confidence)],["source",r=>esc(r.provenance)]],k.slice().reverse());
   const p=await get("performance");
   $("chart").innerHTML=chart(p.accuracy_history);
   $("activity").innerHTML=table([["session",r=>r.session],["environment",r=>esc(r.env_id)],["mode",r=>esc(r.provenance)],["episodes",r=>r.n]],p.activity);
@@ -271,7 +320,7 @@ async function refresh(){
   const ep=await get("episodes?limit=40");
   $("episodes").innerHTML=table([["#",r=>r.id],["context",r=>esc(r.context)],["predicted → actual",r=>Object.entries(r.predictions||{}).map(([q,v])=>`<span class=${v.predicted===v.actual?"ok":"bad"}>${esc(v.predicted)} → ${esc(v.actual)}</span> <span class=dim>(${num(v.confidence)})</span>`).slice(0,4).join("<br>")||"<span class=dim>no prediction (warm-up)</span>"],["surprise",r=>num(r.surprise)]],ep);
   const f=await get("failures");
-  $("failures").innerHTML="<h2>refuted beliefs</h2>"+table([["id",r=>`<a onclick="explain(${r.id})">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["why",r=>esc(r.reason)]],f.refuted_beliefs)+
+  $("failures").innerHTML="<h2>refuted beliefs</h2>"+table([["id",r=>`<a class="kid" data-k="${+r.id}">${r.id}</a>`],["key",r=>esc(r.key)],["belief",r=>"<code>"+esc(r.statement)+"</code>"],["why",r=>esc(r.reason)]],f.refuted_beliefs)+
     "<h2>confident predictions that failed</h2>"+table([["#",r=>r.id],["context",r=>esc(r.context)],["wrong",r=>Object.entries(r.wrong).map(([q,v])=>`${esc(q.split("/").slice(1).join("/"))}: ${esc(v.predicted)} ≠ ${esc(v.actual)} (${num(v.confidence)})`).join("<br>")]],f.confident_wrong_predictions);
   const o=await get("objectives");
   $("objectives").innerHTML=table([["status",r=>tag(r.status)],["objective",r=>esc(r.text)],["outcome",r=>"<code>"+esc(r.outcome||"")+"</code>"]],o.slice().reverse());
@@ -282,6 +331,8 @@ async function refresh(){
   $("procs").innerHTML=table([["rule shape",r=>"<code>"+esc(r.shape)+"</code>"],["successes",r=>r.successes],["attempts",r=>r.attempts]],pr)+
     table([["a",r=>esc(r.a)],["b",r=>esc(r.b)],["kind",r=>tag(r.kind)],["weight",r=>num(r.weight)]],as);
 }
+document.addEventListener("click",e=>{const a=e.target.closest("a");if(!a)return;
+  if(a.classList.contains("kid"))explain(+a.dataset.k);else if(a.classList.contains("close"))$("explain").style.display="none";});
 $("kstatus").onchange=refresh; refresh(); setInterval(refresh,10000);
 </script></body></html>
 """
