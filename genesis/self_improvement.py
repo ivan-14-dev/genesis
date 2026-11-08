@@ -26,10 +26,12 @@ judged unpredictable, unmet developmental gates).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
 import time
+from typing import Optional
 
 from .adapters import SequenceAdapter
 from .agent import TUNABLE, Genesis, validate_config
@@ -149,8 +151,10 @@ def improve(memory_path: str, world_factory, trial_seeds, holdout_seeds, params=
         ltm.close()
 
 
-def approve(memory_path: str, version_id: int, approved_by: str) -> dict:
-    """Human-only deployment of a validated version."""
+def approve(memory_path: str, version_id: int, approved_by: str, admin_seed: Optional[bytes] = None) -> dict:
+    """Human-only deployment of a validated version. Once an admin key is pinned in the memory, the approval
+    must be signed with it (``admin_seed``); either way the decision is appended to the audit chain."""
+    from . import governance
     if not approved_by:
         raise PermissionError("approval requires a named human approver")
     ltm = LongTermMemory(memory_path)
@@ -161,12 +165,22 @@ def approve(memory_path: str, version_id: int, approved_by: str) -> dict:
         if v["safety_digest"] != DEFAULT_SAFETY.digest():
             raise PermissionError("version was validated under a different safety policy")
         validate_config(v["config"])
+        approval = None
+        if governance.pinned_key(ltm) is not None:
+            if admin_seed is None:
+                raise PermissionError("an admin key is pinned in this memory: the approval must be signed (--key)")
+            approval = governance.admin_approval(ltm, admin_seed, "version-approval",
+                                                 {"version_id": version_id, "config": v["config"]}, approved_by)
+        else:
+            ltm.append_audit("version.approve", "allow", approved_by, "human", version_id, {"config": v["config"]})
         for x in ltm.versions():
             if x["status"] == "deployed":
                 ltm.set_version_status(x["id"], "superseded")
         ltm.set_meta("previous_config", ltm.get_meta("active_config") or {})
         ltm.set_meta("active_config", v["config"])
         ltm.set_version_status(version_id, "deployed", approved_by)
+        if approval is not None:
+            ltm.db.execute("UPDATE model_versions SET approval=? WHERE id=?", (json.dumps(approval), version_id))
         return v["config"]
     finally:
         ltm.close()
@@ -181,6 +195,7 @@ def rollback(memory_path: str) -> dict:
             if x["status"] == "deployed":
                 ltm.set_version_status(x["id"], "rolled-back")
         ltm.set_meta("active_config", prev)
+        ltm.append_audit("version.rollback", "allow", "human", "human", None, {"restored_config": prev})
         return prev
     finally:
         ltm.close()

@@ -21,12 +21,15 @@ Every answer carries ``meta`` (intent, keys, knowledge ids) so it can be traced 
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from typing import Callable, Optional
 
 from .adapters import SEQ_VARS, Outcome, Query, Situation
-from . import language
+from . import governance, language
 from .curiosity import Curiosity
+from .governance import PolicyDenied
 from .language import FUNCTION, INT_RE, Parse
 from .lexicon import ASK_POSTERIOR, Lexicon
 from .metacognition import Metacognition
@@ -48,6 +51,15 @@ ACTIONS = ("explore", "predict", "explain", "sequence", "continue")
 # Intents a learned word may point to (the innate actions the chat can perform).
 TEACHABLE = ("knowledge", "stage", "limitations", "questions", "vocabulary", "help", "intro", "thanks", "explore",
              "predict", "explain")
+# Intents that change memory beyond the transcript, and the policy action each one needs.
+INTENT_ACTION = {"sequence": "sequence.learn", "continue": "sequence.learn", "explore": "world.explore"}
+# Explicit prefix for the in-house language model: free text never reaches it implicitly.
+GENERATE_RE = re.compile(r"^\s*(compl[eè]te|g[eé]n[eè]re|generate)\s*:\s*(.+)$", re.I | re.S)
+OUTPUT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+DENIAL_FR = {"role not permitted": "ton rôle ne le permet pas", "domain disabled by the admin":
+             "ce domaine est désactivé par l'administrateur", "blocked term": "ton message contient un terme "
+             "interdit par l'administrateur", "message too long": "ton message est trop long",
+             "unknown action (default deny)": "action inconnue (refus par défaut)"}
 INTENT_FR = {"knowledge": "que sais-tu", "stage": "stade", "limitations": "limites", "questions": "questions",
              "vocabulary": "vocabulaire", "help": "aide", "intro": "présentation", "thanks": "merci",
              "explore": "explorer", "predict": "prédis", "explain": "explique"}
@@ -108,6 +120,7 @@ def _t(lang: str, fr: str, en: str) -> str:
 STATUS_FR = {"validated": "validée", "candidate": "candidate", "unpredictable": "imprévisible", "refuted": "réfutée",
              "hypothesis": "hypothèse", "dormant": "dormante", "unknown": "inconnue"}
 REASONS_FR = {"step limit": "budget atteint", "sandbox budget exhausted": "budget du bac à sable épuisé",
+              "time budget": "budget de temps atteint",
               "nothing left to learn within current hypothesis space":
                   "plus rien à apprendre dans mon espace d'hypothèses actuel",
               "safety interaction limit": "limite de sécurité atteinte"}
@@ -162,43 +175,94 @@ class UserSequenceAdapter:
 
 
 class ChatEngine:
-    """Turns a message into an action of the agent and an answer grounded in its memory."""
+    """Turns a message into an action of the agent and an answer grounded in its memory.
 
-    def __init__(self, agent, world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None):
+    ``guard`` (``governance.Guard``) is the identity the engine currently acts for. Every write is checked
+    against the admin policy *before* it happens; refusals are answered, never silently dropped, and logged
+    in the audit chain. By default the engine runs under the installed policy as the local user."""
+
+    def __init__(self, agent, world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None,
+                 guard: Optional[governance.Guard] = None):
         self.agent = agent
         self.ltm = agent.ltm
         self.world_factory = world_factory
+        self.guard = guard or governance.Guard(governance.load_policy(self.ltm), self.ltm)
         self.lexicon = Lexicon(self.ltm, TEACHABLE, lambda: agent.session, ignore=YES | NO)
         self.semantic = SemanticDialogue(agent)
         self.objects = ObjectDialogue(agent, object_factory)
+        self.semantic.require = self.objects.require = self._require
+
+    def _require(self, action: str, target=None, detail: Optional[dict] = None) -> None:
+        self.guard.require(action, target, detail)
+
+    def _precheck(self, intent: str) -> None:
+        """Refuses (and logs) an intent the identity may not perform, before anything is learned about it."""
+        action = INTENT_ACTION.get(intent)
+        if action and not self.guard.allowed(action):
+            self.guard.require(action)
+
+    @property
+    def owner(self) -> str:
+        return self.guard.actor
 
     # ------------------------------------------------------------ transcript
     def new_conversation(self, lang: Optional[str] = None) -> dict:
-        cid = self.ltm.add_conversation(None, lang if lang in ("fr", "en") else None)
+        self.guard.require("chat.read")
+        cid = self.ltm.add_conversation(None, lang if lang in ("fr", "en") else None, owner=self.owner)
         self.ltm.commit()
         return self.ltm.conversation(cid)
 
+    def conversation(self, cid: int) -> Optional[dict]:
+        return self.ltm.conversation(cid, owner=self.owner)
+
     def conversations(self) -> list:
-        return self.ltm.conversations()
+        return self.ltm.conversations(owner=self.owner)
 
     def messages(self, cid: int) -> list:
+        if self.conversation(cid) is None:
+            raise KeyError(cid)
         return self.ltm.messages(cid)
 
     def send(self, cid: int, text: str, lang_hint: Optional[str] = None) -> dict:
-        conv = self.ltm.conversation(cid)
+        conv = self.conversation(cid)
         if conv is None:
             raise KeyError(cid)
-        text = (text or "").strip()[:MAX_TEXT]
+        text = (text or "").strip()
         if not text:
             raise ValueError("empty message")
-        lang = detect_lang(text, conv.get("lang") or lang_hint)
-        user = self.ltm.add_message(cid, "user", text)
-        reply, meta = self.respond(cid, text, lang)
+        gen = GENERATE_RE.match(text)
+        # The prompt may be in any language: the command word decides the language of the reply.
+        lang = (("en" if gen.group(1).lower() in ("complete", "generate") else "fr") if gen
+                else detect_lang(text[:MAX_TEXT], conv.get("lang") or lang_hint))
+        try:
+            self.guard.require("chat.read", f"conversation:{cid}")
+            self.guard.check_text(text)
+        except PolicyDenied as exc:
+            # The refused content is not stored: it may be exactly what the admin wants kept out of memory.
+            user = self.ltm.add_message(cid, "user", _t(lang, "[message refusé par la politique]",
+                                                        "[message refused by policy]"), {"refused": exc.reason})
+            reply, meta = self.denied(exc, lang)
+        else:
+            user = self.ltm.add_message(cid, "user", text)
+            try:
+                reply, meta = self.respond(cid, text, lang)
+            except PolicyDenied as exc:
+                reply, meta = self.denied(exc, lang)
         meta = {"lang": lang, **meta}
         bot = self.ltm.add_message(cid, "genesis", reply, meta)
-        self.ltm.update_conversation(cid, lang=lang, title=conv["title"] or text[:60])
+        self.ltm.update_conversation(cid, lang=lang, title=conv["title"] or user["text"][:60])
         self.ltm.commit()
         return {"user": user, "reply": bot, "conversation": self.ltm.conversation(cid)}
+
+    def denied(self, exc: PolicyDenied, lang: str) -> tuple:
+        reason = DENIAL_FR.get(exc.reason, exc.reason) if lang == "fr" else exc.reason
+        if exc.reason.startswith("role '"):
+            reason = _t(lang, "ton rôle ne le permet pas", exc.reason)
+        return _t(lang, f"Je ne peux pas faire cela (`{exc.action}`) : {reason}. Les règles sont fixées par "
+                        "l'administrateur ; rien n'a été appris ni modifié.",
+                  f"I can't do that (`{exc.action}`): {reason}. The rules are set by the administrator; nothing "
+                  "was learned or changed."), {"intent": "policy-denied", "action": exc.action,
+                                               "reason": exc.reason}
 
     # ---------------------------------------------------------------- intents
     def _innate(self, cid: int, p: Parse, text: str) -> Optional[str]:
@@ -293,6 +357,9 @@ class ChatEngine:
             {"intent": "too-short"}
 
     def respond(self, cid: int, text: str, lang: str) -> tuple:
+        gen = GENERATE_RE.match(text)
+        if gen:
+            return self.generate(gen.group(2).strip(), lang)
         objects = self.objects.respond(cid, text, lang)
         if objects is not None:
             return objects
@@ -325,19 +392,21 @@ class ChatEngine:
         if prev.get("intent") == "clarify" and u:
             proposed = prev["proposed"]
             if yes:
-                info = self.lexicon.learn(u, proposed, "confirmed", prev.get("posterior"))
+                self._precheck(proposed)
+                info = self._teach_word(u, proposed, "confirmed", prev.get("posterior"))
                 return self._with_note(self.run(cid, proposed, prev.get("nums") or [], lang),
-                                       self._learn_note(info, u, proposed, "confirmed", lang))
+                                       self._learn_note(info, u, proposed, "confirmed", lang), info is not None)
             if no:
-                info = self.lexicon.learn(u, proposed, "rejected", prev.get("posterior"))
+                info = self._teach_word(u, proposed, "rejected", prev.get("posterior"))
                 return self._ask_teacher(u, prev.get("nums") or [], lang, rejected=proposed, info=info)
             # Any other message is not taken as an answer: ignoring a question is not evidence.
         elif prev.get("intent") in ("not-understood", "unknown-topic", "teach-request") and u and teachable:
-            info = self.lexicon.learn(u, teachable, "taught")
+            self._precheck(teachable)
+            info = self._teach_word(u, teachable, "taught")
             return self._with_note(self.run(cid, teachable, nums or prev.get("nums") or [], lang),
-                                   self._learn_note(info, u, teachable, "taught", lang))
+                                   self._learn_note(info, u, teachable, "taught", lang), info is not None)
         elif prev.get("interpreted") and u and no and not innate:
-            info = self.lexicon.learn(u, prev["intent"], "rejected", prev.get("posterior"))
+            info = self._teach_word(u, prev["intent"], "rejected", prev.get("posterior"))
             return self._ask_teacher(u, prev.get("nums") or [], lang, rejected=prev["intent"], info=info)
 
         if prev.get("intent") in ("not-understood", "unknown-topic", "teach-request") and u and (yes or no):
@@ -389,13 +458,25 @@ class ChatEngine:
         return [_t(lang, fr, en) for fr, en in COMMANDS]
 
     @staticmethod
-    def _with_note(answer: tuple, note: str) -> tuple:
+    def _with_note(answer: tuple, note: str, learned: bool = True) -> tuple:
         reply, meta = answer
-        return reply + "\n\n" + note, {**meta, "learned_word": True}
+        return reply + "\n\n" + note, {**meta, "learned_word": learned}
 
-    def _learn_note(self, info: dict, utterance: str, intent: str, how: str, lang: str) -> str:
+    def _teach_word(self, utterance: str, intent: str, how: str, posterior=None) -> Optional[dict]:
+        """Word learning is a write governed by ``lexicon.teach``; without it the command still runs."""
+        try:
+            self.guard.require("lexicon.teach", intent, {"utterance": utterance[:80], "how": how})
+        except PolicyDenied:
+            return None
+        return self.lexicon.learn(utterance, intent, how, posterior)
+
+    def _learn_note(self, info: Optional[dict], utterance: str, intent: str, how: str, lang: str) -> str:
         name = INTENT_FR[intent] if lang == "fr" else intent
         quoted = utterance if len(utterance) <= 60 else utterance[:57] + "…"
+        if info is None:
+            return _t(lang, f"_« {quoted} » → `{name}` : association pas mémorisée, ton rôle ne permet pas de "
+                            "m'enseigner du vocabulaire._",
+                      f"_“{quoted}” → `{name}`: mapping not stored, your role may not teach me vocabulary._")
         parts = [_t(lang, f"📘 Noté : « {quoted} » → `{name}`.", f"📘 Noted: “{quoted}” → `{name}`.")]
         if info["new_words"]:
             parts.append(_t(lang, f"Nouveaux mots : {', '.join(info['new_words'])}.",
@@ -466,9 +547,10 @@ class ChatEngine:
 
     # ----------------------------------------------------------- sequences
     def learn_sequence(self, cid: int, terms: list, lang: str, key: Optional[str] = None) -> tuple:
-        if len(terms) > MAX_TERMS or any(abs(v) > MAX_ABS for v in terms):
-            return _t(lang, f"Je refuse cette entrée : au plus {MAX_TERMS} termes, chacun entre -10⁹ et 10⁹.",
-                      f"Input refused: at most {MAX_TERMS} terms, each between -10⁹ and 10⁹."), \
+        max_terms = min(MAX_TERMS, self.guard.limit("max_terms_per_message"))
+        if len(terms) > max_terms or any(abs(v) > MAX_ABS for v in terms):
+            return _t(lang, f"Je refuse cette entrée : au plus {max_terms} termes, chacun entre -10⁹ et 10⁹.",
+                      f"Input refused: at most {max_terms} terms, each between -10⁹ and 10⁹."), \
                 {"intent": "refused"}
         agent = self.agent
         env_id = f"conversation-{cid}"
@@ -476,9 +558,19 @@ class ChatEngine:
         if key is None:
             n = sum(1 for k in agent.learners if k.startswith(env_id + "/"))
             key = f"{env_id}/seq{n + 1}"
+        already = self.ltm.db.execute("SELECT COUNT(*) FROM episodes WHERE context=?", (key,)).fetchone()[0]
+        cap = self.guard.limit("max_sequence_terms")
+        if already + len(terms) > cap:
+            # Every term re-scores the hypotheses on the whole history: the admin bounds that cost.
+            return _t(lang, f"Je refuse : cette suite dépasserait {cap} termes (limite fixée par l'administrateur ; "
+                            f"déjà lus : {already}). Commence une nouvelle suite.",
+                      f"Refused: this sequence would exceed {cap} terms (limit set by the administrator; already "
+                      f"read: {already}). Start a new sequence."), {"intent": "refused", "reason": "max_sequence_terms"}
+        self.guard.require("sequence.learn", key, {"terms": len(terms)})
         first_ep = self.ltm.db.execute("SELECT COALESCE(MAX(id), 0) FROM episodes").fetchone()[0]
         adapter = UserSequenceAdapter(agent, env_id, key, terms)
-        agent.live(adapter, len(terms), "curiosity", stop_when_idle=False)
+        rep = agent.live(adapter, len(terms), "curiosity", stop_when_idle=False,
+                         max_seconds=self.guard.limit("max_seconds_per_message"))
         trace = []
         for r in self.ltm.db.execute("SELECT predictions, outcome FROM episodes WHERE context=? AND id>? ORDER BY id",
                                      (key, first_ep)):
@@ -503,8 +595,14 @@ class ChatEngine:
                 "correct_before_seeing": n_ok, "next_terms": future, "appended": appended}
         lines = []
         if appended:
-            lines.append(_t(lang, f"J'ai lu {len(terms)} terme(s) de plus de la même suite.",
-                            f"I read {len(terms)} more term(s) of the same sequence."))
+            lines.append(_t(lang, f"J'ai lu {len(trace)} terme(s) de plus de la même suite.",
+                            f"I read {len(trace)} more term(s) of the same sequence."))
+        if rep.stopped_because == "time budget":
+            meta["stopped"] = "time budget"
+            lines.append(_t(lang, f"⏱️ Budget de temps atteint : je n'ai lu que {len(trace)}/{len(terms)} terme(s). "
+                                  "Renvoie les suivants avec `suite …`.",
+                            f"⏱️ Time budget reached: I only read {len(trace)}/{len(terms)} term(s). Send the rest "
+                            "with `continue …`."))
         if predicted:
             marks = " ".join(f"{t['term']}{'·' if t['predicted'] is None else '✓' if t['predicted'] == t['term'] else '✗'}"
                              for t in trace[-12:])
@@ -706,10 +804,12 @@ class ChatEngine:
         if self.world_factory is None:
             return _t(lang, "Aucun monde d'expérimentation n'est connecté à cette interface.",
                       "No experimental world is connected to this interface."), {"intent": "explore"}
+        budget = min(budget, self.guard.limit("max_explore_steps"))
+        self.guard.require("world.explore", None, {"budget": budget})
         n = (self.ltm.get_meta("chat_explorations") or 0) + 1
         self.ltm.set_meta("chat_explorations", n)
         sb = self.world_factory(20000 + n)
-        rep = self.agent.explore_sequences(sb, budget)
+        rep = self.agent.explore_sequences(sb, budget, max_seconds=self.guard.limit("max_seconds_per_message"))
         env = sb.env_id
         res = {k: lr.status() for k, lr in self.agent.learners.items() if self.agent.learner_env.get(k) == env}
         val = sorted(k for k, s in res.items() if s == "validated")
@@ -728,6 +828,45 @@ class ChatEngine:
             lines.append(f"  - `{k}` : `{top.expr}`")
         return "\n".join(lines), {"intent": "explore", "env_id": env, "steps": rep.steps, "validated": len(val),
                                   "unpredictable": len(unp)}
+
+    # ------------------------------------------------- in-house language model
+    def generate(self, prompt: str, lang: str) -> tuple:
+        """Continues a text with the admin-approved model trained here. The output is labelled as unverified,
+        filtered (personal data, blocked terms) and never stored as knowledge: only the transcript keeps it."""
+        from . import corpus
+        from .lm import registry
+        self.guard.require("lm.generate", None, {"prompt_chars": len(prompt)})
+        meta = {"intent": "lm-generate"}
+        try:
+            model = registry.load_active(self.ltm)
+        except (registry.LMIntegrityError, KeyError) as exc:
+            return _t(lang, f"Mon modèle de langage interne est refusé : son intégrité ne se vérifie plus ({exc}). "
+                            "L'administrateur doit le réapprouver ou en entraîner un autre.",
+                      f"My in-house language model is refused: its integrity no longer verifies ({exc}). The "
+                      "administrator must re-approve it or train another one."), {**meta, "error": "integrity"}
+        if model is None:
+            return _t(lang, "Aucun modèle de langage interne n'est actif. Il doit être entraîné ici, sur des "
+                            "documents approuvés par l'administrateur (`python -m genesis corpus add`, "
+                            "`corpus approve`, `lm train`, `lm approve`). Je n'utilise aucun modèle externe.",
+                      "No in-house language model is active. It has to be trained here, on documents approved by "
+                      "the administrator (`python -m genesis corpus add`, `corpus approve`, `lm train`, "
+                      "`lm approve`). I use no external model."), {**meta, "active": False}
+        seed = int(hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8], 16)
+        out = model.generate(prompt, self.guard.limit("max_generate_tokens"), seed=seed,
+                             max_seconds=self.guard.limit("max_seconds_per_message"))
+        text, redactions = corpus.redact(OUTPUT_CONTROL.sub("", out["text"]))
+        meta = {**meta, "model_id": model.id, "tokens": out["tokens"], "stopped": out["stopped"], "seed": seed}
+        if redactions:
+            meta["redactions"] = redactions
+        if self.guard.policy.blocked(text):
+            return _t(lang, "Le texte généré contenait un terme interdit par l'administrateur : je ne l'affiche pas.",
+                      "The generated text contained a term blocked by the administrator: I won't show it."), \
+                {**meta, "withheld": True}
+        head = _t(lang, f"_Texte généré par mon modèle interne {model.describe('fr')} — **non vérifié, ce n'est "
+                        "pas une connaissance** et rien n'est mémorisé comme vrai._",
+                  f"_Text generated by my in-house model {model.describe('en')} — **unverified, not knowledge**, "
+                  "and nothing is stored as true._")
+        return f"{head}\n\n{prompt}{text}", meta
 
     # ------------------------------------------------------ language faculty
     def define(self, p: Parse, lang: str) -> tuple:
@@ -827,6 +966,8 @@ class ChatEngine:
                   "- `atelier objets` → apprendre des mots à partir d'objets et de leurs effets observés\n"
                   "- `apprends phrase : prends dax sans mip => dax et pas mip` → enseigner une construction "
                   "avec des mots déjà appris dans l'atelier\n"
+                  "- `complète : il était une fois` → texte généré par mon petit modèle de langage entraîné ici "
+                  "(s'il a été approuvé par l'administrateur), toujours marqué non vérifié\n"
                   "- un mot que je ne connais pas → dis-moi quelle commande tu voulais : j'apprendrai ce mot",
                   "Talk to me normally in English or French. What I can do:\n"
                   "- a **sequence of integers** (≥ 4) → I look for its rule by predicting each term\n"
@@ -844,6 +985,8 @@ class ChatEngine:
                   "- `object workshop` → learn words from objects and their observed effects\n"
                   "- `learn phrase: fetch dax without mip => dax and not mip` → teach a construction "
                   "using words already learned in the workshop\n"
+                  "- `complete: once upon a time` → text generated by my small language model trained here "
+                  "(if the administrator approved one), always labelled unverified\n"
                   "- a word I don't know → tell me which command you meant: I'll learn that word")
 
     def not_understood(self, lang: str) -> str:

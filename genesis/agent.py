@@ -78,11 +78,12 @@ class SessionReport:
 class Genesis:
     def __init__(self, memory_path: str, safety: SafetyPolicy = DEFAULT_SAFETY, seed: int = 0,
                  procedural_prior: bool = True, consolidate_every: int = 50, idle_patience: int = 20,
-                 review_interval: int = 10, reviews_to_graduate: int = 3, config: Optional[dict] = None):
+                 review_interval: int = 10, reviews_to_graduate: int = 3, config: Optional[dict] = None,
+                 check_same_thread: bool = True):
         self.safety = safety
         self.seed = seed
         self.rng = random.Random(seed)
-        self.ltm = LongTermMemory(memory_path)
+        self.ltm = LongTermMemory(memory_path, check_same_thread=check_same_thread)
         self.wm = WorkingMemory(capacity=9)
         self.perception = Perception()
         self.attention = Attention()
@@ -251,13 +252,19 @@ class Genesis:
         self.wm.put(("seq", key), ((list(window) + [y])[-3:], t + 1), salience=1.0)
 
     # ------------------------------------------------------------ the cycle
-    def live(self, adapter, max_steps: int, strategy: str = "curiosity", stop_when_idle: bool = True) -> SessionReport:
+    def live(self, adapter, max_steps: int, strategy: str = "curiosity", stop_when_idle: bool = True,
+             max_seconds: Optional[float] = None) -> SessionReport:
+        """``max_seconds`` is a wall-clock safety budget for interactive callers (chat): it bounds the work one
+        request can trigger. It is checked between interactions, never inside one, and the stop is reported."""
         rep = SessionReport()
         t0 = time.perf_counter()
         idle = 0
         for _ in range(max_steps):
             if self.interactions >= self.safety.max_interactions_per_session * (self.session + 1):
                 rep.stopped_because = "safety interaction limit"
+                break
+            if max_seconds is not None and time.perf_counter() - t0 > max_seconds:
+                rep.stopped_because = "time budget"
                 break
             # 1-2 OBSERVE + PERCEIVE (3 REMEMBER happens inside adapters via recall)
             try:

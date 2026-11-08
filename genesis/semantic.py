@@ -195,6 +195,7 @@ class SemanticDialogue:
     def __init__(self, agent):
         self.memory = SemanticMemory(agent)
         self.ltm = agent.ltm
+        self.require = lambda action, target=None, detail=None: None  # set by the chat engine's policy guard
 
     def context(self, cid):
         for m in reversed(self.ltm.messages(cid)):
@@ -214,6 +215,7 @@ class SemanticDialogue:
         retract = re.fullmatch(r"(?:retire le fait|retract fact) #?(\d+)", normalized)
         if retract and not text.rstrip().endswith("?"):
             kid = int(retract[1])
+            self.require("semantic.teach", f"knowledge:{kid}", {"op": "retract"})
             try:
                 self.memory.retract(kid, cid, text)
             except ValueError as exc:
@@ -301,6 +303,7 @@ class SemanticDialogue:
                     "Conclusion conditionnelle, pas une observation vérifiée.",
                     "Conditional conclusion, not a verified observation.")
             return wording, {**meta, **result, "intent": "semantic-query"}
+        self.require("semantic.teach", None, {"facts": [f.statement for f in resolved], "correction": correction})
         try:
             ids = self.memory.teach(resolved, cid, text, correction)
         except ValueError as exc:

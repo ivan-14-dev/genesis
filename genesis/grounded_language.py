@@ -202,6 +202,7 @@ class ObjectDialogue:
     def __init__(self, agent, factory):
         self.agent, self.ltm, self.factory = agent, agent.ltm, factory
         self.worlds = {}
+        self.require = lambda action, target=None, detail=None: None  # set by the chat engine's policy guard
 
     def workshop(self, seed):
         from .grounding import GroundedExplorer
@@ -244,6 +245,7 @@ class ObjectDialogue:
                       "The object workshop is not configured in this interface."), {"intent": "refused"}
         if start:
             seed = int(start[1] or 0)
+            self.require("objects.explore", f"workshop:{seed}")
             try:
                 g, _ = self.workshop(seed)
             except (ValueError, BudgetExceeded) as exc:
@@ -265,6 +267,10 @@ class ObjectDialogue:
         try:
             g, lexicon = self.workshop(context["seed"])
             obj = next((o for o in g.objects if o["id"] == context["selected"]), None)
+            if teaching or label:
+                self.require("objects.teach", context["seed"], {"text": t[:120]})
+            elif explore or observe or test:
+                self.require("objects.explore", context["seed"], {"text": t[:120]})
             if teaching:
                 terms = parse_terms(teaching[3])
                 if terms is None:
