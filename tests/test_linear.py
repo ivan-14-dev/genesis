@@ -134,3 +134,37 @@ def test_spare_rows_step_over_corruption_denser_than_the_rule():
                                                     lambda length: dense_windows(len(ys), length, 4), 4,
                                                     spare=spare)[0]] for spare in (0, 1)}
     assert target not in found[0] and target in found[1]
+
+
+def test_linear_kernel_matches_python_reference():
+    from genesis import search
+    if search.backend_info()["active"] != "c":
+        pytest.skip("no C compiler: the Python reference is the only backend")
+    rng = random.Random(11)
+    n_rules = 0
+    for case in range(150):
+        n = rng.randint(1, 26)
+        big = case % 10 == 9
+        scale = 2**38 if big else 9
+        inputs = [{"a": rng.randint(-scale, scale), "b": rng.randint(0, 12), "t": t} for t in range(n)]
+        k1, k2 = rng.randint(-4, 4), rng.randint(-5, 5)
+        f = rng.choice([lambda d: 2 * d["a"] - 3 * d["t"] + k1, lambda d: d["a"] * d["t"] + k2 * d["b"] - k1,
+                        lambda d: 3 * d["a"] - 2 * d["b"] + 5 * d["t"] - 4, lambda d: rng.randint(-50, 50),
+                        lambda d: d["t"] * d["t"] + k1 * d["t"] + k2])
+        ys = [f(d) for d in inputs]
+        for _ in range(rng.randint(0, 3)):
+            if n:
+                ys[rng.randrange(n)] += rng.randint(1, 9)
+        args = (inputs, ys, ["a", "b", "t"][: rng.randint(1, 3)],
+                lambda length, n_win=rng.randint(1, 5): dense_windows(n, length, n_win), rng.randint(0, n // 2))
+        kw = dict(max_terms=rng.randint(1, 4), products=rng.random() < 0.7, spare=rng.choice([0, 1, 1, 2]),
+                  cap=rng.choice([2, 64]), min_support=rng.randint(1, 3))
+        c = linear_rules(*args, **kw)
+        search.set_backend("python")
+        try:
+            py = linear_rules(*args, **kw)
+        finally:
+            search.set_backend(None)
+        assert [(str(e), b) for e, b in c[0]] == [(str(e), b) for e, b in py[0]] and c[1] == py[1], case
+        n_rules += len(py[0])
+    assert n_rules > 0

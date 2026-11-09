@@ -37,7 +37,9 @@ from .perception import Perception
 def default_configs(safety: SafetyPolicy) -> dict:
     common = dict(max_candidates=safety.max_candidates_per_induction, max_seconds=safety.max_seconds_per_induction)
     return {
-        "sequence": InductionConfig(max_size=5, **common),
+        # A passive observer cannot step around a burst of corruption, so a sequence rule is proposed as soon as it
+        # could survive; in the lab, half-right conditionals would divert the experiments that settle them.
+        "sequence": InductionConfig(max_size=5, search_mismatch_frac=0.5, **common),
         "lab": InductionConfig(max_size=3, allow_conditionals=True, outcome_range=101, deepen_size=0, **common),
     }
 

@@ -15,7 +15,7 @@
  * enumerated either, an affine meet in the middle finds "(A op B) + c" by looking B up up to a constant shift
  * (window differences), c being fitted. Sizes grow by two (iterative deepening) until one explains the data.
  * Every hit is checked on all observations against the mismatch tolerance, so noisy observations inside one
- * window only cost a miss.
+ * window only cost a miss; it is kept only if it errs less often than every enumerated match and bias fit.
  * The kernel never allocates more than the caller-sized arena and only reads/writes caller buffers.
  */
 #define _POSIX_C_SOURCE 199309L
@@ -276,6 +276,9 @@ int gn_search(int n, const int64_t *ys, int n_leaves, const int64_t *leaf_sigs, 
     int rc = 0;
     if (deepen_bad >= 0 && best > deepen_bad && deep_size > top && deep_size - 1 - top >= 1) {
         stats[3] = 1;
+        /* A deeper rule is reported only when it explains more than every enumerated one: one that errs as often
+         * as a shorter rule is less probable (Occam) and, on noisy series, came by the thousands. */
+        if (best - 1 < tol) tol = best - 1;
         int64_t nd = 0;
         int has_mod = 0;
         for (int pi = 0; pi < n_ops; pi++) has_mod |= ops[pi] == OP_MOD;
@@ -560,5 +563,177 @@ int gn_shapes(int n, const int64_t *ys, int n_vars, const int64_t *var_sigs, int
         }
     }
     free(vals);
+    return 0;
+}
+
+/* Exact sparse linear induction (genesis.linear holds the pure-Python reference, linear_rules): for every window
+ * rank w, every feature subset s (in order) and every row combination of that rank not tried before for a subset
+ * of the same size (combo_off / combo_cnt per (k, w), k = |s| + 1 unknowns), the k x (k + 1) system
+ * [features of s, 1 | y] is solved; a solution with integer, non-zero coefficients of magnitude <= max_coef and a
+ * constant of magnitude <= max_const is scored on all observations (at most tol mismatches, at least
+ * k + min_support matches) and reported once, in discovery order, up to cap.
+ * The reference eliminates over the integers (Bareiss), whose intermediate values outgrow any fixed width on long
+ * series; the kernel reaches the same decisions modulo 31-bit primes and proves each one exactly:
+ *   - non-singular modulo a prime implies det != 0: the solution is unique, and when it is an admissible integer
+ *     vector it equals the symmetric residues of the modular solution (all bounds are below p / 2); so the
+ *     residues are bounds-checked, then substituted into the k equations exactly: they hold iff the reference
+ *     accepts;
+ *   - singular modulo primes whose product exceeds Hadamard's bound on |det| implies det == 0: the reference
+ *     finds the system singular too.
+ * A system the kernel cannot settle that way (a value flagged in big, an overflow without 128-bit integers, a
+ * bound beyond the primes) is left to the caller: the kernel stores its position in pos and returns 3, and is
+ * called again after it. The loop starts at pos = (w, s, combination) with n_out results and solved systems
+ * already counted. Returns 0 when done, -1 on bad arguments. */
+#define LIN_MAXK 9
+#define LIN_NP 12
+static const int64_t LIN_PRIMES[LIN_NP] = {2147483647LL, 2147483629LL, 2147483587LL, 2147483579LL, 2147483563LL,
+                                           2147483549LL, 2147483543LL, 2147483497LL, 2147483489LL, 2147483477LL,
+                                           2147483423LL, 2147483399LL};
+static int lin_mul(int64_t a, int64_t b, int64_t *r) {
+    if (a == 0 || b == 0) { *r = 0; return 0; }
+    if (a == INT64_MIN || b == INT64_MIN) return 1;
+    int64_t aa = a < 0 ? -a : a, bb = b < 0 ? -b : b;
+    if (aa > INT64_MAX / bb) return 1;
+    *r = a * b;
+    return 0;
+}
+
+static int lin_add(int64_t a, int64_t b, int64_t *r) {
+    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return 1;
+    *r = a + b;
+    return 0;
+}
+
+/* acc += x * v exactly (1 on overflow, impossible with 128-bit integers: |x| <= 2^30, |v| <= 2^62, <= 9 terms). */
+#ifdef __SIZEOF_INT128__
+typedef __int128 lin_acc_t;
+static int lin_fma(lin_acc_t *acc, int64_t x, int64_t v) { *acc += (lin_acc_t)x * v; return 0; }
+#else
+typedef int64_t lin_acc_t;
+static int lin_fma(lin_acc_t *acc, int64_t x, int64_t v) { int64_t t; return lin_mul(x, v, &t) || lin_add(*acc, t, acc); }
+#endif
+
+static int64_t lin_inv(int64_t a, int64_t p) { /* a in [1, p): extended Euclid */
+    int64_t r0 = p, r1 = a, t0 = 0, t1 = 1;
+    while (r1) {
+        int64_t q = r0 / r1, r = r0 - q * r1, t = t0 - q * t1;
+        r0 = r1; r1 = r; t0 = t1; t1 = t;
+    }
+    return t0 < 0 ? t0 + p : t0;
+}
+
+/* Gauss-Jordan elimination of the k x (k + 1) system modulo p into mm; 1 if non-singular modulo p. */
+static int lin_gj(int64_t m[][LIN_MAXK + 1], int k, int64_t p, int64_t mm[][LIN_MAXK + 1]) {
+    for (int i = 0; i < k; i++)
+        for (int j = 0; j <= k; j++) mm[i][j] = ((m[i][j] % p) + p) % p;
+    for (int c = 0; c < k; c++) {
+        if (mm[c][c] == 0) {
+            int i = c + 1;
+            while (i < k && mm[i][c] == 0) i++;
+            if (i == k) return 0;
+            for (int j = 0; j <= k; j++) { int64_t t = mm[c][j]; mm[c][j] = mm[i][j]; mm[i][j] = t; }
+        }
+        int64_t inv = lin_inv(mm[c][c], p);
+        for (int i = 0; i < k; i++) {
+            if (i == c || mm[i][c] == 0) continue;
+            int64_t f = mm[i][c] * inv % p;
+            for (int j = c; j <= k; j++) mm[i][j] = ((mm[i][j] - f * mm[c][j]) % p + p) % p;
+        }
+    }
+    return 1;
+}
+
+int gn_linear(int n, const int64_t *ys, int n_feats, const int64_t *cols, const int8_t *big, int n_subsets,
+              const int32_t *sub_len, const int32_t *sub_feat, int max_terms, int n_windows, const int32_t *combo_off,
+              const int32_t *combo_cnt, const int32_t *combos, int tol, int64_t max_coef, int64_t max_const,
+              int min_support, int cap, int32_t *out_sub, int64_t *out_coef, int64_t *out_c, int32_t *out_bad,
+              int32_t *n_out, int64_t *solved, int32_t *pos) {
+    if (n <= 0 || n_feats < 0 || max_terms < 1 || max_terms + 1 > LIN_MAXK || cap <= 0 || *n_out >= cap)
+        return -1;
+    int64_t m[LIN_MAXK][LIN_MAXK + 1], coef[LIN_MAXK];
+    const int8_t *big_y = big + (int64_t)n_feats * n;
+    for (int w = pos[0]; w < n_windows; w++) {
+        for (int s = w == pos[0] ? pos[1] : 0; s < n_subsets; s++) {
+            int nf = sub_len[s], k = nf + 1;
+            if (nf < 1 || nf > max_terms) return -1;
+            const int32_t *fs = sub_feat + (int64_t)s * max_terms;
+            int slot = k * n_windows + w;
+            int c0 = w == pos[0] && s == pos[1] ? pos[2] : 0;
+            const int32_t *rows = combos + combo_off[slot] + (int64_t)c0 * k;
+            for (int ci = c0; ci < combo_cnt[slot]; ci++, rows += k) {
+                pos[0] = w; pos[1] = s; pos[2] = ci;
+                for (int i = 0; i < k; i++) {
+                    int r = rows[i];
+                    if (big_y[r]) return 3;
+                    for (int j = 0; j < nf; j++) {
+                        if (big[(int64_t)fs[j] * n + r]) return 3;
+                        m[i][j] = cols[(int64_t)fs[j] * n + r];
+                    }
+                    m[i][nf] = 1;
+                    m[i][k] = ys[r];
+                }
+                /* Hadamard: det^2 <= prod of the squared row norms (in double, with a margin of 4). */
+                double h2 = 4.0, m2 = 1.0;
+                for (int i = 0; i < k; i++) {
+                    double ss = 0;
+                    for (int j = 0; j < k; j++) ss += (double)m[i][j] * (double)m[i][j];
+                    h2 *= ss * (1 + 1e-9);
+                }
+                int64_t mm[LIN_MAXK][LIN_MAXK + 1], pr = 0;
+                int state = 0; /* 1 non-singular modulo pr, 2 singular over the integers */
+                for (int q = 0; q < LIN_NP && !state; q++) {
+                    if (lin_gj(m, k, LIN_PRIMES[q], mm)) { state = 1; pr = LIN_PRIMES[q]; }
+                    else if ((m2 *= (double)LIN_PRIMES[q] * (double)LIN_PRIMES[q]) > h2) state = 2;
+                }
+                if (!state) return 3;
+                ++*solved;
+                if (state == 2) continue;
+                int ok = 1;
+                for (int i = 0; i < k; i++) {
+                    coef[i] = mm[i][k] * lin_inv(mm[i][i], pr) % pr;
+                    if (coef[i] > pr / 2) coef[i] -= pr;
+                }
+                int64_t c = coef[k - 1];
+                for (int i = 0; i < nf && ok; i++)
+                    if (coef[i] == 0 || coef[i] > max_coef || coef[i] < -max_coef) ok = 0;
+                if (!ok || c > max_const || c < -max_const) continue;
+                int holds = 1;
+                for (int i = 0; i < k && holds; i++) {
+                    lin_acc_t v = 0;
+                    for (int j = 0; j < k; j++)
+                        if (lin_fma(&v, coef[j], m[i][j])) { --*solved; return 3; }
+                    holds = v == (lin_acc_t)m[i][k];
+                }
+                if (!holds) continue;
+                int dup = 0;
+                for (int o = 0; o < *n_out && !dup; o++) {
+                    if (out_sub[o] != s || out_c[o] != c) continue;
+                    dup = 1;
+                    for (int i = 0; i < nf; i++)
+                        if (out_coef[(int64_t)o * max_terms + i] != coef[i]) { dup = 0; break; }
+                }
+                if (dup) continue;
+                int bad = 0;
+                for (int r = 0; r < n; r++) {
+                    lin_acc_t v = c;
+                    if (big_y[r]) { --*solved; return 3; }
+                    for (int j = 0; j < nf; j++) {
+                        if (big[(int64_t)fs[j] * n + r] || lin_fma(&v, coef[j], cols[(int64_t)fs[j] * n + r])) {
+                            --*solved;
+                            return 3;
+                        }
+                    }
+                    if (v != (lin_acc_t)ys[r] && ++bad > tol) break;
+                }
+                if (bad <= tol && n - bad >= k + min_support) {
+                    out_sub[*n_out] = s;
+                    for (int i = 0; i < nf; i++) out_coef[(int64_t)*n_out * max_terms + i] = coef[i];
+                    out_c[*n_out] = c;
+                    out_bad[*n_out] = bad;
+                    if (++*n_out >= cap) return 0;
+                }
+            }
+        }
+    }
     return 0;
 }

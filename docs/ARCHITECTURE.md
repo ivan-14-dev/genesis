@@ -44,9 +44,9 @@ Notation: **innate** = present before any experience (fixed by the designers, re
   an answer.
 - Black-swan induction: a rule can be validated before the evidence that would refute it has appeared
   (observed once on a decrementing modular counter before wrap-around; see §H).
-- Noise robustness is bounded: a rule survives while it is right at least as often as wrong, but new rules are
-  proposed only below 40% mismatches, so a stream whose actual corruption rate approaches ~45% may stay
-  unvalidated.
+- Noise robustness is bounded: a sequence rule is proposed and survives while it is right at least as often as
+  wrong, so a stream with about half of its observations corrupted cannot be learned. A stream with 45% of its
+  observations corrupted is learned. In the lab, new rules are proposed only below 40% mismatches.
 
 ---
 
@@ -397,14 +397,24 @@ Details of the core learner (`RuleLearner`):
   always has a solution). This reaches 11- and 13-node rules such as `3·x[t−1] − 2·x[t−2] + 5·t − 4`. Solutions
   are ordinary expressions over innate primitives, scored with the Occam prior of their size; when one fits,
   the kernel's deepening phase only looks for *shorter* rules (`t·(t+3)` beats `t·t + 3·t`).
+  The same loop runs in C (`gn_linear`), with results identical to the Python reference (fuzzed, and checked by a
+  self-test at load):
+  - Each system is solved modulo 31-bit primes, and the solution is substituted back exactly.
+  - A system is proven singular when the product of the primes it is singular modulo exceeds Hadamard's bound.
+  - Systems the kernel cannot settle are handed back to Python one at a time, and the kernel then resumes.
 - **Unseen moduli:** for `y = (a·x + c) mod m`, every `y − a·x` lies in one residue class, so the gcd of their
   differences over 5 consecutive observations reveals m although m exceeds every observed value. A modulus must
   exceed its window's outputs and recur in at least two windows (a corrupted observation spoils only the
   windows containing it); at most two are proposed.
 - **Noise tolerance:** a hypothesis survives while it is right at least as often as wrong
-  (`max_mismatch_frac` = 0.5), so a burst of corruption pauses it instead of refuting it; new rules are only
-  *proposed* below 40% mismatches (`search_mismatch_frac`), because a wider search tolerance floods every noisy
-  search with half-right candidates (4× the CPU on 9-node worlds with 10% noise, no gain). Noise is
+  (`max_mismatch_frac` = 0.5), so a burst of corruption pauses it instead of refuting it. Passive sequence
+  streams also *propose* rules up to that tolerance (`search_mismatch_frac` = 0.5). A stream with 45% of its
+  observations corrupted is learned, and two clamps keep the cost down:
+  - A deep hit must err strictly less often than the best enumerated rule, in both backends.
+  - A shape's bias fit must be the residual of a strict majority.
+
+  The lab proposes rules only below 40% mismatches (`search_mismatch_frac` = 0.4): there, half-right
+  conditionals would divert the experiments that settle them. Noise is
   *unstructured*: a rule whose errors mostly share one residual (a missed wrap-around, an off-by-one) is
   incomplete and is never validated, whatever its error rate. Conditionals `if q == c then e1 else e0` tolerate
   noise too: each branch takes its exact blocks when there are any, otherwise the blocks with the fewest
@@ -427,9 +437,12 @@ Details of the core learner (`RuleLearner`):
 - **Recognizing noise:** the recognition model has two reserved classes, dreamt at every sleep: `~noise`
   (uniform random draws) and `~program` (random programs of the base language, 3–11 nodes, so that an
   *unfamiliar* rule family is not mistaken for noise). Features are coarse (monotone, few distinct differences,
-  smooth, bounded…). When the series looks rule-less with p ≥ 0.9 after ≥ 10 observations, a due deep search
-  (deep, linear and invention stages) is postponed by n observations: delayed, never forbidden, and validation
-  is unaffected. Dream statistics record their feature set and are re-dreamt when it changes.
+  smooth, bounded…), so the recognizer only sets the *prior* log-odds of noise. The hypothesis pool's evidence
+  can only lower them: `+ min(0, log p(data | null) − log Σ p(data | rules))` (`RuleLearner._likely_noise`).
+  When the series still looks rule-less with p ≥ 0.9 after ≥ 10 observations, a due deep search (deep, linear
+  and invention stages) is postponed by n observations: delayed, never forbidden, and validation is unaffected.
+  A rule with no salient feature is not postponed once a hypothesis explains most observations; noise keeps an
+  empty pool. Dream statistics record their feature set and are re-dreamt when it changes.
 - **Validation:** equivalence-class posterior ≥ 0.9 **and** ≥ 4 correct forward predictions **and** no
   structured errors **and** either ≤ 25% forward errors (`validation_max_error`) or, after a burst of corruption,
   Wald's sequential test (SPRT) accepting "errs at 25%" against "errs at 50%" (a rule no better than a coin) at
@@ -486,7 +499,7 @@ future source must be tagged with provenance `external` and kept separate from e
 | Phase | Content | Acceptance criterion |
 |---|---|---|
 | 1 ✅ | Innate core, induction, memory, curiosity, metacognition, consolidation, sequence + causal worlds, benchmarks, demo | stages 0–5 gates pass on held-out seeds |
-| 2 ✅ | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Met:* sequences (majority-residual fits, structured-error check, separate survival and search tolerances, sequential validation test, exact beliefs): 100% at 10% innovation noise, 98.75% at 20%; causal lab with noisy conditionals: 100% held-out accuracy and every confounded cause found at 5%, 10% and 20% outcome noise; 0 false validations (RESULTS, robustness). Probabilistic transitions remain open |
+| 2 ✅ | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Met:* sequences (majority-residual fits, structured-error check, deep hits that must err less than shorter rules, sequential validation test, exact beliefs): 100% at 10% and 20% innovation noise; causal lab with noisy conditionals: 100% held-out accuracy and every confounded cause found at 5%, 10% and 20% outcome noise; 0 false validations (RESULTS, robustness). Probabilistic transitions remain open |
 | 3 ✅ | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Met:* library-first search over remembered shapes cuts search 16× on standard worlds and observations to validation by 25% on 7-node worlds; sleep-time sub-program promotion and dreaming (`library.py`) let a 7-node search budget learn later 9-node rules (curriculum, RESULTS) |
 | 4 ✅ | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction (met at budget 150 and 300; **not** at 100) |
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
@@ -518,15 +531,15 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
   `mod c`, `A op B`, `(A op B) + c`). Beyond 9 nodes, only *linear* rules are reached directly (≤ 4 terms, at most
   one product, |coefficients| ≤ 16); other 11+-node rules need invented primitives or a raised
   `deepen_max_size`.
-- Rules tolerate innovation noise up to ~20% (98.75% validated); a stream whose actual corruption rate approaches
-  ~45% stays *candidate* (one modular counter at 20% noise, with 9 of its 20 observations corrupted).
+- Rules tolerate innovation noise up to ~20% (100% validated). A stream with 45% of its observations corrupted is
+  learned; one with about half corrupted cannot be, since no rule is then right more often than wrong.
 - The search is bounded by ±10¹⁸ (beliefs are exact): proposals are found on the in-range part of a stream, and
   once values exceed ±2⁶¹ the search falls back to the slower Python path.
-- Noise recognition is coarse: its features (monotone, few distinct differences, smooth, bounded…) leave some
-  rules looking like noise (e.g. `x[t−1] − x[t−3] + 4`, p ≈ 0.97); such a misjudgement only postpones the deep
-  searches. On deep worlds, procedural memory saves search and observations but now costs CPU (+25%), because the
-  linear solver made the learner without memory cheaper. The recognition model's effect on observations to
-  validation is marginal; it mainly ranks shapes and postpones deep searches on likely noise.
+- The noise recognizer's features are coarse: some rules look like noise from their features alone (e.g.
+  `x[t−1] − x[t−3] + 4`, p ≈ 0.97). The pool's evidence vetoes the postponement once a hypothesis explains most
+  observations, but a rule that no hypothesis fits yet can still have its deep searches postponed. The
+  recognition model's effect on observations to validation is marginal; it mainly ranks shapes and postpones deep
+  searches on likely noise.
 - Moduli are found from data (largest values + 1, differences, contrasts) and, for affine modular rules
   `(a·x + c) mod m` with a small multiplier, from the gcd of residue differences; other unseen moduli may be
   missed. The search kernels stay bounded (no `__int128`): beliefs are exact integers, so only the search, not

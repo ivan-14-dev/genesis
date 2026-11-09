@@ -69,8 +69,10 @@ class InductionConfig:
     # A rule survives while it is right at least as often as wrong (far beyond the chance agreement of noise):
     # bursts of corruption well above the world's nominal rate then pause it instead of refuting it.
     max_mismatch_frac: float = 0.5
-    # New rules are proposed only with fewer mismatches: a wider search tolerance floods every search on noisy
-    # data with half-right candidates (4x the CPU on deeper worlds with 10% noise) for no measured gain.
+    # New rules are proposed only with at most this many mismatches (capped by max_mismatch_frac). Passive streams
+    # use 0.5 (genesis.agent.default_configs: a stream with 45% corrupted observations is still learned); where
+    # the learner chooses its experiments, a wider search floods the hypotheses with half-right conditionals that
+    # divert the experiments which would settle them.
     search_mismatch_frac: float = 0.4
     # Deepening (genesis.search): when no enumerated rule mispredicts at most deepen_below * n observations,
     # look for rules of deepen_size nodes by meet-in-the-middle, within the same candidate budget.
@@ -82,8 +84,9 @@ class InductionConfig:
     deepen_window: int = 4
     deepen_windows: int = 8
     deepen_growth: float = 0.5   # after a deep search at n, the next one waits until n * (1 + deepen_growth)
-    # When the recognition model learned during sleep judges the series rule-less with at least this probability
-    # (after noise_min_n observations), a due deep search (deep, linear and invention stages) is postponed by
+    # When the recognition model learned during sleep, updated with the evidence of the surviving hypotheses
+    # (RuleLearner._likely_noise), judges the series rule-less with at least this probability (after noise_min_n
+    # observations), a due deep search (deep, linear and invention stages) is postponed by
     # noise_deepen_growth * n observations: deeper searches are delayed on likely noise, never forbidden.
     noise_recognition: float = 0.9
     noise_min_n: int = 10
@@ -116,6 +119,8 @@ class Hypothesis:
     fwd_bad: int = 0
     born_n: int = 0
     probe_sig: tuple = ()
+    # Residual counts of the mismatched observations, extended as data arrives (see _structured_errors).
+    residuals: Optional[tuple] = field(default=None, compare=False, repr=False)
 
     def to_json(self) -> dict:
         return {
@@ -164,6 +169,10 @@ def _has_trivial(e: Expr) -> bool:
 def _in_range(inputs: dict, y: int) -> bool:
     return -VALUE_LIMIT <= y <= VALUE_LIMIT and all(
         v is None or -VALUE_LIMIT <= v <= VALUE_LIMIT for v in inputs.values())
+
+
+def _logit(p: float) -> float:
+    return math.inf if p >= 1 else -math.inf if p <= 0 else math.log(p / (1 - p))
 
 
 def _logsumexp(xs: list) -> float:
@@ -232,12 +241,17 @@ class RuleLearner:
         self._post_memo = (key, tuple(self.hyps), out)
         return out
 
-    def _posterior(self, n: int) -> tuple:
+    def _scores(self, hyps: list) -> list:
+        """Unnormalised log posterior of each hypothesis."""
         cfg = self.cfg
         l_ok = math.log(1 - cfg.noise)
         l_bad = math.log(cfg.noise / cfg.outcome_range)
+        return [math.log(1 - cfg.null_prior) + h.log_prior + h.n_ok * l_ok + h.n_bad * l_bad for h in hyps]
+
+    def _posterior(self, n: int) -> tuple:
+        cfg = self.cfg
         null = math.log(cfg.null_prior) + n * math.log(1 / cfg.outcome_range)
-        scores = [math.log(1 - cfg.null_prior) + h.log_prior + h.n_ok * l_ok + h.n_bad * l_bad for h in self.hyps]
+        scores = self._scores(self.hyps)
         z = _logsumexp(scores + [null])
         post = tuple(sorted(((h, math.exp(s - z)) for h, s in zip(self.hyps, scores)), key=lambda t: -t[1]))
         return post, math.exp(null - z)
@@ -326,11 +340,15 @@ class RuleLearner:
         off-by-one branch), the rule is incomplete and must not be validated, whatever its error rate."""
         if h.n_bad < 2:
             return False
-        residuals: Counter = Counter()
-        for d, y in self.data:
+        memo = h.residuals
+        if memo is None or memo[0] is not self.data or memo[1] > len(self.data):
+            memo = (self.data, 0, Counter())
+        _, done, residuals = memo
+        for d, y in self.data[done:]:
             v = h.expr.evaluate(d, True)
             if v != y:
                 residuals[None if v is None else y - v] += 1
+        h.residuals = (self.data, len(self.data), residuals)
         if not residuals:
             return False
         return residuals.most_common(1)[0][1] > max(1, sum(residuals.values()) // 2)
@@ -481,7 +499,8 @@ class RuleLearner:
         inputs = [d for d, _ in rows]
         ys = tuple(y for _, y in rows)
         consts = self._propose_constants(inputs, ys)
-        found = self._rescore(self._library_search(inputs, ys, tol, consts), check, partial, tol)
+        found = self._rescore(self._library_search(inputs, ys, tol, consts, None if check else cfg.pool_size),
+                              check, partial, tol)
         if any(bad == 0 for _, bad, _ in found):
             self.library_searches += 1
         else:
@@ -511,10 +530,15 @@ class RuleLearner:
         n_size = math.comb(2 * k, k) // (k + 1) * 4 ** k * n_leaves ** (k + 1)
         return -2 * math.log(e.size) - math.log(max(n_size, 1))
 
-    def _library_search(self, inputs: list, ys: tuple, tol: int, consts: set) -> list:
-        """Instantiate previously successful shapes; return those that explain the data."""
+    def _library_search(self, inputs: list, ys: tuple, tol: int, consts: set, keep: Optional[int] = None) -> list:
+        """Instantiate previously successful shapes; return those that explain the data. With ``keep``, at most
+        that many new hypotheses per shape (the fewest mismatches first, then in enumeration order): instances of
+        one shape share their prior, so the others rank below them and cannot enter a pool of ``keep``; on small
+        series a remembered shape has hundreds of instances that agree on every observation. Instances that are
+        already hypotheses do not count (the merge skips them)."""
         if self.shape_library is None:
             return []
+        existing = {str(h.expr) for h in self.hyps} if keep is not None else set()
         cfg = self.cfg
         consts = sorted(consts)
         n_leaves = len(self.var_names) + len(consts)
@@ -541,7 +565,10 @@ class RuleLearner:
                 # Kernel path (genesis.search): only the instances within tolerance become expressions.
                 hits, evaluated, _ = matched
                 self.expressions_evaluated += evaluated
-                for vs, cs, r, bad in hits:
+                order = range(len(hits)) if keep is None else sorted(range(len(hits)), key=lambda i: hits[i][3])
+                taken, n_new = [], 0
+                for i in order:
+                    vs, cs, r, bad = hits[i]
                     e = fill_shape(body, vs, cs)
                     if fit_bias:
                         e = app("add", e, const(r))
@@ -550,7 +577,12 @@ class RuleLearner:
                     k = str(e)
                     if k not in seen:
                         seen.add(k)
-                        found.append((e, bad, self._approx_prior(e, n_leaves)))
+                        taken.append((i, (e, bad, self._approx_prior(e, n_leaves))))
+                        if keep is not None and k not in existing:
+                            n_new += 1
+                            if n_new >= keep:
+                                break
+                found += [item for _, item in sorted(taken, key=lambda t: t[0])]
                 continue
             for vs in itertools.product(self.var_names, repeat=nv):
                 for cs in itertools.product(consts, repeat=n_c_enum):
@@ -678,11 +710,24 @@ class RuleLearner:
         return found, sr.counts, sr.deep_ran
 
     def _likely_noise(self) -> bool:
+        """Whether a due deep search should wait. The recognition model's odds that the series has no rule (learned
+        during sleep from coarse features) are a prior; the learner's own evidence updates them: the likelihood of
+        the observations under its surviving hypotheses against the null model (uniform outcomes), as in
+        posterior(). A series that a hypothesis already mostly explains is not postponed however noise-like its
+        features look (a lag-2 rule under 20% corruption alternates like draws). Only evidence for a rule counts:
+        the pool holds what a bounded search found, and that search's failure is what the deeper one is for."""
+        cfg = self.cfg
         rec = self.learned_library()[1] if self.learned_library is not None else None
-        if rec is None or len(self.data) < self.cfg.noise_min_n:
+        if rec is None or len(self.data) < cfg.noise_min_n:
             return False
-        p = rec.p_noise(task_features([y for _, y in self.data]))
-        return p is not None and p >= self.cfg.noise_recognition
+        odds = rec.noise_log_odds(task_features([y for _, y in self.data]))
+        if odds is None:
+            return False
+        if self.hyps:
+            null = len(self.data) * math.log(1 / cfg.outcome_range)
+            rules = _logsumexp(self._scores(self.hyps)) - math.log(1 - cfg.null_prior)
+            odds += min(0.0, null - rules)
+        return odds >= _logit(cfg.noise_recognition)
 
     def _recognition(self) -> Callable[[str], float]:
         """Task-conditional prior from the recognition model: how much more plausible than uniform each familiar
@@ -725,10 +770,12 @@ class RuleLearner:
                 recognition = self._recognition()
             fresh.append(Hypothesis(e, lp + cfg.shape_bias * (self.shape_prior(shape) + recognition(shape)),
                                     n - bad, bad, 0, 0, n))
-        pool = [h for h in self.hyps] + fresh
-        self.hyps = pool
-        post, _ = self.posterior()
-        self.hyps = [h for h, _ in post[: cfg.pool_size]]
+        # The pool_size most probable, by log score (ties: pool order). Ranking the scores rather than their
+        # normalised probabilities (posterior()) keeps the order of hypotheses far below the best, whose
+        # probabilities all underflow to 0, and makes it independent of the candidates that cannot enter.
+        pool = self.hyps + fresh
+        scores = self._scores(pool)
+        self.hyps = [pool[i] for i in heapq.nsmallest(cfg.pool_size, range(len(pool)), key=lambda i: (-scores[i], i))]
         self._make_probes()
         for h in self.hyps:
             h.probe_sig = self._probe_sig(h.expr)

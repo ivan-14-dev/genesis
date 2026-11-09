@@ -248,3 +248,21 @@ def test_recognized_noise_postpones_deeper_searches_but_not_on_rules():
     learned, alone = run(terms, lambda: ([], rec)), run(terms, None)
     assert learned.noise_delays == 0 and learned.status() == alone.status() == "validated"
     assert learned.deep_searches == alone.deep_searches
+
+
+def test_evidence_for_a_rule_overrides_noise_like_features():
+    # Two interleaved lag-2 progressions with two corrupted terms alternate like random draws: the recognizer alone
+    # would call the series noise and postpone its deeper searches, although x[t-2] + 2 explains 13 of 15 terms.
+    lib = library.sleep([], ["add(V,C)", "mul(V,C)"], [], {"sequence": (SEQ_VARS, sequence_dream)}, seed=3)
+    rec = library.Recognizer.from_json(lib["recognizer"])
+    terms, corrupt = [23, 15], {7: -9, 12: 30}
+    for t in range(2, 16):
+        terms.append(terms[-2] + 2 + corrupt.get(t, 0))
+    learner = RuleLearner("s", SEQ_VARS, InductionConfig(max_size=5), probe_fn=sequence_rollout_probes,
+                          learned_library=lambda: ([], rec))
+    feed_sequence(learner, terms)
+    assert rec.p_noise(library.features([y for _, y in learner.data])) >= 0.9
+    assert str(learner.best()[0].expr) == "(x[t-2] + 2)" and learner.status() == "validated"
+    assert not learner._likely_noise() and learner.noise_delays == 0
+    learner.hyps = []  # without that evidence, the features decide
+    assert learner._likely_noise()

@@ -262,6 +262,15 @@ class Recognizer:
         z = m + math.log(sum(math.exp(x - m) for x in scores))
         return math.exp(self.log_score(NOISE, feats) - z)
 
+    def noise_log_odds(self, feats: frozenset) -> Optional[float]:
+        """``log(p / (1 - p))`` for ``p = p_noise(feats)``, without rounding ``p`` to 1: a prior that evidence for a
+        rule can still overturn (RuleLearner._likely_noise); None unless both reserved classes were learned."""
+        if NOISE not in self.totals or PROGRAM not in self.totals:
+            return None
+        others = [self.log_score(s, feats) for s in sorted(self.totals) if s != NOISE]
+        m = max(others)
+        return self.log_score(NOISE, feats) - m - math.log(sum(math.exp(x - m) for x in others))
+
     def rank(self, shapes: list, feats: frozenset) -> list:
         """``shapes`` reordered by recognition score; unknown shapes keep their order after the known ones."""
         scored = [(self.log_score(s, feats), i, s) for i, s in enumerate(shapes)]

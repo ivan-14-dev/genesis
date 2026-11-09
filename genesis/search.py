@@ -11,7 +11,9 @@
   nodes found *without enumerating them*: bias fits and remainders of the level two nodes below, and a
   meet-in-the-middle step. For every candidate ``A`` and operator, the outputs ``B`` must have so that
   ``A op B = y`` are computed on a window of observations (``y - A``, ``A - y``, ``y + A``, ``y / A``) and looked
-  up among the enumerated signatures; each hit is then checked on all observations against ``tol``. Several
+  up among the enumerated signatures; each hit is then checked on all observations, and kept only with at most
+  ``tol`` mismatches and fewer than every enumerated match or bias fit (a deeper rule that errs as often as a
+  shorter one is less probable, and noisy series produced them by the thousands). Several
   windows are tried, so a noisy observation in one window does not hide the rule. When the level two nodes below
   is not enumerated either, an *affine* meet in the middle finds ``(A op B) + c``: ``B`` is looked up up to a
   constant shift (window differences) and ``c`` is fitted. Iterative deepening tries ``deep_size``,
@@ -31,6 +33,7 @@ from __future__ import annotations
 import ctypes
 import itertools
 import os
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -49,7 +52,8 @@ CHAIN_MAX = 64  # candidates sharing one window signature that are checked on al
 _VARIANTS = (("add", True), ("sub", True), ("sub", False), ("mul", True))  # (operator, A on the left?)
 _AFFINE = (("add", True), ("sub", True), ("sub", False))  # (A op B) + c, c fitted
 
-_c: dict = {"tried": False, "fn": None, "shapes": None, "failure": None, "library": None, "compiler": None}
+_c: dict = {"tried": False, "fn": None, "shapes": None, "linear": None, "failure": None, "library": None,
+            "compiler": None}
 _requested: str | None = None
 
 
@@ -291,13 +295,38 @@ def _search_python(inputs, ys, var_names, constants, tol, max_size, max_candidat
     if deepen_bad >= 0 and best > deepen_bad and deep_size > top and deep_size - 1 - top >= 1:
         deep_ran = True
         cap = max(max_candidates, len(en.by_size.get(1, [])) + 1) + 1
-        raw, timed_out = _deep_python(en.candidates, en.by_size, ys, tol, max_size, ops, deep_size, windows, cap,
-                                      t0, max_seconds, deep_max, deepen_bad)
+        # Deeper rules must explain more than every enumerated one (see the C kernel).
+        raw, timed_out = _deep_python(en.candidates, en.by_size, ys, min(tol, best - 1), max_size, ops, deep_size,
+                                      windows, cap, t0, max_seconds, deep_max, deepen_bad)
         truncated = truncated or timed_out
         deep = _finish_deep(raw, lambda k: en.candidates[k][0], lambda k: en.candidates[k][0].size)
     return SearchResult(matches, offsets, deep, _with_deep_count(en.counts, deep, deep_size), en.evaluated,
                         truncated, len(en.candidates), time.perf_counter() - t0, "python", en.by_size.get(1, []),
                         deep_ran)
+
+
+_buffers = threading.local()
+_BUFFER_KEEP_BYTES = 32 * 2**20
+
+
+def _buffer(name: str, ctype, length: int):
+    """A per-thread ctypes array of at least ``length`` items, reused across searches: allocating and zeroing a
+    search's tables (about 20 MB on a 40-observation series) on every call cost as much as a small search. The
+    kernel writes every item before reading it. Tables above _BUFFER_KEEP_BYTES are not kept (small machines)."""
+    pool = getattr(_buffers, "pool", None)
+    if pool is None:
+        pool = _buffers.pool = {}
+    buf = pool.get(name)
+    if buf is None or len(buf) < length:
+        size = ctypes.sizeof(ctype)
+        # Geometric growth: the arena grows with the series, one observation at a time.
+        grown = max(length, len(buf) * 3 // 2 if buf is not None else 0)
+        if grown * size > _BUFFER_KEEP_BYTES:
+            grown = length
+        buf = (ctype * grown)()
+        if grown * size <= _BUFFER_KEEP_BYTES:
+            pool[name] = buf
+    return buf
 
 
 def _search_c(inputs, ys, var_names, constants, tol, max_size, max_candidates, max_seconds, bias_max_size,
@@ -311,17 +340,17 @@ def _search_c(inputs, ys, var_names, constants, tol, max_size, max_candidates, m
     leaf_sigs = (I64 * (nl * n))(*[v for _, s in leaves for v in s])
     leaf_const = (I32 * nl)(*[e.op == "const" for e, _ in leaves])
     op_codes = (I32 * len(ops))(*[OPS.index(o) for o in ops])
-    node_op, node_l, node_r, node_size = (I32 * cap)(), (I32 * cap)(), (I32 * cap)(), (I32 * cap)()
-    sigs = (I64 * (cap * n))()
+    node_op, node_l, node_r, node_size = (_buffer(k, I32, cap) for k in ("node_op", "node_l", "node_r", "node_size"))
+    sigs = _buffer("sigs", I64, cap * n)
     counts = (I64 * max(2, max_size + 1))()
     stats = (I64 * 4)()
-    match_node, match_bad = (I32 * cap)(), (I32 * cap)()
-    off_node, off_bad, off_val = (I32 * cap)(), (I32 * cap)(), (I64 * cap)()
+    match_node, match_bad = _buffer("match_node", I32, cap), _buffer("match_bad", I32, cap)
+    off_node, off_bad, off_val = _buffer("off_node", I32, cap), _buffer("off_bad", I32, cap), _buffer("off_val", I64, cap)
     n_match, n_off, n_deep = I64(), I64(), I64()
     win_len = len(windows[0]) if windows else 0
     win_rows = (I32 * max(1, len(windows) * win_len))(*[r for w in windows for r in w])
-    deep_kind, deep_l, deep_r, deep_bad, deep_val = (I32 * cap)(), (I32 * cap)(), (I32 * cap)(), (I32 * cap)(), \
-        (I64 * cap)()
+    deep_kind, deep_l, deep_r, deep_bad = (_buffer(k, I32, cap) for k in ("deep_kind", "deep_l", "deep_r", "deep_bad"))
+    deep_val = _buffer("deep_val", I64, cap)
     rc = _c["fn"](n, (I64 * n)(*ys), nl, leaf_sigs, leaf_const, max_size, keep_all_upto, len(ops), op_codes,
                   max_candidates, float(max_seconds), tol, bias_max_size, cap, node_op, node_l, node_r, node_size,
                   sigs, counts, stats, match_node, match_bad, ctypes.byref(n_match), off_node, off_bad, off_val,
@@ -385,7 +414,32 @@ def _setup(lib):
         if _shapes_c(*args) != _shapes_python(*args)[:2]:
             _c["fn"] = None
             raise RuntimeError("shape kernel self-test failed")
+    li = lib.gn_linear
+    li.argtypes = [ctypes.c_int, P64, ctypes.c_int, P64, ctypes.POINTER(ctypes.c_int8), ctypes.c_int, P32, P32,
+                   ctypes.c_int, ctypes.c_int, P32, P32, P32, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
+                   ctypes.c_int, P32, P64, P64, P32, P32, P64, P32]
+    li.restype = ctypes.c_int
+    _c["linear"] = li
+    from . import linear
+    lin_ys = [2 * d["x"] - 3 * d["t"] + d["x"] * d["t"] + 1 for d in inputs]
+    lin_ys[4] += 3
+    for tol, spare in ((0, 1), (2, 1), (2, 0)):
+        if linear.linear_rules(inputs, lin_ys, ["x", "t"], lambda ln: linear.dense_windows(len(lin_ys), ln, 3), tol,
+                               spare=spare) != _with_backend("python", linear.linear_rules, inputs, lin_ys, ["x", "t"],
+                                                             lambda ln: linear.dense_windows(len(lin_ys), ln, 3), tol,
+                                                             spare=spare):
+            _c["fn"] = _c["linear"] = None
+            raise RuntimeError("linear kernel self-test failed")
     return fn
+
+
+def _with_backend(name: str, f, *args, **kwargs):
+    global _requested
+    saved, _requested = _requested, name
+    try:
+        return f(*args, **kwargs)
+    finally:
+        _requested = saved
 
 
 def _summary(r: SearchResult) -> tuple:
@@ -461,7 +515,7 @@ def _shapes_c(tree, inputs, ys, var_names, consts, tol, fit_bias) -> tuple:
         return [], 0
     I64, I32 = ctypes.c_int64, ctypes.c_int32
     var_sigs = (I64 * max(1, len(var_names) * n))(*[d[v] for v in var_names for d in inputs])
-    hit_idx, hit_bad, hit_r = (I64 * total)(), (I32 * total)(), (I64 * total)()
+    hit_idx, hit_bad, hit_r = _buffer("hit_idx", I64, total), _buffer("hit_bad", I32, total), _buffer("hit_r", I64, total)
     n_hits, evaluated = I64(), I64()
     rc = _c["shapes"](n, (I64 * n)(*ys), len(var_names), var_sigs, len(consts), (I64 * max(1, len(consts)))(*consts),
                       len(prog), (I32 * len(prog))(*prog), nv, nc, int(fit_bias), tol, total, hit_idx, hit_bad,
@@ -486,10 +540,14 @@ def match_shape(tree, inputs: list, ys, var_names, consts, tol: int, fit_bias: b
 
     Returns ``(hits, evaluated, backend)`` with ``hits = [(variables, constants, fitted_constant, n_bad)]`` in
     ``itertools.product`` order, or None when the shape has operators the kernel does not know (conditionals).
-    With ``fit_bias``, ``tree`` is the body X of "add(X, C)" and the constant is fitted, not enumerated."""
+    With ``fit_bias``, ``tree`` is the body X of "add(X, C)" and the constant is fitted, not enumerated: it must be
+    the residual of a strict majority of the observations (``tol`` is capped below n / 2), so it is unique and both
+    backends agree; a wider tolerance used to send these shapes to the slow Python path."""
     if _postfix(tree) is None:
         return None
     ys, consts, var_names = tuple(ys), list(consts), list(var_names)
+    if fit_bias:
+        tol = min(tol, (len(ys) - 1) // 2)
     req = _requested_backend()
     if req != "python" and _load_c() and ys and (not fit_bias or 2 * tol < len(ys)):
         values = [abs(v) for v in ys] + [abs(c) for c in consts]
