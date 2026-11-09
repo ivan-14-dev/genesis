@@ -26,6 +26,7 @@ Key properties
 
 from __future__ import annotations
 
+import functools
 import heapq
 import math
 import random
@@ -44,6 +45,8 @@ from .innate import INNATE_CONSTANTS, VALUE_LIMIT
 from .linear import dense_windows, linear_rules
 from .search import match_shape, search_programs
 
+# The search keeps every program up to this size, and one program per behaviour on the observations beyond it.
+KEEP_ALL_UPTO = 3
 
 @dataclass
 class InductionConfig:
@@ -66,13 +69,32 @@ class InductionConfig:
     # at level validation_sprt_alpha: a long forward record can carry a few more errors. 0 disables the test.
     validation_sprt_alpha: float = 0.01
     sprt_null_error: float = 0.5
-    # A rule survives while it is right at least as often as wrong (far beyond the chance agreement of noise):
-    # bursts of corruption well above the world's nominal rate then pause it instead of refuting it.
+    # ... or, when a rule that does not hold would agree with the outcomes at most at this rate (a numeric prediction
+    # is right by chance about once in outcome_range; 0 disables the test), an anytime-valid test of the forward
+    # record (RuleLearner._beats_chance) shows, at level validation_sprt_alpha, that the rule is right more often
+    # than chance: being right more often than wrong is not required, so a heavily corrupted stream can be learned.
+    validation_chance: float = 0.0
+    # Prior weight of "this world corrupts observations at an unknown rate" (uniform prior, integrated out) against
+    # "nearly clean" (rate `noise`), in every rule's likelihood (RuleLearner._scores). A rule right on half of the
+    # observations then still gains about log(outcome_range / 2) nats per observation over the null, where the
+    # fixed rate alone makes each of its errors cost log(outcome_range / noise); at low error rates the posterior is
+    # unchanged (within log(1 - weight)). 0 disables it.
+    noise_unknown_weight: float = 0.0
+    # Under that "unknown rate" component (and its share of the null), corrupted values follow a law learned from
+    # the observations rather than uniform(outcome_range): a Bayes mixture of uniform(outcome_range) and a uniform
+    # law on an unknown interval (RuleLearner._value_law). A rule's hit is evidence only as far as the value was
+    # unlikely by chance: on a stream of digits, a coincidental hit is a 1-in-10 event, not 1-in-100.
+    learned_chance: bool = False
+    # A rule survives while it errs on at most this fraction of the observations (by default it is right at least as
+    # often as wrong, far beyond the chance agreement of noise): bursts of corruption well above the world's nominal
+    # rate then pause it instead of refuting it. Passive streams use 0.75 (genesis.agent.default_configs): right on
+    # a quarter of the observations is still 25 times chance, and a stream with half of its observations corrupted
+    # keeps its rule through the bursts.
     max_mismatch_frac: float = 0.5
     # New rules are proposed only with at most this many mismatches (capped by max_mismatch_frac). Passive streams
-    # use 0.5 (genesis.agent.default_configs: a stream with 45% corrupted observations is still learned); where
-    # the learner chooses its experiments, a wider search floods the hypotheses with half-right conditionals that
-    # divert the experiments which would settle them.
+    # use 0.75 (genesis.agent.default_configs: a stream with half of its observations corrupted is still learned,
+    # although its first ones can be mostly corrupted); where the learner chooses its experiments, a wider search
+    # floods the hypotheses with half-right conditionals that divert the experiments which would settle them.
     search_mismatch_frac: float = 0.4
     # Deepening (genesis.search): when no enumerated rule mispredicts at most deepen_below * n observations,
     # look for rules of deepen_size nodes by meet-in-the-middle, within the same candidate budget.
@@ -121,6 +143,10 @@ class Hypothesis:
     probe_sig: tuple = ()
     # Residual counts of the mismatched observations, extended as data arrives (see _structured_errors).
     residuals: Optional[tuple] = field(default=None, compare=False, repr=False)
+    # Bitset of the observations the rule predicts exactly (bit i: observation i), extended as data arrives.
+    hits: Optional[tuple] = field(default=None, compare=False, repr=False)
+    # Markov-model statistics of that hit/miss record (see RuleLearner._pattern_log_ratio).
+    pattern: Optional[tuple] = field(default=None, compare=False, repr=False)
 
     def to_json(self) -> dict:
         return {
@@ -180,6 +206,46 @@ def _logsumexp(xs: list) -> float:
     return m + math.log(sum(math.exp(x - m) for x in xs))
 
 
+def _logaddexp(a: float, b: float) -> float:
+    hi, lo = (a, b) if a >= b else (b, a)
+    return hi + math.log1p(math.exp(lo - hi))
+
+
+def _interval_log_prob(y: int, lo: int, hi: int, t: int) -> float:
+    """Predictive log probability of ``y`` after ``t >= 2`` integers spanning [lo, hi], when they are drawn
+    uniformly from an unknown interval (scale-invariant prior on its width): (t - 1) / (t + 1) of the mass is
+    spread over [lo, hi] and the rest decays with the distance d outside it as s^(t-1) / (s + d)^t, where s is the
+    span. Summed over all integers it is at most 1."""
+    s = hi - lo + 1
+    base = math.log(t - 1) - math.log(t + 1)
+    if lo <= y <= hi:
+        return base - math.log(s)
+    d = lo - y if y < lo else y - hi
+    return base + (t - 1) * math.log(s) - t * math.log(s + d)
+
+
+def _log_beta(a: int, b: int) -> float:
+    return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+
+
+# Orders of the Markov models that look for a pattern in when a rule is right (RuleLearner._pattern_log_ratio).
+PATTERN_ORDERS = 6
+
+
+@functools.lru_cache(maxsize=4096)
+def _chance_log_ratio(ok: int, bad: int, rho: float) -> float:
+    """Log likelihood ratio of ``ok`` successes and ``bad`` failures under "right at an unknown rate above rho"
+    (uniform prior on (rho, 1)) against "right at rate rho". Under any rate <= rho it is a nonnegative
+    supermartingale, so by Ville's inequality it ever reaches log(1 / alpha) with probability at most alpha, however
+    long the record grows (an anytime-valid test, Robbins' method of mixtures)."""
+    m = ok + bad
+    # Mass of Beta(ok + 1, bad + 1) above rho = P(Binomial(m + 1, rho) <= ok).
+    l_rho, l_not = math.log(rho), math.log1p(-rho)
+    tail = _logsumexp([math.lgamma(m + 2) - math.lgamma(j + 1) - math.lgamma(m + 2 - j) + j * l_rho
+                       + (m + 1 - j) * l_not for j in range(ok + 1)])
+    return _log_beta(ok + 1, bad + 1) + min(tail, 0.0) - l_not - ok * l_rho - bad * l_not
+
+
 class RuleLearner:
     def __init__(self, key: str, var_names: list, cfg: InductionConfig,
                  shape_prior: Optional[Callable[[str], float]] = None,
@@ -200,6 +266,9 @@ class RuleLearner:
         self.linear_searches = 0
         self.linear_hits = 0
         self.noise_delays = 0
+        self.rival_searches = 0
+        self.rivals_found = 0
+        self._challenged: set = set()
         # probe_fn generates the inputs on which behavioural equivalence is judged.
         # Default: independent random values (appropriate when the agent can intervene).
         self.probe_fn = probe_fn
@@ -223,6 +292,8 @@ class RuleLearner:
         self.last_search: dict = {}
         # Memos of posterior(), best() and predict(), valid while the posterior is unchanged (same object).
         self._post_memo: Optional[tuple] = None
+        self._law_memo: Optional[tuple] = None
+        self._inc_memo: Optional[tuple] = None
         self._best_memo: Optional[tuple] = None
         self._pred_memo: Optional[tuple] = None
 
@@ -232,25 +303,191 @@ class RuleLearner:
         times between two observations. The memo holds the hypotheses themselves, so their ids stay unique."""
         cfg = self.cfg
         n = len(self.data)
-        key = (n, cfg.noise, cfg.outcome_range, cfg.null_prior,
-               tuple((id(h), h.n_ok, h.n_bad, h.log_prior) for h in self.hyps))
+        # Hypothesis counts change only in observe(), which then replaces the pool list, as _merge() does: the
+        # pool list itself (kept alive by the memo, so its id is not reused) identifies the evidence.
+        key = (n, cfg.noise, cfg.outcome_range, cfg.null_prior, cfg.noise_unknown_weight, cfg.learned_chance,
+               len(self.hyps))
         memo = self._post_memo
-        if memo is not None and memo[0] == key:
+        if memo is not None and memo[1] is self.hyps and memo[0] == key:
             return memo[2]
         out = self._posterior(n)
-        self._post_memo = (key, tuple(self.hyps), out)
+        self._post_memo = (key, self.hyps, out)
         return out
 
     def _scores(self, hyps: list) -> list:
-        """Unnormalised log posterior of each hypothesis."""
+        """Unnormalised log posterior of each hypothesis. Its likelihood: each observation is right with probability
+        1 - e, else one of outcome_range values, where the error rate e is `noise` or, with prior weight
+        noise_unknown_weight, unknown (uniform, integrated out). The unknown rate stands for corruption, which is
+        unpredictable: it is not offered to a pooled rule whose errors a rival predicts (_incomplete_ids)."""
         cfg = self.cfg
         l_ok = math.log(1 - cfg.noise)
         l_bad = math.log(cfg.noise / cfg.outcome_range)
-        return [math.log(1 - cfg.null_prior) + h.log_prior + h.n_ok * l_ok + h.n_bad * l_bad for h in hyps]
+        base = math.log(1 - cfg.null_prior)
+        w = cfg.noise_unknown_weight
+        if w <= 0:
+            return [base + h.log_prior + h.n_ok * l_ok + h.n_bad * l_bad for h in hyps]
+        l_clean, l_unknown = math.log1p(-w), math.log(w)
+        # Log probability of a corrupted value under the unknown rate: the learned law's, or uniform.
+        l_value = self._value_law() if cfg.learned_chance else -math.log(cfg.outcome_range)
+        incomplete = self._incomplete_ids() if hyps is self.hyps else ()
+        out = []
+        for h in hyps:
+            clean = l_clean + h.n_ok * l_ok + h.n_bad * l_bad
+            if id(h) in incomplete:
+                out.append(base + h.log_prior + clean)
+                continue
+            unknown = l_unknown + _log_beta(h.n_bad + 1, h.n_ok + 1) + h.n_bad * l_value
+            hi, lo = (clean, unknown) if clean >= unknown else (unknown, clean)
+            out.append(base + h.log_prior + hi + math.log1p(math.exp(lo - hi)))
+        return out
+
+    def _null_ll(self) -> float:
+        """Log likelihood of the observations under the null model (no rule): uniform outcomes, or, with
+        learned_chance, uniform with weight 1 - noise_unknown_weight and the learned value law otherwise."""
+        cfg = self.cfg
+        uniform, w = len(self.data) * math.log(1 / cfg.outcome_range), cfg.noise_unknown_weight
+        if not cfg.learned_chance or w <= 0:
+            return uniform
+        return _logaddexp(math.log1p(-w) + uniform, math.log(w) + len(self.data) * self._value_law())
+
+    def _value_law(self) -> float:
+        """Log probability, under the value law learned so far, of each observed value: the chance that a rule
+        is right by coincidence. The law is the Bayes mixture, with prior 1/2 each, of uniform(outcome_range) and
+        the uniform law on an unknown interval, weighted by how well each predicted the outcomes one after the
+        other (_interval_log_prob; uniform until two integers are seen). Each value is then given its current
+        probability, about 1/10 on a stream of digits and 1/outcome_range on an unbounded stream: an
+        empirical-Bayes estimate, which credits the null with the range it has seen. Chance is at most 1/2: a law
+        concentrated on one value is a rule (a constant), not chance. Updated incrementally."""
+        memo = self._law_memo
+        if memo is None or memo[0] is not self.data or memo[1] > len(self.data):
+            memo = (self.data, 0, 0, 0, 0, 0.0)
+        data, done, t, lo, hi, interval = memo
+        l_uniform = -math.log(self.cfg.outcome_range)
+        for _, y in self.data[done:]:
+            if not isinstance(y, int) or isinstance(y, bool):
+                interval += l_uniform
+                continue
+            interval += _interval_log_prob(y, lo, hi, t) if t >= 2 else l_uniform
+            lo, hi, t = (y, y, 1) if t == 0 else (min(lo, y), max(hi, y), t + 1)
+        self._law_memo = (data, len(self.data), t, lo, hi, interval)
+        if t < 2:
+            return l_uniform
+        uniform = len(self.data) * l_uniform
+        inside = math.log(t - 1) - math.log(t + 1) - math.log(max(hi - lo + 1, 2))
+        return _logaddexp(uniform + l_uniform, interval + inside) - _logaddexp(uniform, interval)
+
+    def _hit_bits(self, h: Hypothesis) -> int:
+        """Bit i is set when ``h`` predicts observation i exactly (memoised, extended as data arrives)."""
+        memo = h.hits
+        if memo is None or memo[0] is not self.data or memo[1] > len(self.data):
+            memo = (self.data, 0, 0)
+        _, done, bits = memo
+        for i in range(done, len(self.data)):
+            d, y = self.data[i]
+            if h.expr.evaluate(d, True) == y:
+                bits |= 1 << i
+        h.hits = (self.data, len(self.data), bits)
+        return bits
+
+    def _pattern_log_ratio(self, h: Hypothesis) -> float:
+        """Log likelihood ratio of the rule's hit/miss record (in observation order) under a Bayes mixture of
+        Markov models of orders 1 to PATTERN_ORDERS (Krichevsky-Trofimov estimates per context of previous bits)
+        against its best fit as independent draws. Corruption strikes at independent times, so a corrupted rule's
+        record is such draws: under any rate, the mixture over that rate is a nonnegative martingale and this ratio
+        is below it, so it ever reaches log(1 / alpha) with probability at most alpha (Ville). A rule right on one
+        phase of a cycle (every fourth term) reaches it within a few cycles. Updated incrementally."""
+        bits, n = self._hit_bits(h), len(self.data)
+        memo = h.pattern
+        if memo is None or memo[0] is not self.data or memo[1] > n:
+            memo = (self.data, 0, [{} for _ in range(PATTERN_ORDERS)], [0.0] * PATTERN_ORDERS)
+        _, done, counts, logq = memo
+        for i in range(done, n):
+            b = (bits >> i) & 1
+            for j in range(PATTERN_ORDERS):
+                m = min(j + 1, i)
+                ctx = ((bits >> (i - m)) & ((1 << m) - 1), m)
+                c = counts[j].get(ctx)
+                if c is None:
+                    c = counts[j][ctx] = [0, 0]
+                logq[j] += math.log((c[b] + 0.5) / (c[0] + c[1] + 1))
+                c[b] += 1
+        h.pattern = (self.data, n, counts, logq)
+        k = bits.bit_count()
+        best = (k * math.log(k / n) if k else 0.0) + ((n - k) * math.log((n - k) / n) if k < n else 0.0)
+        return _logsumexp(logq) - math.log(PATTERN_ORDERS) - best
+
+    def _incomplete_ids(self) -> frozenset:
+        """Ids of the pooled rules whose errors are structure they miss, not corruption, by either of two
+        anytime-valid tests at level validation_sprt_alpha / 2 each:
+
+        * when it is right is patterned (_pattern_log_ratio), e.g. on one phase of a cycle; or
+        * a rival predicts its errors far better than chance (whatever the rule's error rate: an incomplete rule
+          right on most inputs but wrong on a region of them is no more corrupted than one wrong on most). Under
+          "this rule, corrupted", another rule hits a corrupted value only by coincidence, at the learned chance
+          rate (rounded up to 1 / k); the chance test (_chance_log_ratio) on the rival's hits among the rule's
+          errors, with the level shared among the rivals, refutes that. Only the errors observed after the rival
+          joined the pool count: it was chosen to fit the earlier ones.
+
+        Only with noise_unknown_weight > 0 (the unknown rate is what models corruption). Both tests depend only on
+        the rule's hit record (a rival with the same record hits none of its errors), so pooled rules that agree on
+        every observation share one test. Memoised for the current pool and data."""
+        memo = self._inc_memo
+        n = len(self.data)
+        if memo is not None and memo[0] is self.hyps and memo[1] == n:
+            return memo[2]
+        cfg, hyps, out = self.cfg, self.hyps, set()
+        alpha = cfg.validation_sprt_alpha / 2
+        if cfg.noise_unknown_weight > 0 and alpha > 0:
+            threshold = math.log(1 / alpha)
+            patterned: dict = {}
+            for h in hyps:
+                if h.n_bad >= 2:
+                    bits = self._hit_bits(h)
+                    flag = patterned.get(bits)
+                    if flag is None:
+                        flag = patterned[bits] = self._pattern_log_ratio(h) >= threshold
+                    if flag:
+                        out.add(id(h))
+            suspects = [h for h in hyps if h.n_bad >= 2 and id(h) not in out]
+            if suspects and len(hyps) > 1:
+                chance = math.exp(self._value_law()) if cfg.learned_chance else 1 / cfg.outcome_range
+                rho = 1 / max(int(1 / chance), 2)
+                threshold = math.log((len(hyps) - 1) / alpha)
+                # Rivals' hits after they joined the pool, grouped by when they joined.
+                rivals: dict = {}
+                for g in hyps:
+                    rivals.setdefault(g.born_n, set()).add(self._hit_bits(g) >> g.born_n)
+                full = (1 << n) - 1
+                refuted: dict = {}
+                for h in suspects:
+                    bits = self._hit_bits(h)
+                    flag = refuted.get(bits)
+                    if flag is None:
+                        flag = refuted[bits] = self._rival_hits_errors(full & ~bits, rivals, rho, threshold)
+                    if flag:
+                        out.add(id(h))
+        ids = frozenset(out)
+        self._inc_memo = (hyps, n, ids)
+        return ids
+
+    @staticmethod
+    def _rival_hits_errors(errors: int, rivals: dict, rho: float, threshold: float) -> bool:
+        """Whether some rival's hits among the ``errors`` observed after it joined the pool pass the chance test."""
+        for born, records in rivals.items():
+            later = errors >> born
+            m = None
+            for hits in records:
+                k = (hits & later).bit_count()
+                if k >= 2:
+                    if m is None:
+                        m = later.bit_count()
+                    if _chance_log_ratio(k, m - k, rho) >= threshold:
+                        return True
+        return False
 
     def _posterior(self, n: int) -> tuple:
         cfg = self.cfg
-        null = math.log(cfg.null_prior) + n * math.log(1 / cfg.outcome_range)
+        null = math.log(cfg.null_prior) + self._null_ll()
         scores = self._scores(self.hyps)
         z = _logsumexp(scores + [null])
         post = tuple(sorted(((h, math.exp(s - z)) for h, s in zip(self.hyps, scores)), key=lambda t: -t[1]))
@@ -310,7 +547,8 @@ class RuleLearner:
         if top is not None:
             fwd = top.fwd_ok + top.fwd_bad
             if (mass >= self.cfg.validation_posterior and top.fwd_ok >= self.cfg.validation_k
-                    and (top.fwd_bad <= int(self.cfg.validation_max_error * fwd) or self._sprt_accepts(top))
+                    and (top.fwd_bad <= int(self.cfg.validation_max_error * fwd) or self._sprt_accepts(top)
+                         or self._beats_chance(top))
                     and not self._structured_errors(top)):
                 return "validated"
             if mass >= 0.5:
@@ -322,8 +560,16 @@ class RuleLearner:
         successes than failures) keeps the question open, even while the null still dominates the posterior: a
         long rule pays its Occam prior back only over several more observations, and judging the stream
         unpredictable now would withdraw the attention that would decide it. Noise almost never yields one (each
-        forward success is a 1 / outcome_range coincidence)."""
-        return h is not None and h.fwd_ok >= 2 and h.fwd_ok > h.fwd_bad
+        forward success is a 1 / outcome_range coincidence). With validation_chance, a record that favours "right
+        more often than chance" over chance itself also counts (a heavily corrupted rule errs more often than not),
+        unless the rule is incomplete (_incomplete_ids): its errors are then structure it misses, not corruption."""
+        if h is None or h.fwd_ok < 2:
+            return False
+        if h.fwd_ok > h.fwd_bad:
+            return True
+        rho = self.cfg.validation_chance
+        return (0 < rho < 1 and _chance_log_ratio(h.fwd_ok, h.fwd_bad, rho) > 0
+                and id(h) not in self._incomplete_ids())
 
     def _sprt_accepts(self, h: Hypothesis) -> bool:
         """Wald's log-likelihood ratio of the forward record under "errs at validation_max_error" against "errs at
@@ -335,11 +581,23 @@ class RuleLearner:
         llr = h.fwd_ok * math.log((1 - p1) / (1 - p0)) + h.fwd_bad * math.log(p1 / p0)
         return llr >= math.log(1 / alpha)
 
+    def _beats_chance(self, h: Hypothesis) -> bool:
+        """The forward record shows, at level validation_sprt_alpha and whatever its length, that the rule is right
+        more often than validation_chance (see _chance_log_ratio). A rule right on half of its forward predictions
+        passes after about a dozen of them; one right by chance (on noise, about once in 61 here) almost never does."""
+        alpha, rho = self.cfg.validation_sprt_alpha, self.cfg.validation_chance
+        if alpha <= 0 or not 0 < rho < 1:
+            return False
+        return _chance_log_ratio(h.fwd_ok, h.fwd_bad, rho) >= math.log(1 / alpha)
+
     def _structured_errors(self, h: Hypothesis) -> bool:
         """Noise is unstructured: when most of a rule's errors share one residual (a missed wrap-around, an
-        off-by-one branch), the rule is incomplete and must not be validated, whatever its error rate."""
+        off-by-one branch), or a rival predicts them (_incomplete_ids), the rule is incomplete and must not be
+        validated, whatever its error rate."""
         if h.n_bad < 2:
             return False
+        if id(h) in self._incomplete_ids():
+            return True
         memo = h.residuals
         if memo is None or memo[0] is not self.data or memo[1] > len(self.data):
             memo = (self.data, 0, Counter())
@@ -367,13 +625,18 @@ class RuleLearner:
         surprise = -math.log2(p_y)
         top_before, _, _ = self.best()
 
+        n_before = len(self.data)
         for h in self.hyps:
-            if h.expr.evaluate(inputs, True) == y:
+            ok = h.expr.evaluate(inputs, True) == y
+            if ok:
                 h.n_ok += 1
                 h.fwd_ok += 1
             else:
                 h.n_bad += 1
                 h.fwd_bad += 1
+            memo = h.hits
+            if memo is not None and memo[0] is self.data and memo[1] == n_before:
+                h.hits = (self.data, n_before + 1, memo[2] | (1 << n_before) if ok else memo[2])
         self.data.append((dict(inputs), y))
         self.episodes.append(episode_id)
         self.provenance.append(provenance)
@@ -396,9 +659,62 @@ class RuleLearner:
             self._induce()
             reinduced = True
         self._status = self.status()
+        if self._status == "validated" and self._challenge(self.best()[0]):
+            self._status = self.status()
         if self._status != status_before:
             self.status_history.append({"n": n, "status": self._status, "episode": episode_id})
         return LearnResult(pred, correct, surprise, reinduced, status_before, self._status, refuted)
+
+    def _challenge(self, top: Hypothesis) -> bool:
+        """Look for rivals of a rule about to be validated: rules within max_size that explain the observations at
+        least as well but predict a different future. The search keeps one program per behaviour on the
+        observations (the first enumerated), so such a rival can be missing from the pool although it is exactly as
+        plausible, e.g. (x - 1) % 10 next to x % 10 - 1 when corruption kept a counter off its wrap-around and the
+        decisive input never occurred. Once per rule, the search runs on the observations plus the rule's own probes
+        (the inputs it would be used on), so rivals that disagree there stay distinct; they join the pool and the
+        posterior weighs them. Returns whether any was found. The probes are labelled with a value no program
+        reaches (the kernels are bounded by VALUE_LIMIT), so every candidate misses all of them and the tolerance
+        admits exactly the programs that fit the observations as well as the rule. Only rules larger than
+        KEEP_ALL_UPTO and within max_size can hide an equally simple rival: the search keeps every smaller program,
+        and an equally good rival within max_size would outrank a larger rule. Only rules that already err: an
+        exact rule errs on the first decisive input, which no corruption excuses, so the search runs again then;
+        a rule whose errors pass for corruption would absorb that one too."""
+        cfg = self.cfg
+        key = str(top.expr)
+        if key in self._challenged or top.n_bad == 0 or not KEEP_ALL_UPTO < top.expr.size <= cfg.max_size:
+            return False
+        self._challenged.add(key)
+        rows = [(d, y) for d, y in self.data if _in_range(d, y)]
+        probes = self.probe_fn(self, top.expr) if self.probe_fn is not None else self._probes
+        labelled = []
+        for p in probes:
+            v = top.expr.evaluate(p, True)
+            if v is not None and _in_range(p, v):
+                labelled.append((p, v))
+        if len(rows) < 5 or not labelled:
+            return False
+        self.rival_searches += 1
+        top_bad = sum(top.expr.evaluate(d, True) != y for d, y in self.data)
+        inputs = [d for d, _ in rows]
+        ys = [y for _, y in rows]
+        consts = self._propose_constants(inputs, tuple(ys))
+        sr = search_programs(inputs + [p for p, _ in labelled], ys + [VALUE_LIMIT + 1] * len(labelled),
+                             self.var_names, sorted(consts),
+                             sum(top.expr.evaluate(d, True) != y for d, y in rows) + len(labelled), cfg.max_size,
+                             cfg.max_candidates, cfg.max_seconds, 0, keep_all_upto=KEEP_ALL_UPTO)
+        self.expressions_evaluated += sr.evaluated
+        rivals = []
+        for e, _ in sr.matches:
+            if _has_trivial(e) or all(e.evaluate(p, True) == v for p, v in labelled):
+                continue
+            exact = sum(e.evaluate(d, True) != y for d, y in self.data)
+            if exact <= top_bad:
+                rivals.append((e, exact, self._base_prior(e, sr.counts)))
+        if not rivals:
+            return False
+        self.rivals_found += len(rivals)
+        self._merge(rivals, len(self.data))
+        return True
 
     def _propose_constants(self, inputs: list, ys: list) -> set:
         proposals: Counter = Counter()
@@ -475,8 +791,12 @@ class RuleLearner:
 
     def _induce(self) -> None:
         cfg = self.cfg
-        # Back off when the previous search failed: nothing survived, or its best rule kept failing.
-        failed = self._prev_top is None or self._prev_top.fwd_ok < 2
+        # Back off when the previous search failed: nothing survived, or its best rule kept failing. Where rules
+        # survive while wrong more often than right (max_mismatch_frac > 1/2), a best rule that is not right more
+        # often than wrong has not settled the stream either: a search after each of its errors would rerun on
+        # nearly the same data (a reachable rule that is right on one phase of a longer cycle errs on most terms).
+        prev = self._prev_top
+        failed = prev is None or prev.fwd_ok < 2 or (cfg.max_mismatch_frac > 0.5 and prev.fwd_ok <= prev.fwd_bad)
         if self.n_inductions and failed and len(self.data) >= cfg.unpredictable_min_n:
             self.backoff = min(self.backoff * 2, cfg.max_backoff)
         else:
@@ -693,9 +1013,9 @@ class RuleLearner:
         if defs:
             inputs = [{**d, **{k: e.evaluate(d) for k, e in defs.items()}} for d in inputs]
         sr = search_programs(inputs, ys, self.var_names + list(defs), sorted(consts), tol, cfg.max_size,
-                             cfg.max_candidates, cfg.max_seconds, cfg.max_size - 2, deepen_bad=deepen_bad,
-                             deep_size=cfg.deepen_size, window=cfg.deepen_window, n_windows=cfg.deepen_windows,
-                             deep_max_size=deep_max_size or cfg.deepen_max_size)
+                             cfg.max_candidates, cfg.max_seconds, cfg.max_size - 2, keep_all_upto=KEEP_ALL_UPTO,
+                             deepen_bad=deepen_bad, deep_size=cfg.deepen_size, window=cfg.deepen_window,
+                             n_windows=cfg.deepen_windows, deep_max_size=deep_max_size or cfg.deepen_max_size)
         self.expressions_evaluated += sr.evaluated
         self.last_search = {"backend": sr.backend, "evaluated": sr.evaluated, "truncated": sr.truncated,
                             "seconds": round(sr.seconds, 4), "max_size": cfg.max_size, "deep_found": len(sr.deep),
@@ -724,7 +1044,7 @@ class RuleLearner:
         if odds is None:
             return False
         if self.hyps:
-            null = len(self.data) * math.log(1 / cfg.outcome_range)
+            null = self._null_ll()
             rules = _logsumexp(self._scores(self.hyps)) - math.log(1 - cfg.null_prior)
             odds += min(0.0, null - rules)
         return odds >= _logit(cfg.noise_recognition)
@@ -776,8 +1096,12 @@ class RuleLearner:
         pool = self.hyps + fresh
         scores = self._scores(pool)
         self.hyps = [pool[i] for i in heapq.nsmallest(cfg.pool_size, range(len(pool)), key=lambda i: (-scores[i], i))]
+        before = self._probes
         self._make_probes()
-        for h in self.hyps:
+        # Signatures of the hypotheses already pooled are kept while the probes are unchanged.
+        fresh_ids = {id(h) for h in fresh}
+        todo = self.hyps if self._probes != before else [h for h in self.hyps if id(h) in fresh_ids]
+        for h in todo:
             h.probe_sig = self._probe_sig(h.expr)
         self._best_memo = None  # equivalence classes follow the new probes
 
@@ -848,7 +1172,8 @@ class RuleLearner:
             "deep_searches": self.deep_searches, "next_deep_n": self.next_deep_n,
             "invention_searches": self.invention_searches, "invention_hits": self.invention_hits,
             "linear_searches": self.linear_searches, "linear_hits": self.linear_hits,
-            "noise_delays": self.noise_delays,
+            "noise_delays": self.noise_delays, "rival_searches": self.rival_searches,
+            "rivals_found": self.rivals_found, "challenged": sorted(self._challenged),
         }
 
     @classmethod
@@ -867,6 +1192,9 @@ class RuleLearner:
         lr.linear_searches = state.get("linear_searches", 0)
         lr.linear_hits = state.get("linear_hits", 0)
         lr.noise_delays = state.get("noise_delays", 0)
+        lr.rival_searches = state.get("rival_searches", 0)
+        lr.rivals_found = state.get("rivals_found", 0)
+        lr._challenged = set(state.get("challenged", ()))
         lr.data = [(dict(d), y) for d, y in state["data"]]
         lr.episodes = list(state["episodes"])
         lr.provenance = list(state["provenance"])

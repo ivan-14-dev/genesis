@@ -326,8 +326,8 @@ criterion; learning new constructions is a measurable intermediate step, not a s
   measured learning progress and sets its own objectives (34 of 38 achieved here). Controls with fresh agents
   are shown honestly: on this seed random allocation scores 86.6% vs 84.7% for progress and 80.6% for
   round-robin.
-- **Stage 7:** it lists its own limitations, then runs a sandboxed self-improvement cycle. `validation_k` 4 → 3
-  wins on trial seeds (+0.05) but not on holdout (76% vs 76%), so it is *rejected*. A variant that passes would be
+- **Stage 7:** it lists its own limitations, then runs a sandboxed self-improvement cycle. No variant improves the
+  trial score here (`validation_k` 4 → 5 and 4 → 3 lose 0.01 and 0.02), so nothing is proposed. A variant that passes would be
   stored as *pending approval*, **never** deployed automatically; only a named human can approve it, and rollback
   is available.
 
@@ -337,9 +337,11 @@ or refuted it (`inspect --explain`).
 ## Headline results (10 held-out seeds, see docs/RESULTS.md)
 
 - Sequences: 100% extrapolation accuracy on hidden rules (baselines 7.6% / 17%); 20/20 noise streams judged
-  unpredictable, 0 false validations; 0.23 s CPU per seed (12× less than v0.2.0, C search kernel).
-- Robustness: with 10% or 20% corrupted observations, 100% of rule streams validated, including a stream with
-  45% of its observations corrupted (beliefs use exact integers, so geometric streams no longer overflow).
+  unpredictable, 0 false validations; 0.31 s CPU per seed (9× less than v0.2.0, C search kernel).
+- Robustness: with 10%, 20% or 30% corrupted observations, 100% of rule streams validated; with **half** of the
+  observations corrupted, 97.5% (100% when 8 of 10 streams are pure noise). A rule must beat the chance measured
+  on its own stream, through an anytime-valid test, not be right more often than wrong: the old majority
+  requirement validates 7.5% at 50% noise. Beliefs use exact integers, so geometric streams no longer overflow.
   7-node rules: 100% validated with deepening vs 37.5% without; 9-node rules: 100% (also with 10% noise) vs 36% without the 9-node
   level and the linear solver; 11- and 13-node linear rules: 100% (also with 10% noise) vs 11% without the
   exact linear solver. 0 false validations on noise in every condition.
@@ -348,18 +350,20 @@ or refuted it (`inspect --explain`).
   With 5%, 10% or 20% of experiment outcomes corrupted, still 100% held-out accuracy and 18/18 confounded causes
   found, never a wrong cause validated (noise-tolerant conditionals).
 - Memory: retention 1.0 across sessions, forgetting 0.0 after a second world. Planning: 100% vs 78.5% random.
-- Tight budget (60 observations): curiosity with budget-aware focus validates 60% of rule streams (random 24%,
+- Tight budget (60 observations): curiosity with budget-aware focus validates 59% of rule streams (random 24%,
   round-robin 0%). Remembered rule shapes cut search 16×; on 7-node worlds they also cut observations to
-  validation by 25% (11.6 → 8.6), now at no CPU cost.
+  validation by 24% (11.6 → 8.7), at no CPU cost.
 - Library learning (wake-sleep): sub-programs promoted to invented primitives during sleep let a learner limited
   to 7-node searches learn later 9-node worlds (late rule streams validated 33% → 100%, linear solver off).
-- Stage 6: learning-progress allocation beats round-robin at budget 150 (0.849 vs 0.792, half the noise) and
-  stops itself at 300 with equal knowledge.
-- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.702 vs 0.723); on standard
-  worlds remembered shapes do not reduce observations to validation; curiosity spends slightly more on noise and
-  only ties round-robin at budget 100; the recognition model's effect on observations is marginal (it postpones
+- Stage 6: learning-progress allocation beats round-robin at budget 150 (0.848 vs 0.786, half the noise) and
+  stops itself at 300 with slightly more knowledge (0.979 vs 0.968).
+- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.705 vs 0.725); on standard
+  worlds remembered shapes do not reduce observations to validation; learning half-corrupted streams costs CPU
+  on clean worlds (0.31 vs 0.23 s per seed) and keeps noise streams open longer, so curiosity spends more on
+  noise (43.9 vs 30 observations for round-robin at budget 150) and leads round-robin by only one stream at
+  budget 100; the recognition model's effect on observations is marginal (it postpones
   deep searches on series that look like noise unless a hypothesis already explains most observations: −8 to
-  −11% expressions evaluated, same validation); stage 7 finds no variant that survives holdout, and most tunable parameters have no
+  −11% expressions evaluated, same validation); stage 7 finds no variant that improves the trial score, and most tunable parameters have no
   effect.
 
 ## Layout

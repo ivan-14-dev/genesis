@@ -110,12 +110,21 @@ def run_sequence_benchmark(seed: int, budget: int = 400, strategy: str = "curios
         return res
 
 
+# Ablation: a rule must be right more often than wrong (tolerances 0.5, fixed corruption rate, no chance test).
+MAJORITY_RULE = {"sequence.search_mismatch_frac": 0.5, "sequence.max_mismatch_frac": 0.5,
+                 "sequence.noise_unknown_weight": 0.0, "sequence.learned_chance": False,
+                 "sequence.validation_chance": 0.0}
+
 ROBUSTNESS_CONDITIONS = {
     # name: (world options, agent config overrides)
     "clean": ({}, {}),
     "noise_10": ({"noise": 0.1}, {}),
     "noise_20": ({"noise": 0.2}, {}),
+    "noise_30": ({"noise": 0.3}, {}),
+    "noise_50": ({"noise": 0.5}, {}),
+    "noise_50_majority_rule": ({"noise": 0.5}, MAJORITY_RULE),
     "mostly_noise_20": ({"noise": 0.2, "n_rule_streams": 2, "n_noise_streams": 8}, {}),
+    "mostly_noise_50": ({"noise": 0.5, "n_rule_streams": 2, "n_noise_streams": 8}, {}),
     "deep": ({"families": DEEP_FAMILIES}, {}),
     "deep_noise_10": ({"families": DEEP_FAMILIES, "noise": 0.1}, {}),
     "deep_without_deepening": ({"families": DEEP_FAMILIES}, {"sequence.deepen_size": 0}),
