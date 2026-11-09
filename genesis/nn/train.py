@@ -2,7 +2,8 @@
 
 All randomness (window sampling, shuffling) comes from ``random.Random(seed)``
 and every reduction runs in a fixed order, so a (model config, data, seed)
-triple always yields bit-identical weights on a given backend.
+triple always yields bit-identical weights on a given backend (for the C
+backend, whatever its SIMD level or thread count).
 """
 
 from __future__ import annotations

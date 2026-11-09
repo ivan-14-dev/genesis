@@ -13,6 +13,23 @@ from typing import Iterable, Optional
 
 from .innate import ARITHMETIC_PRIMITIVES
 
+# Beliefs (prediction, scoring, replay) use exact integers: a validated x*2 stays right past 10^18. The search
+# kernels keep the bounded innate semantics (|v| <= VALUE_LIMIT, as in the C kernel). Exact values are capped
+# in length so a rule applied to its own output (x*x, rollouts) cannot blow up memory.
+EXACT_BITS = 4096
+
+
+def _exact(op: str, a: int, b: int) -> Optional[int]:
+    if op == "mod":
+        return a % b if b > 0 else None
+    if op == "mul":
+        if a.bit_length() + b.bit_length() > EXACT_BITS + 1:
+            return None
+        v = a * b
+    else:
+        v = a + b if op == "add" else a - b
+    return v if v.bit_length() <= EXACT_BITS else None
+
 
 @dataclass(frozen=True, slots=True)
 class Expr:
@@ -21,21 +38,24 @@ class Expr:
     value: object = None
     size: int = 1
 
-    def evaluate(self, env: dict) -> Optional[int]:
+    def evaluate(self, env: dict, exact: bool = False) -> Optional[int]:
+        """Bounded innate arithmetic by default (search semantics); ``exact=True`` for beliefs."""
         if self.op == "var":
             return env.get(self.value)
         if self.op == "const":
             return self.value
         if self.op == "if_eq":
             q, c, e1, e2 = self.args
-            qv = q.evaluate(env)
+            qv = q.evaluate(env, exact)
             if qv is None:
                 return None
-            return e1.evaluate(env) if qv == c.value else e2.evaluate(env)
-        a = self.args[0].evaluate(env)
-        b = self.args[1].evaluate(env)
+            return e1.evaluate(env, exact) if qv == c.value else e2.evaluate(env, exact)
+        a = self.args[0].evaluate(env, exact)
+        b = self.args[1].evaluate(env, exact)
         if a is None or b is None:
             return None
+        if exact:
+            return _exact(self.op, a, b)
         return ARITHMETIC_PRIMITIVES[self.op].fn(a, b)
 
     def __str__(self) -> str:

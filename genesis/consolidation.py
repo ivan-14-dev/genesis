@@ -12,12 +12,18 @@ Runs between bouts of activity. It never deletes episodes. It:
 5. recomputes associations, comparing observational vs interventional evidence
    to separate causal links from spurious correlations;
 6. measures replay consistency of validated knowledge (forgetting check);
+7. improves the library (genesis.library): promotes recurring sub-programs of
+   validated rules to invented primitives, and trains the recognition model on
+   dreams sampled from procedural memory plus replays of validated problems.
 """
 
 from __future__ import annotations
 
+import zlib
 from collections import defaultdict
 
+from . import library
+from .adapters import SEQ_VARS, sequence_dream
 from .expressions import Expr, var
 
 STATUS_FROM_LEARNER = {"validated": "validated", "candidate": "candidate", "unknown": "hypothesis"}
@@ -44,6 +50,7 @@ class Consolidation:
         summary["generalizations"] = self._frame_generalizations(agent)
         summary["associations"] = self._associations(agent)
         summary["replay_consistency"] = self._replay_consistency(agent)
+        summary["library"] = self._sleep(agent)
         ltm.record_metric(agent.session, "replay_consistency", summary["replay_consistency"])
         ltm.record_metric(agent.session, "consolidation", summary["written"], summary)
         ltm.commit()
@@ -90,7 +97,7 @@ class Consolidation:
             if item.statement in current or item.status in ("refuted", "dormant") or item.expr is None:
                 continue
             e = Expr.from_json(item.expr)
-            contra = [lr.episodes[i] for i, (inp, y) in enumerate(lr.data) if e.evaluate(inp) != y]
+            contra = [lr.episodes[i] for i, (inp, y) in enumerate(lr.data) if e.evaluate(inp, True) != y]
             if contra:
                 ltm.add_evidence(item.id, contra[:5], "refuted_by")
                 ltm.set_status(item.id, "refuted", f"contradicted by {len(contra)} stored episodes on replay")
@@ -101,12 +108,42 @@ class Consolidation:
                 ltm.set_status(item.id, "dormant", "consistent with all evidence but displaced by simpler beliefs")
 
     @staticmethod
+    def _sleep(agent) -> dict:
+        """Abstraction and dreaming, recomputed from the current validated knowledge (see genesis.library)."""
+        if not getattr(agent, "library_learning", False):
+            return {}
+        ltm = agent.ltm
+        rules = [(k.key, Expr.from_json(k.expr)) for k in ltm.knowledge(status="validated", kind="rule")
+                 if k.expr is not None]
+        successes = ltm.shape_successes()
+        shapes = [s for s, n in sorted(successes.items(), key=lambda t: (-t[1], t[0])) if n > 0]
+        # Nothing new was validated since the last sleep: the library would be the same.
+        digest = zlib.crc32(repr(([(k, str(e)) for k, e in rules], shapes)).encode())
+        previous = ltm.get_meta("library")
+        if previous and previous.get("digest") == digest:
+            return {"unchanged": True}
+        replays = []
+        for key in sorted(agent.learners):
+            lr = agent.learners[key]
+            top = lr.best()[0]
+            if top is not None and lr.status() == "validated":
+                replays.append((top.expr.shape(), [y for _, y in lr.data]))
+        lib = library.sleep(rules, shapes, replays, {"sequence": (SEQ_VARS, sequence_dream)},
+                            seed=agent.seed * 7919, dreamt=(previous or {}).get("dreamt"))
+        lib.update(session=agent.session, digest=digest)
+        ltm.set_meta("library", lib)
+        out = {"inventions": [d["statement"] for d in lib["inventions"]], "dreams": lib["dreams"],
+               "replays": lib["replays"]}
+        ltm.record_metric(agent.session, "library", len(lib["inventions"]), out)
+        return out
+
+    @staticmethod
     def _evidence(ltm, kid, h, lr) -> None:
         induced = [e for e in lr.episodes[: h.born_n]]
         sup, con = [], []
         for i in range(h.born_n, len(lr.data)):
             inp, y = lr.data[i]
-            (sup if h.expr.evaluate(inp) == y else con).append(lr.episodes[i])
+            (sup if h.expr.evaluate(inp, True) == y else con).append(lr.episodes[i])
         ltm.add_evidence(kid, induced, "induced_from")
         ltm.add_evidence(kid, sup, "supports")
         ltm.add_evidence(kid, con, "contradicts")
@@ -193,6 +230,6 @@ class Consolidation:
                 continue
             e = Expr.from_json(item.expr)
             for inp, y in lr.data:
-                ok += e.evaluate(inp) == y
+                ok += e.evaluate(inp, True) == y
                 tot += 1
         return ok / tot if tot else 1.0

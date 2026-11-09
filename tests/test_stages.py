@@ -7,7 +7,7 @@ from genesis import self_improvement as SI
 from genesis.adapters import SEQ_VARS, LabAdapter, SequenceAdapter, sequence_rollout_probes
 from genesis.agent import Genesis, validate_config
 from genesis.environments import CausalWorld, SequenceWorld, sandboxed
-from genesis.experiments import run_autonomy
+from genesis.experiments import run_autonomy, run_robustness_benchmark
 from genesis.induction import InductionConfig, RuleLearner
 from genesis.innate import DEFAULT_SAFETY
 from genesis.memory import LongTermMemory
@@ -16,6 +16,16 @@ from genesis.memory import LongTermMemory
 def _feed(lr, terms):
     for t in range(3, len(terms)):
         lr.observe({"x[t-1]": terms[t - 1], "x[t-2]": terms[t - 2], "x[t-3]": terms[t - 3], "t": t}, terms[t])
+
+
+# ------------------------------------------------------ robustness and depth
+def test_robustness_benchmark_deepening_and_soundness():
+    r = run_robustness_benchmark([100], ("noise_20", "deep", "deep_without_deepening"))
+    assert r["deep"]["rule_streams_validated"] > r["deep_without_deepening"]["rule_streams_validated"]
+    assert r["deep"]["deep_searches"] > 0 == r["deep_without_deepening"]["deep_searches"]
+    assert r["noise_20"]["corrupted_observations"] > 0
+    assert all(c["false_validation_rate_on_noise"] == 0 for c in r.values())
+    assert all(c["validated_rule_extrapolation_accuracy"] >= 0.9 for c in r.values())
 
 
 # ------------------------------------------------- procedural memory speed-up
