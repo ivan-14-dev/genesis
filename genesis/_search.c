@@ -382,7 +382,9 @@ int gn_search(int n, const int64_t *ys, int n_leaves, const int64_t *leaf_sigs, 
                         int a_left = variant != 2;
                         int allowed = 0;
                         for (int pi = 0; pi < n_ops; pi++) allowed |= ops[pi] == op;
-                        if (!allowed) continue;
+                        /* A commutative pair is kept with its smaller side on the left (checked below), so a
+                         * left side larger than any partner could be is never kept: skip the lookup. */
+                        if (!allowed || ((op == OP_ADD || op == OP_MUL) && sa > want)) continue;
                         int ok = 1;
                         for (int i = 0; i < win_len && ok; i++) {
                             int64_t y = ys[rows[i]], x = A[rows[i]];
@@ -429,7 +431,7 @@ int gn_search(int n, const int64_t *ys, int n_leaves, const int64_t *leaf_sigs, 
                         int a_left = variant != 2;
                         int allowed = 0;
                         for (int pi = 0; pi < n_ops; pi++) allowed |= ops[pi] == op;
-                        if (!allowed) continue;
+                        if (!allowed || (op == OP_ADD && sa > awant)) continue;
                         int ok = 1;
                         for (int i = 0; i < win_len && ok; i++) {
                             int64_t y = ys[rows[i]], x = A[rows[i]];

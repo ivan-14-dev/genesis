@@ -126,11 +126,13 @@ REASONS_FR = {"step limit": "budget atteint", "sandbox budget exhausted": "budge
               "safety interaction limit": "limite de sécurité atteinte"}
 NOTES_FR = {
     "hypothesis space is bounded: programs up to max_size, deeper ones only as deepening compositions "
-    "(up to deepen_max_size) or through invented primitives":
+    "(up to deepen_max_size), sparse linear combinations or through invented primitives":
         "mon espace d'hypothèses est borné : programmes jusqu'à max_size, au-delà seulement par approfondissement "
-        "(jusqu'à deepen_max_size) ou via des primitives inventées",
-    "constants are proposed from observed data only; unseen moduli cannot be discovered":
-        "je ne propose des constantes qu'à partir des données : un modulo jamais observé m'échappe",
+        "(jusqu'à deepen_max_size), combinaisons linéaires creuses ou via des primitives inventées",
+    "constants are proposed from observed data only; an unseen modulus is found only for affine modular rules "
+    "(gcd of residue differences)":
+        "je ne propose des constantes qu'à partir des données : un modulo jamais observé n'est retrouvé que pour "
+        "des règles affines modulo (pgcd des écarts de résidus)",
     "search budgets are safety-locked and cannot be raised by self-improvement":
         "mes budgets de recherche sont verrouillés par la sécurité ; je ne peux pas les augmenter moi-même"}
 

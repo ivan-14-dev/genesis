@@ -2,7 +2,8 @@ import random
 
 import pytest
 
-from genesis.adapters import SEQ_VARS, sequence_rollout_probes
+from genesis import library
+from genesis.adapters import SEQ_VARS, sequence_dream, sequence_rollout_probes
 from genesis.expressions import app, const, enumerate_programs, if_eq, var
 from genesis.induction import Hypothesis, InductionConfig, RuleLearner
 
@@ -184,3 +185,66 @@ def test_deepening_learns_size_seven_rules(family, make):
     assert learner.predict(x).value == make(40, terms)
     clone = RuleLearner.from_state(learner.to_state(), learner.cfg, probe_fn=sequence_rollout_probes)
     assert clone.next_deep_n == learner.next_deep_n and clone.predict(x).value == make(40, terms)
+
+
+def test_sequential_test_tolerates_a_burst_above_the_error_threshold():
+    learner = seq_learner()
+    assert learner._sprt_accepts(Hypothesis(var("t"), 0.0, fwd_ok=50, fwd_bad=19))  # 27.5% over a long record
+    assert not learner._sprt_accepts(Hypothesis(var("t"), 0.0, fwd_ok=20, fwd_bad=12))  # 37.5%: no evidence
+    assert not learner._sprt_accepts(Hypothesis(var("t"), 0.0, fwd_ok=9, fwd_bad=0))  # short: fast criterion's job
+    off = RuleLearner("s", SEQ_VARS, InductionConfig(max_size=5, validation_sprt_alpha=0))
+    assert not off._sprt_accepts(Hypothesis(var("t"), 0.0, fwd_ok=500, fwd_bad=170))
+
+
+def test_unobserved_modulus_is_proposed_from_residue_classes():
+    terms = [8]
+    while len(terms) < 30:
+        terms.append((3 * terms[-1] + 2) % 11)  # cycles through 8, 4, 3, 0, 2: 11 is never observed
+    learner = seq_learner()
+    inputs = [{"x[t-1]": terms[t - 1], "x[t-2]": terms[t - 2], "x[t-3]": terms[t - 3], "t": t} for t in range(3, 30)]
+    assert 11 in learner._propose_moduli(inputs, terms[3:])
+    rng = random.Random(0)
+    noise = [rng.randint(-30, 30) for _ in range(30)]
+    assert learner._propose_moduli([{"x[t-1]": noise[t - 1], "x[t-2]": noise[t - 2], "x[t-3]": noise[t - 3],
+                                     "t": t} for t in range(3, 30)], noise[3:]) == set()
+    feed_sequence(learner, terms)
+    assert learner.status() == "validated" and "% 11" in str(learner.best()[0].expr)
+
+
+def test_promising_long_rule_keeps_the_question_open_through_dense_corruption():
+    terms, corrupt = [1, -3, -2], {4: 2, 8: -2, 11: -7, 14: 12}  # no 4 consecutive clean observations early on
+    for t in range(3, 34):
+        terms.append(3 * terms[-1] - 2 * terms[-2] + 5 * t - 1 + corrupt.get(t, 0))
+    learner = seq_learner()
+    history = []
+    for t in range(3, len(terms)):
+        learner.observe({"x[t-1]": terms[t - 1], "x[t-2]": terms[t - 2], "x[t-3]": terms[t - 3], "t": t}, terms[t])
+        history.append(learner.status())
+    assert "unpredictable" in history[:10] and history[-1] == "validated"
+    assert str(learner.best()[0].expr) == "((((x[t-1] * 3) + (t * 5)) - (x[t-2] * 2)) + -1)"
+
+
+def test_recognized_noise_postpones_deeper_searches_but_not_on_rules():
+    lib = library.sleep([], ["add(V,C)", "mul(V,C)"], [], {"sequence": (SEQ_VARS, sequence_dream)}, seed=3)
+    rec = library.Recognizer.from_json(lib["recognizer"])
+
+    def run(terms, learned):
+        learner = RuleLearner("s", SEQ_VARS, InductionConfig(max_size=5), probe_fn=sequence_rollout_probes,
+                              learned_library=learned)
+        feed_sequence(learner, terms)
+        return learner
+
+    rng = random.Random(4)
+    noise = [rng.randint(0, 60) for _ in range(40)]
+    plain, judged = run(noise, None), run(noise, lambda: ([], rec))
+    assert judged.noise_delays >= 1 and judged.deep_searches < plain.deep_searches
+    assert judged.expressions_evaluated < plain.expressions_evaluated
+    assert judged.status() == plain.status() == "unpredictable"
+    clone = RuleLearner.from_state(judged.to_state(), judged.cfg, probe_fn=sequence_rollout_probes)
+    assert clone.noise_delays == judged.noise_delays and clone.next_deep_n == judged.next_deep_n
+    terms = [1, 4, 0]
+    for t in range(3, 40):
+        terms.append(2 * terms[-1] - terms[-2] + 3 * t - 7)
+    learned, alone = run(terms, lambda: ([], rec)), run(terms, None)
+    assert learned.noise_delays == 0 and learned.status() == alone.status() == "validated"
+    assert learned.deep_searches == alone.deep_searches

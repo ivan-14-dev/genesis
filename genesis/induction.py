@@ -39,8 +39,9 @@ import itertools
 
 from .expressions import (Expr, _trivial, app, const, enumerate_programs, fill_shape, if_eq, parse_shape,
                           shape_slots)
-from .library import features as task_features, inline
+from .library import RESERVED, features as task_features, inline
 from .innate import INNATE_CONSTANTS, VALUE_LIMIT
+from .linear import dense_windows, linear_rules
 from .search import match_shape, search_programs
 
 
@@ -60,7 +61,17 @@ class InductionConfig:
     # Forward-prediction error rate still compatible with "the rule is right, the world is noisy". Errors must
     # also be unstructured (see RuleLearner._structured_errors), so a systematic misfit is never validated.
     validation_max_error: float = 0.25
-    max_mismatch_frac: float = 0.4
+    # ... or, when the observed rate drifts above it (a burst of corruption), Wald's sequential test between "errs
+    # at validation_max_error" and "errs at sprt_null_error" (a rule no better than a coin) must accept the former
+    # at level validation_sprt_alpha: a long forward record can carry a few more errors. 0 disables the test.
+    validation_sprt_alpha: float = 0.01
+    sprt_null_error: float = 0.5
+    # A rule survives while it is right at least as often as wrong (far beyond the chance agreement of noise):
+    # bursts of corruption well above the world's nominal rate then pause it instead of refuting it.
+    max_mismatch_frac: float = 0.5
+    # New rules are proposed only with fewer mismatches: a wider search tolerance floods every search on noisy
+    # data with half-right candidates (4x the CPU on deeper worlds with 10% noise) for no measured gain.
+    search_mismatch_frac: float = 0.4
     # Deepening (genesis.search): when no enumerated rule mispredicts at most deepen_below * n observations,
     # look for rules of deepen_size nodes by meet-in-the-middle, within the same candidate budget.
     deepen_size: int = 7
@@ -71,6 +82,21 @@ class InductionConfig:
     deepen_window: int = 4
     deepen_windows: int = 8
     deepen_growth: float = 0.5   # after a deep search at n, the next one waits until n * (1 + deepen_growth)
+    # When the recognition model learned during sleep judges the series rule-less with at least this probability
+    # (after noise_min_n observations), a due deep search (deep, linear and invention stages) is postponed by
+    # noise_deepen_growth * n observations: deeper searches are delayed on likely noise, never forbidden.
+    noise_recognition: float = 0.9
+    noise_min_n: int = 10
+    noise_deepen_growth: float = 1.0
+    # Exact sparse linear induction (genesis.linear), on the deepening schedule: y = a1*f1 + ... + ak*fk + c over
+    # the perceived variables and their pairwise products (at most one per rule), with k <= linear_terms and
+    # small integer coefficients, solved exactly on the deepening windows. 0 disables it.
+    linear_terms: int = 4
+    linear_products: bool = True
+    linear_max_coef: int = 16
+    linear_min_support: int = 3  # observations a solution must explain beyond those it was solved on
+    linear_spare: int = 1  # rows to spare per window: solve on every k of k + spare rows (steps over corruption)
+    linear_windows: int = 4
     unpredictable_min_n: int = 8
     max_backoff: int = 8
     shape_bias: float = 1.0
@@ -162,6 +188,9 @@ class RuleLearner:
         self.full_searches = 0
         self.deep_searches = 0
         self.next_deep_n = 0
+        self.linear_searches = 0
+        self.linear_hits = 0
+        self.noise_delays = 0
         # probe_fn generates the inputs on which behavioural equivalence is judged.
         # Default: independent random values (appropriate when the agent can intervene).
         self.probe_fn = probe_fn
@@ -183,58 +212,114 @@ class RuleLearner:
         self._probes: list = []
         self._status = "unknown"
         self.last_search: dict = {}
+        # Memos of posterior(), best() and predict(), valid while the posterior is unchanged (same object).
+        self._post_memo: Optional[tuple] = None
+        self._best_memo: Optional[tuple] = None
+        self._pred_memo: Optional[tuple] = None
 
     # ------------------------------------------------------------------ beliefs
     def posterior(self) -> tuple:
+        """``(((hypothesis, probability), ...) most probable first, p_null)``, memoised: it is asked for many
+        times between two observations. The memo holds the hypotheses themselves, so their ids stay unique."""
         cfg = self.cfg
         n = len(self.data)
+        key = (n, cfg.noise, cfg.outcome_range, cfg.null_prior,
+               tuple((id(h), h.n_ok, h.n_bad, h.log_prior) for h in self.hyps))
+        memo = self._post_memo
+        if memo is not None and memo[0] == key:
+            return memo[2]
+        out = self._posterior(n)
+        self._post_memo = (key, tuple(self.hyps), out)
+        return out
+
+    def _posterior(self, n: int) -> tuple:
+        cfg = self.cfg
         l_ok = math.log(1 - cfg.noise)
         l_bad = math.log(cfg.noise / cfg.outcome_range)
         null = math.log(cfg.null_prior) + n * math.log(1 / cfg.outcome_range)
         scores = [math.log(1 - cfg.null_prior) + h.log_prior + h.n_ok * l_ok + h.n_bad * l_bad for h in self.hyps]
         z = _logsumexp(scores + [null])
-        post = sorted(((h, math.exp(s - z)) for h, s in zip(self.hyps, scores)), key=lambda t: -t[1])
+        post = tuple(sorted(((h, math.exp(s - z)) for h, s in zip(self.hyps, scores)), key=lambda t: -t[1]))
         return post, math.exp(null - z)
 
     def best(self) -> tuple:
         """(top hypothesis, mass of its behavioural equivalence class, p_null)."""
-        post, p_null = self.posterior()
+        result = self.posterior()
+        memo = self._best_memo
+        if memo is not None and memo[0] is result:
+            return memo[1]
+        post, p_null = result
         if not post:
-            return None, 0.0, p_null
-        top = post[0][0]
-        mass = sum(p for h, p in post if h.probe_sig == top.probe_sig)
-        return top, mass, p_null
+            out = (None, 0.0, p_null)
+        else:
+            top = post[0][0]
+            out = (top, sum(p for h, p in post if h.probe_sig == top.probe_sig), p_null)
+        self._best_memo = (result, out)
+        return out
 
     def predict(self, inputs: dict) -> Prediction:
-        post, p_null = self.posterior()
+        result = self.posterior()
+        try:
+            key = tuple(sorted(inputs.items()))
+        except TypeError:
+            key = None
+        memo = self._pred_memo
+        if key is not None and memo is not None and memo[0] is result and memo[1] == key:
+            return memo[2]
+        post, p_null = result
         dist: dict = defaultdict(float)
+        values = []
         for h, p in post:
             v = h.expr.evaluate(inputs, True)
+            values.append(v)
             if v is None:
                 p_null += p
             else:
                 dist[v] += p
         ranked = sorted(dist.items(), key=lambda t: -t[1])
         if not ranked:
-            return Prediction(None, 0.0, p_null, [], None)
-        value = ranked[0][0]
-        top = next((str(h.expr) for h, _ in post if h.expr.evaluate(inputs, True) == value), None)
-        return Prediction(value, ranked[0][1], p_null, ranked, top)
+            pred = Prediction(None, 0.0, p_null, [], None)
+        else:
+            value = ranked[0][0]
+            top = next((str(h.expr) for (h, _), v in zip(post, values) if v == value), None)
+            pred = Prediction(value, ranked[0][1], p_null, ranked, top)
+        if key is not None:
+            self._pred_memo = (result, key, pred)
+        return pred
 
     def status(self) -> str:
         if not self.data:
             return "unknown"
         top, mass, p_null = self.best()
-        if p_null >= 0.9 and len(self.data) >= self.cfg.unpredictable_min_n:
+        if p_null >= 0.9 and len(self.data) >= self.cfg.unpredictable_min_n and not self._promising(top):
             return "unpredictable"
         if top is not None:
             fwd = top.fwd_ok + top.fwd_bad
             if (mass >= self.cfg.validation_posterior and top.fwd_ok >= self.cfg.validation_k
-                    and top.fwd_bad <= int(self.cfg.validation_max_error * fwd) and not self._structured_errors(top)):
+                    and (top.fwd_bad <= int(self.cfg.validation_max_error * fwd) or self._sprt_accepts(top))
+                    and not self._structured_errors(top)):
                 return "validated"
             if mass >= 0.5:
                 return "candidate"
         return "unknown"
+
+    def _promising(self, h: Optional[Hypothesis]) -> bool:
+        """A surviving rule that predicted the future far better than chance (at least two forward successes, more
+        successes than failures) keeps the question open, even while the null still dominates the posterior: a
+        long rule pays its Occam prior back only over several more observations, and judging the stream
+        unpredictable now would withdraw the attention that would decide it. Noise almost never yields one (each
+        forward success is a 1 / outcome_range coincidence)."""
+        return h is not None and h.fwd_ok >= 2 and h.fwd_ok > h.fwd_bad
+
+    def _sprt_accepts(self, h: Hypothesis) -> bool:
+        """Wald's log-likelihood ratio of the forward record under "errs at validation_max_error" against "errs at
+        sprt_null_error" reaches log(1 / validation_sprt_alpha). Its drift is positive only below an error rate of
+        about 37% (with the defaults), and the record grows with every forward prediction."""
+        alpha, p1, p0 = self.cfg.validation_sprt_alpha, self.cfg.validation_max_error, self.cfg.sprt_null_error
+        if alpha <= 0 or not 0 < p1 < p0 < 1:
+            return False
+        llr = h.fwd_ok * math.log((1 - p1) / (1 - p0)) + h.fwd_bad * math.log(p1 / p0)
+        return llr >= math.log(1 / alpha)
 
     def _structured_errors(self, h: Hypothesis) -> bool:
         """Noise is unstructured: when most of a rule's errors share one residual (a missed wrap-around, an
@@ -251,8 +336,9 @@ class RuleLearner:
         return residuals.most_common(1)[0][1] > max(1, sum(residuals.values()) // 2)
 
     # ----------------------------------------------------------------- learning
-    def _tol(self, n: int) -> int:
-        return int(self.cfg.max_mismatch_frac * n) if n >= 5 else 0
+    def _tol(self, n: int, search: bool = False) -> int:
+        frac = min(self.cfg.search_mismatch_frac, self.cfg.max_mismatch_frac) if search else self.cfg.max_mismatch_frac
+        return int(frac * n) if n >= 5 else 0
 
     def observe(self, inputs: dict, y: int, episode_id: Optional[int] = None,
                 provenance: str = "observation") -> LearnResult:
@@ -320,7 +406,37 @@ class RuleLearner:
         if ys:
             # Perceived range: candidate modulus. The few largest values guard against one corrupted maximum.
             consts |= {v + 1 for v in sorted(set(ys))[-3:]}
-        return consts
+        return consts | self._propose_moduli(inputs, ys)
+
+    def _propose_moduli(self, inputs: list, ys: list, max_moduli: int = 2) -> set:
+        """Moduli that are never observed: y = (a * x + c) % m keeps every y - a * x in one residue class, so the
+        differences of y - a * x over a few consecutive observations are multiples of m, and their gcd reveals it
+        (with c, the common residue), although m exceeds every observed value. Multipliers are the innate small
+        constants; a modulus must exceed the outputs of its window and recur in at least two windows (one corrupted
+        observation spoils only the windows containing it), and at most ``max_moduli`` are proposed."""
+        n = len(ys)
+        if n < 6:
+            return set()
+        support: Counter = Counter()
+        offsets: dict = defaultdict(Counter)
+        for v in self.var_names:
+            xs = [inp.get(v) for inp in inputs]
+            for a in sorted(c for c in INNATE_CONSTANTS if c > 0):
+                for w in dense_windows(n, 5, 8):
+                    if any(xs[i] is None for i in w):
+                        continue
+                    r = [ys[i] - a * xs[i] for i in w]
+                    g = 0
+                    for x in r[1:]:
+                        g = math.gcd(g, x - r[0])
+                    if g >= 2 and max(ys[i] for i in w) < g <= 10**6:
+                        support[g] += 1
+                        offsets[g][r[0] % g] += 1
+        out = set()
+        for g, k in sorted(support.items(), key=lambda t: (-t[1], t[0]))[:max_moduli]:
+            if k >= 2:
+                out |= {g, offsets[g].most_common(1)[0][0]}
+        return out
 
     def _make_probes(self) -> None:
         if self.probe_fn is not None and self.hyps:
@@ -349,7 +465,7 @@ class RuleLearner:
             self.backoff = 1
         t0 = time.perf_counter()
         n = len(self.data)
-        tol = self._tol(n)
+        tol = self._tol(n, search=True)
         # The search kernels use bounded arithmetic; beliefs are exact. Observations beyond VALUE_LIMIT (a
         # geometric stream past 10^18) are left out of the search and every proposal is re-scored on them
         # exactly, so a rule found on the in-range data keeps its evidence instead of being refuted by overflow.
@@ -466,8 +582,39 @@ class RuleLearner:
         cfg = self.cfg
         n = len(self.data)
         deepen = cfg.deepen_size > cfg.max_size and n >= max(cfg.deepen_min_n, self.next_deep_n)
+        if deepen and self._likely_noise():
+            # The series looks rule-less to the recognition model learned during sleep: the deeper searches (deep,
+            # linear, inventions) are postponed, never forbidden.
+            deepen = False
+            self.noise_delays += 1
+            self.next_deep_n = n + max(1, int(n * cfg.noise_deepen_growth))
         deepen_bad = int(cfg.deepen_below * len(ys)) if deepen else -1
-        found, counts, deep_ran = self._search(inputs, ys, tol, consts, {}, deepen_bad)
+        top = self.best()[0] if deepen else None
+        if top is not None and top.n_bad and self._structured_errors(top):
+            # The best rule is known to be incomplete (its errors share one residual: a missed cycle, a wrap-around):
+            # it must not stop the search for a deeper rule that explains more, however few its errors are.
+            deepen_bad = min(deepen_bad, top.n_bad - 1)
+        if deepen and cfg.linear_terms:
+            # Linear rules are solved for, not enumerated, as the first way of looking deeper: only when the
+            # enumerated rules leave more than deepen_bad observations unexplained (when the kernel would deepen).
+            # When a linear rule explains the data that well, the kernel's deepening phase (by far the most
+            # expensive part) only looks for shorter rules (t * (t + 3) is shorter than t * t + 3 * t, and Occam
+            # must be able to see it); otherwise the search runs exactly as without the solver.
+            found, counts, _ = self._search(inputs, ys, tol, consts, {}, -1)
+            deep_ran = min((bad for _, bad, _ in found), default=len(ys) + 1) > deepen_bad
+            if deep_ran:
+                lin = self._linear(inputs, ys, tol, consts)
+                hit = min((e.size for e, bad, _ in lin if bad <= deepen_bad), default=0)
+                if hit:
+                    self.linear_hits += 1
+                    if hit - 2 >= cfg.deepen_size:
+                        found, counts, _ = self._search(inputs, ys, tol, consts, {}, deepen_bad,
+                                                        min(hit - 2, cfg.deepen_max_size))
+                else:
+                    found, counts, deep_ran = self._search(inputs, ys, tol, consts, {}, deepen_bad)
+                found += lin
+        else:
+            found, counts, deep_ran = self._search(inputs, ys, tol, consts, {}, deepen_bad)
         # Second stage, only when the innate language found nothing that fits: the same search over a language
         # extended with the invented primitives. Problems the innate language solves cost exactly what they did,
         # and the stage follows the deepening schedule (it is one more way of looking deeper). Its deepening stops
@@ -490,6 +637,19 @@ class RuleLearner:
                                         cfg.max_seconds)
             found += self._conditionals(blocks, counts, inputs, ys)
         return found
+
+    def _linear(self, inputs: list, ys: tuple, tol: int, consts: set) -> list:
+        """Exact sparse linear rules (genesis.linear) with the Occam prior of their size."""
+        cfg = self.cfg
+        n = len(ys)
+        rules, solved = linear_rules(inputs, ys, self.var_names,
+                                     lambda length: dense_windows(n, max(length, cfg.deepen_window), cfg.linear_windows),
+                                     tol, cfg.linear_terms, cfg.linear_products, cfg.linear_max_coef,
+                                     min_support=cfg.linear_min_support, spare=cfg.linear_spare)
+        self.linear_searches += 1
+        self.expressions_evaluated += solved
+        n_leaves = len(self.var_names) + len(consts)
+        return [(e, bad, self._approx_prior(e, n_leaves)) for e, bad in rules]
 
     def _search(self, inputs: list, ys: tuple, tol: int, consts: set, defs: dict, deepen_bad: int,
                 deep_max_size: int = 0) -> tuple:
@@ -517,6 +677,13 @@ class RuleLearner:
             found = [(inline(e, defs), bad, lp) for e, bad, lp in found]
         return found, sr.counts, sr.deep_ran
 
+    def _likely_noise(self) -> bool:
+        rec = self.learned_library()[1] if self.learned_library is not None else None
+        if rec is None or len(self.data) < self.cfg.noise_min_n:
+            return False
+        p = rec.p_noise(task_features([y for _, y in self.data]))
+        return p is not None and p >= self.cfg.noise_recognition
+
     def _recognition(self) -> Callable[[str], float]:
         """Task-conditional prior from the recognition model: how much more plausible than uniform each familiar
         shape is for the observations at hand (never negative, zero for unfamiliar shapes)."""
@@ -524,7 +691,9 @@ class RuleLearner:
         if rec is None or not rec.totals:
             return lambda shape: 0.0
         feats = task_features([y for _, y in self.data])
-        scores = {s: rec.log_score(s, feats) for s in rec.totals}
+        scores = {s: rec.log_score(s, feats) for s in rec.totals if s not in RESERVED}
+        if not scores:
+            return lambda shape: 0.0
         z = _logsumexp(list(scores.values()))
         floor = -math.log(len(scores))
         return lambda shape: max(0.0, scores[shape] - z - floor) if shape in scores else 0.0
@@ -563,6 +732,7 @@ class RuleLearner:
         self._make_probes()
         for h in self.hyps:
             h.probe_sig = self._probe_sig(h.expr)
+        self._best_memo = None  # equivalence classes follow the new probes
 
     def _conditionals(self, en, counts: dict, inputs: list, ys: tuple) -> list:
         """``if q == c then e1 else e0`` from small blocks. Each branch takes its exact blocks when there are
@@ -613,7 +783,7 @@ class RuleLearner:
                     return exact
         if exact:
             return exact
-        tol = max(self._tol(size), 1 if size >= 3 else 0)
+        tol = max(self._tol(size, search=True), 1 if size >= 3 else 0)
         if not tol:
             return []
         scored = ((bad, i) for i, (_, miss) in enumerate(blocks) if (bad := (miss & mask).bit_count()) <= tol)
@@ -630,6 +800,8 @@ class RuleLearner:
             "library_searches": self.library_searches, "full_searches": self.full_searches,
             "deep_searches": self.deep_searches, "next_deep_n": self.next_deep_n,
             "invention_searches": self.invention_searches, "invention_hits": self.invention_hits,
+            "linear_searches": self.linear_searches, "linear_hits": self.linear_hits,
+            "noise_delays": self.noise_delays,
         }
 
     @classmethod
@@ -645,6 +817,9 @@ class RuleLearner:
         lr.full_searches = state.get("full_searches", 0)
         lr.deep_searches = state.get("deep_searches", 0)
         lr.next_deep_n = state.get("next_deep_n", 0)
+        lr.linear_searches = state.get("linear_searches", 0)
+        lr.linear_hits = state.get("linear_hits", 0)
+        lr.noise_delays = state.get("noise_delays", 0)
         lr.data = [(dict(d), y) for d, y in state["data"]]
         lr.episodes = list(state["episodes"])
         lr.provenance = list(state["provenance"])
@@ -660,4 +835,5 @@ class RuleLearner:
         lr._make_probes()
         for h in lr.hyps:
             h.probe_sig = lr._probe_sig(h.expr)
+        lr._best_memo = None
         return lr

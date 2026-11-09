@@ -195,19 +195,39 @@ def features(ys: list) -> frozenset:
         out.add("negative")
     if len(set(ys)) <= max(2, n // 3):
         out.add("few-values")
-    if max(ys) - min(ys) < 16:
+    k = -(-3 * n // 4)
+    s = sorted(ys)
+    if min(s[i + k - 1] - s[i] for i in range(n - k + 1)) < 16:  # three quarters of the values in a narrow band
         out.add("bounded")
     if len(d1) >= 3 and most(a * b < 0 for a, b in zip(d1, d1[1:])):
         out.add("alternating")
+    # Rarely true of rule-less series: they separate the NOISE class from structured series without a growth or
+    # period signature (lag-2 steps, slow recurrences).
+    if len(d1) >= 3 and (most(x > 0 for x in d1) or most(x < 0 for x in d1)):
+        out.add("monotone")
+    if len(d1) >= 3 and len(set(d1)) <= max(2, len(d1) // 3):
+        out.add("d1-few-values")
+    if len(d1) >= 3 and most(4 * abs(x) <= max(ys) - min(ys) for x in d1):
+        out.add("smooth")
     return frozenset(out)
 
 
 FEATURES = ("d0-constant", "d1-constant", "d2-constant", "period-2", "period-3", "ratio-growth", "fast-growth",
-            "accelerating", "negative", "few-values", "bounded", "alternating")
+            "accelerating", "negative", "few-values", "bounded", "alternating", "monotone", "d1-few-values",
+            "smooth")
+
+
+# Reserved recognizer classes, never shapes. NOISE: series without a rule, dreamt as random draws. PROGRAM: "some
+# rule of the base language", dreamt from random programs; without it, any unfamiliar rule would look like noise.
+NOISE = "~noise"
+PROGRAM = "~program"
+RESERVED = (NOISE, PROGRAM)
+_FEATURES_KEY = "~features"  # in the dream cache: the feature set its statistics were computed with
 
 
 class Recognizer:
-    """Bernoulli naive Bayes ``q(shape | features)`` with Laplace smoothing; deterministic and inspectable."""
+    """Bernoulli naive Bayes ``q(shape | features)`` with Laplace smoothing; deterministic and inspectable. Besides
+    shapes, it may hold the :data:`NOISE` class (series without a rule)."""
 
     def __init__(self, counts: Optional[dict] = None, totals: Optional[dict] = None):
         self.counts = counts or {}  # shape -> {feature: n}
@@ -231,6 +251,16 @@ class Recognizer:
             p = (c.get(f, 0) + 1) / (n + 2)
             s += math.log(p if f in feats else 1 - p)
         return s
+
+    def p_noise(self, feats: frozenset) -> Optional[float]:
+        """Posterior probability that the series is rule-less, against every known shape and a generic program;
+        None unless both reserved classes were learned."""
+        if NOISE not in self.totals or PROGRAM not in self.totals:
+            return None
+        scores = [self.log_score(s, feats) for s in sorted(self.totals)]
+        m = max(scores)
+        z = m + math.log(sum(math.exp(x - m) for x in scores))
+        return math.exp(self.log_score(NOISE, feats) - z)
 
     def rank(self, shapes: list, feats: frozenset) -> list:
         """``shapes`` reordered by recognition score; unknown shapes keep their order after the known ones."""
@@ -271,18 +301,51 @@ def dream(shapes: list, var_names: list, rollout: Callable, seed: int, per_shape
     return out
 
 
+def dream_noise(seed: int, n: int = 32, length: int = 16, widths: tuple = (50, 200)) -> list:
+    """Rule-less fantasies: uniform draws over a random range of about the learner's null-model width
+    (``InductionConfig.outcome_range``), as ``(NOISE, features)`` training examples."""
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        lo, width = rng.randint(-60, 60), rng.randint(*widths)
+        out.append((NOISE, features([rng.randint(lo, lo + width) for _ in range(length)])))
+    return out
+
+
+def _random_shape(rng: random.Random, size: int) -> str:
+    if size <= 1:
+        return rng.choice("VVC")
+    left = rng.randrange(1, size - 1, 2)
+    op = rng.choice(("add", "add", "sub", "mul", "mul", "mod"))
+    return f"{op}({_random_shape(rng, left)},{_random_shape(rng, size - 1 - left)})"
+
+
+def dream_programs(var_names: list, rollout: Callable, seed: int, n: int = 64, sizes=(3, 5, 7, 9, 11)) -> list:
+    """Fantasies of random programs of the base language (not only the shapes known so far), as ``(PROGRAM,
+    features)`` training examples: the recognizer's model of a rule it does not know yet."""
+    rng = random.Random(seed)
+    out = []
+    tries = 0
+    while len(out) < n and tries < 20 * n:
+        tries += 1
+        shape = _random_shape(rng, rng.choice(sizes))
+        if "V" in shape:
+            out.extend((PROGRAM, f) for _, f in dream([shape], var_names, rollout, rng.randrange(2 ** 31), 1))
+    return out
+
+
 def sleep(rules: list, shapes: list, replays: list, dream_domains: dict, seed: int,
           dreamt: Optional[dict] = None) -> dict:
     """One sleep phase. ``rules``: ``(problem key, validated Expr)``; ``shapes``: validated shapes, most successful
     first; ``replays``: ``(shape, ys)`` of real validated problems; ``dream_domains``: ``{name: (var_names,
     rollout)}``. Each shape is dreamt with its own seed, so its dreams never change: ``dreamt`` (the ``"dreamt"``
-    entry of the previous library) holds their statistics and only new shapes are dreamt. Returns the
-    JSON-serialisable library."""
+    entry of the previous library) holds their statistics and only new shapes are dreamt; statistics computed
+    with another feature set are discarded. Returns the JSON-serialisable library."""
     inventions = promote(rules)
     rec = Recognizer()
     rec.train((shape, features(ys)) for shape, ys in replays)
-    known = dict(dreamt or {})
-    out_dreamt = {}
+    known = dict(dreamt or {}) if (dreamt or {}).get(_FEATURES_KEY) == list(FEATURES) else {}
+    out_dreamt = {_FEATURES_KEY: list(FEATURES)}
     for i, (name, (names, rollout)) in enumerate(sorted(dream_domains.items())):
         for shape in shapes:
             if "if_eq" in shape:
@@ -299,8 +362,28 @@ def sleep(rules: list, shapes: list, replays: list, dream_domains: dict, seed: i
                 c = rec.counts.setdefault(shape, {})
                 for f, k in sorted(stats["counts"].items()):
                     c[f] = c.get(f, 0) + k
+    if rec.totals:
+        # What a series without a rule looks like, against the known shapes and any program (Recognizer.p_noise).
+        reserved = [(NOISE, lambda: dream_noise(seed * 1013 + 1))]
+        for i, (name, (names, rollout)) in enumerate(sorted(dream_domains.items())):
+            reserved.append((f"{name}/{PROGRAM}", lambda names=names, rollout=rollout, i=i:
+                             dream_programs(names, rollout, seed * 1013 + 2 + i)))
+        for key, make in reserved:
+            stats = known.get(key)
+            if stats is None:
+                d = Recognizer()
+                d.train(make())
+                cls = next(iter(d.totals))
+                stats = {"n": d.totals[cls], "counts": d.counts[cls]}
+            out_dreamt[key] = stats
+            cls = key.rsplit("/", 1)[-1]
+            rec.totals[cls] = rec.totals.get(cls, 0) + stats["n"]
+            c = rec.counts.setdefault(cls, {})
+            for f, k in sorted(stats["counts"].items()):
+                c[f] = c.get(f, 0) + k
     return {"inventions": [inv.to_json() for inv in inventions], "recognizer": rec.to_json(),
-            "dreams": sum(st["n"] for st in out_dreamt.values()), "dreamt": out_dreamt, "replays": len(replays),
+            "dreams": sum(st["n"] for k, st in out_dreamt.items() if k != _FEATURES_KEY), "dreamt": out_dreamt,
+            "replays": len(replays),
             "corpus": len(rules)}
 
 

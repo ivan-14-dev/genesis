@@ -337,28 +337,30 @@ or refuted it (`inspect --explain`).
 ## Headline results (10 held-out seeds, see docs/RESULTS.md)
 
 - Sequences: 100% extrapolation accuracy on hidden rules (baselines 7.6% / 17%); 20/20 noise streams judged
-  unpredictable, 0 false validations; 0.32 s CPU per seed (8.6× less than v0.2.0, C search kernel).
-- Robustness: with 10% corrupted observations, 100% of rule streams validated; with 20%, 92.5% (85% in v0.3.0;
-  100% accuracy of validated rules; beliefs use exact integers, so geometric streams no longer overflow).
-  7-node rules: 98.75% validated with deepening vs 37.5% without; 9-node rules: 100% vs 36% without the 9-node
-  level (94% with 10% noise). 0 false validations on noise in every condition.
+  unpredictable, 0 false validations; 0.22 s CPU per seed (12× less than v0.2.0, C search kernel).
+- Robustness: with 10% corrupted observations, 100% of rule streams validated; with 20%, 98.75% (100% accuracy
+  of validated rules; beliefs use exact integers, so geometric streams no longer overflow). 7-node rules: 100%
+  validated with deepening vs 37.5% without; 9-node rules: 100% (also with 10% noise) vs 36% without the 9-node
+  level and the linear solver; 11- and 13-node linear rules: 100% (also with 10% noise) vs 11% without the
+  exact linear solver. 0 false validations on noise in every condition.
 - Causal world: 0% → 100% held-out accuracy; 100% on out-of-range values (tabular baseline 46%); confounded
   causes found 0% by watching vs 100% after experiments; curiosity needs 24.5 experiments vs 51.7 for random.
   With 5%, 10% or 20% of experiment outcomes corrupted, still 100% held-out accuracy and 18/18 confounded causes
   found, never a wrong cause validated (noise-tolerant conditionals).
 - Memory: retention 1.0 across sessions, forgetting 0.0 after a second world. Planning: 100% vs 78.5% random.
 - Tight budget (60 observations): curiosity with budget-aware focus validates 60% of rule streams (random 24%,
-  round-robin 0%). Remembered rule shapes cut search 16.5×; on 7-node worlds they also cut observations to
-  validation by 25% (11.6 → 8.8).
+  round-robin 0%). Remembered rule shapes cut search 16×; on 7-node worlds they also cut observations to
+  validation by 25% (11.6 → 8.6).
 - Library learning (wake-sleep): sub-programs promoted to invented primitives during sleep let a learner limited
-  to 7-node searches learn later 9-node worlds (late rule streams validated 33% → 100%).
+  to 7-node searches learn later 9-node worlds (late rule streams validated 33% → 100%, linear solver off).
 - Stage 6: learning-progress allocation beats round-robin at budget 150 (0.849 vs 0.792, half the noise) and
   stops itself at 300 with equal knowledge.
 - Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.702 vs 0.723); on standard
   worlds remembered shapes do not reduce observations to validation; curiosity spends slightly more on noise and
-  only ties round-robin at budget 100; the 9-node level and library learning cost CPU where they do not help
-  (0.23 → 0.32 s per seed on stage 1, about +20% for the library), and the recognition model's effect on
-  observations is marginal; stage 7 finds no variant that survives holdout, and most tunable parameters have no
+  only ties round-robin at budget 100; on 7-node worlds remembered shapes now cost CPU (+25%) because the
+  linear solver made the learner without memory cheaper; a modular counter with 45% of its observations
+  corrupted stays unvalidated; the recognition model's effect on observations is marginal (it postpones deep
+  searches on series that look like noise: −8 to −11% expressions evaluated, same validation); stage 7 finds no variant that survives holdout, and most tunable parameters have no
   effect.
 
 ## Layout
@@ -368,7 +370,8 @@ genesis/
   innate.py          innate primitives, constants, frozen safety policy, manifest
   expressions.py     program representation + enumeration
   induction.py       learning engine: online Bayesian program induction (noise-tolerant, exact beliefs,
-                     deepening to 9 nodes, noisy conditionals, invented primitives)
+                     deepening to 9 nodes, noisy conditionals, invented primitives, sequential validation)
+  linear.py          exact sparse linear induction (fraction-free Gauss-Jordan on short windows)
   search.py          program search: Python reference + C kernel (_search.c), iterative meet-in-the-middle
                      deepening, shape instantiation
   native.py          hardened local compilation/loading of the C kernels (private cache, digest-checked)
@@ -379,6 +382,7 @@ genesis/
   metacognition.py   calibration, learning progress, developmental curriculum gates
   consolidation.py   sleep-like replay, refutation, generalisation, causal vs spurious associations
   library.py         wake-sleep library learning: invented primitives (MDL), dreams, recognition model
+                     (with reserved noise / random-program classes)
   adapters.py        bridges between the cognitive cycle and each environment
   agent.py           the 12-step cognitive cycle, persistence, planning
   environments/      sandbox + SequenceWorld + CausalWorld + ObjectWorld (hidden rules)
@@ -417,5 +421,5 @@ never touches the safety policy or deploys without a human. The in-house languag
 as the approved corpus; it predicts text, it does not reason, and its output is never treated as knowledge.
 Governance assumes the admin key stays secret and the host is trusted: someone with write access to the DB can
 still delete data (detected by `audit verify`, not prevented) and delete seals, so keep the last sealed head hash
-outside the DB. Limitations and next steps (rules beyond 9 nodes, the CPU cost of library learning, probabilistic
+outside the DB. Limitations and next steps (non-linear rules beyond 9 nodes, the coarse noise recognizer, probabilistic
 transitions, neural perception) are listed in `docs/ARCHITECTURE.md`.

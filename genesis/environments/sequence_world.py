@@ -9,7 +9,8 @@ Optional harder settings (defaults leave the original world unchanged):
 * ``noise``: probability that a rule stream emits a corrupted term. The corruption is an *innovation*: the
   generator continues from the corrupted value, so the rule stays exact on every other term.
 * ``families``: generator families to sample from, e.g. :data:`DEEP_FAMILIES`, whose shortest rules have
-  seven nodes (beyond the default size-5 hypothesis space), or :data:`DEEPER_FAMILIES` (nine nodes).
+  seven nodes (beyond the default size-5 hypothesis space), :data:`DEEPER_FAMILIES` (nine nodes) or
+  :data:`DEEPEST_FAMILIES` (eleven and thirteen nodes).
 """
 
 from __future__ import annotations
@@ -103,6 +104,29 @@ def _doubling_index(rng):
 
 
 DEEPER_FAMILIES = [_weighted_recurrence, _doubling_index]
+
+
+def _third_order_drift(rng):
+    k, c = rng.choice([2, 3, -3]), rng.choice([v for v in range(-5, 6) if v])
+    return {"family": "third-order-drift", "start": [rng.randint(-5, 5) for _ in range(3)],
+            "step": lambda h, t: h[-1] - h[-2] + h[-3] + k * t + c}
+
+
+def _weighted_drift(rng):
+    k, c = rng.choice([3, -3, 5]), rng.choice([v for v in range(-5, 6) if v])
+    return {"family": "weighted-drift", "start": [rng.randint(-5, 5), rng.randint(-5, 5)],
+            "step": lambda h, t: 3 * h[-1] - 2 * h[-2] + k * t + c}
+
+
+def _quadratic_forcing(rng):
+    c = rng.choice([v for v in range(-5, 6) if v])
+    return {"family": "quadratic-forcing", "start": [rng.randint(-5, 5), rng.randint(-5, 5)],
+            "step": lambda h, t: 2 * h[-1] - h[-2] + t * t + c}
+
+
+# Shortest rules of 11 nodes (third-order-drift, quadratic-forcing) and 13 nodes (weighted-drift), also over
+# x[t-3]: e.g. 2x[t-1] - x[t-2] + kt + c would not do, it equals 3(x[t-1] - x[t-2]) + x[t-3] + k (9 nodes).
+DEEPEST_FAMILIES = [_third_order_drift, _weighted_drift, _quadratic_forcing]
 
 
 class SequenceWorld:

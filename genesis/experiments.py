@@ -18,7 +18,7 @@ from .adapters import LabAdapter, SequenceAdapter
 from .agent import Genesis
 from .autonomy import Explorer
 from .environments import CausalWorld, SequenceWorld, sandboxed
-from .environments.sequence_world import DEEP_FAMILIES, DEEPER_FAMILIES
+from .environments.sequence_world import DEEP_FAMILIES, DEEPER_FAMILIES, DEEPEST_FAMILIES
 
 
 @contextmanager
@@ -103,6 +103,7 @@ def run_sequence_benchmark(seed: int, budget: int = 400, strategy: str = "curios
                    cpu_seconds=round(time.process_time() - t0, 3),
                    expressions_evaluated=sum(lr.expressions_evaluated for lr in agent.learners.values()),
                    deep_searches=sum(getattr(lr, "deep_searches", 0) for lr in agent.learners.values()),
+                   linear_hits=sum(getattr(lr, "linear_hits", 0) for lr in agent.learners.values()),
                    corrupted_observations=sum(world.corrupted.values()),
                    calibration=agent.metacog.calibration(), memory_bytes=agent.ltm.size_bytes())
         agent.ltm.close()
@@ -120,7 +121,11 @@ ROBUSTNESS_CONDITIONS = {
     "deep_without_deepening": ({"families": DEEP_FAMILIES}, {"sequence.deepen_size": 0}),
     "deeper": ({"families": DEEPER_FAMILIES}, {}),
     "deeper_noise_10": ({"families": DEEPER_FAMILIES, "noise": 0.1}, {}),
-    "deeper_without_nine": ({"families": DEEPER_FAMILIES}, {"sequence.deepen_max_size": 7}),
+    "deeper_without_nine": ({"families": DEEPER_FAMILIES}, {"sequence.deepen_max_size": 7,
+                                                             "sequence.linear_terms": 0}),
+    "deepest": ({"families": DEEPEST_FAMILIES}, {}),
+    "deepest_noise_10": ({"families": DEEPEST_FAMILIES, "noise": 0.1}, {}),
+    "deepest_without_linear": ({"families": DEEPEST_FAMILIES}, {"sequence.linear_terms": 0}),
 }
 
 
@@ -409,21 +414,24 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
 def run_library_curriculum(seeds, n_worlds: int = 6, budgets=(7, 9)) -> dict:
     """Library learning (sleep-time abstraction + dreaming) on a curriculum: worlds of 7-node rules, then worlds
     of 9-node rules. With a 7-node search budget the late rules are out of reach of the base language; inventions
-    learned on the early worlds can bring them within reach. With the 9-node budget it measures the cost."""
+    learned on the early worlds can bring them within reach. With the 9-node budget it measures the cost.
+    The late rules are linear, so the exact linear solver (genesis.linear) also reaches them: it is switched off
+    to isolate what the library contributes, and one extra row shows the solver alone."""
     half = n_worlds // 2
     curriculum = [{"families": DEEP_FAMILIES}] * half + [{"families": DEEPER_FAMILIES}] * (n_worlds - half)
     out = {}
-    for budget in budgets:
-        for on in (True, False):
-            runs = [run_procedural_transfer(s, curriculum=curriculum, library_learning=on,
-                                            overrides={"sequence.deepen_max_size": budget}) for s in seeds]
-            out[f"deepen_max_{budget}/library_{'on' if on else 'off'}"] = {
-                field: _mean([r[key] for r in runs])
-                for field, key in (("late_validated", "late_worlds_validated"),
-                                   ("late_accuracy", "late_worlds_accuracy"),
-                                   ("late_observations_to_validation", "late_worlds_mean"),
-                                   ("late_cpu_seconds", "late_worlds_cpu"))} | {
-                "inventions": [r["final_inventions"] for r in runs] if on else []}
+    rows = [(budget, on, False) for budget in budgets for on in (True, False)] + [(min(budgets), False, True)]
+    for budget, on, linear in rows:
+        overrides = {"sequence.deepen_max_size": budget} | ({} if linear else {"sequence.linear_terms": 0})
+        runs = [run_procedural_transfer(s, curriculum=curriculum, library_learning=on, overrides=overrides)
+                for s in seeds]
+        out[f"deepen_max_{budget}/library_{'on' if on else 'off'}" + ("/linear_on" if linear else "")] = {
+            field: _mean([r[key] for r in runs])
+            for field, key in (("late_validated", "late_worlds_validated"),
+                               ("late_accuracy", "late_worlds_accuracy"),
+                               ("late_observations_to_validation", "late_worlds_mean"),
+                               ("late_cpu_seconds", "late_worlds_cpu"))} | {
+            "inventions": [r["final_inventions"] for r in runs] if on else []}
     return out
 
 

@@ -149,7 +149,9 @@ def _deep_python(cands, by_size, ys, tol, max_size, ops, deep_size, windows, cap
                     break
                 want = ds - 1 - ea.size
                 for op, a_left in _VARIANTS if 1 <= want <= top else ():
-                    if op not in ops or len(out) >= cap:
+                    # A commutative pair is kept with its smaller side on the left (checked below), so a left
+                    # side larger than any partner could be is never kept: skip the lookup.
+                    if op not in ops or len(out) >= cap or (op in ("add", "mul") and ea.size > want):
                         continue
                     need = []
                     for r in rows:
@@ -186,7 +188,7 @@ def _deep_python(cands, by_size, ys, tol, max_size, ops, deep_size, windows, cap
                             out.append((op, l, r, bad, 0))
                 awant = ds - 3 - ea.size
                 for op, a_left in _AFFINE if affine and 1 <= awant <= top else ():
-                    if op not in ops or len(out) >= cap:
+                    if op not in ops or len(out) >= cap or (op == "add" and ea.size > awant):
                         continue
                     need = [ys[r] - sa[r] if op == "add" else sa[r] - ys[r] if a_left else ys[r] + sa[r]
                             for r in rows]

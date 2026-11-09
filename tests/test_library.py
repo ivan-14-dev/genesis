@@ -1,3 +1,5 @@
+import random
+
 from genesis import library
 from genesis.adapters import SEQ_VARS, sequence_dream, sequence_rollout_probes
 from genesis.agent import Genesis
@@ -94,6 +96,32 @@ def test_features_and_recognizer_identify_the_family_of_a_series():
     again = library.Recognizer.from_json(rec.to_json())
     assert again.rank(list(reversed(shapes)), library.features(geometric))[0] == "mul(V,C)"
     assert rec.rank(["unknown", *shapes], library.features(geometric))[-1] == "unknown"
+
+
+def test_recognizer_tells_rule_less_series_from_rules_it_has_never_seen():
+    domains = {"sequence": (SEQ_VARS, sequence_dream)}
+    lib = library.sleep([], ["add(V,C)", "mul(V,C)"], [], domains, seed=3)
+    rec = library.Recognizer.from_json(lib["recognizer"])
+    assert set(library.RESERVED) <= set(rec.totals)
+    rng = random.Random(0)
+    assert all(rec.p_noise(library.features([rng.randint(0, 60) for _ in range(12)])) >= 0.9 for _ in range(50))
+
+    def series(step, h):
+        while len(h) < 14:
+            h.append(step(h, len(h)))
+        return h[2:]
+
+    # Families without a known shape are not taken for noise: the generic-program class stands for them.
+    for ys in (series(lambda h, t: h[-2] + 5, [3, 9]), series(lambda h, t: 2 * h[-1] - h[-2] + t, [1, 4]),
+               series(lambda h, t: t * t - 3 * t, [0, 0]), series(lambda h, t: h[-1] + h[-2], [1, 2])):
+        assert rec.p_noise(library.features(ys)) < 0.1
+    assert library.Recognizer().p_noise(frozenset()) is None
+    geometric = library.features([3 * 2 ** i for i in range(12)])
+    assert rec.rank(["add(V,C)", "mul(V,C)"], geometric) == ["mul(V,C)", "add(V,C)"]  # never a reserved class
+    # Dreams are cached; statistics computed with another (or an unrecorded) feature set are dreamt again.
+    assert library.sleep([], ["add(V,C)", "mul(V,C)"], [], domains, seed=3, dreamt=lib["dreamt"]) == lib
+    stale = {k: {"n": 1, "counts": {}} for k in lib["dreamt"] if k != "~features"}
+    assert library.sleep([], ["add(V,C)", "mul(V,C)"], [], domains, seed=3, dreamt=stale) == lib
 
 
 def test_sleep_stores_the_library_and_skips_when_nothing_changed(tmp_path):

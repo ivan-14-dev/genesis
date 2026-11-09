@@ -222,7 +222,8 @@ def limitations(agent: Genesis) -> dict:
             "blocked_by": stage["blocked_by"], "stage": stage["stage"],
             "architectural_notes": [
                 "hypothesis space is bounded: programs up to max_size, deeper ones only as deepening "
-                "compositions (up to deepen_max_size) or through invented primitives",
-                "constants are proposed from observed data only; unseen moduli cannot be discovered",
+                "compositions (up to deepen_max_size), sparse linear combinations or through invented primitives",
+                "constants are proposed from observed data only; an unseen modulus is found only for affine "
+                "modular rules (gcd of residue differences)",
                 "search budgets are safety-locked and cannot be raised by self-improvement",
             ]}
