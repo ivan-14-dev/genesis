@@ -337,7 +337,10 @@ or refuted it (`inspect --explain`).
 ## Headline results (10 held-out seeds, see docs/RESULTS.md)
 
 - Sequences: 100% extrapolation accuracy on hidden rules (baselines 7.6% / 17%); 20/20 noise streams judged
-  unpredictable, 0 false validations; 0.31 s CPU per seed (9× less than v0.2.0, C search kernel).
+  unpredictable, 0 false validations; 0.27 s CPU per seed (10× less than v0.2.0, C search kernel).
+  Severe validation: a rule is validated only once its own predictions separate it from every rival within
+  reach that fits as well (neither the prior nor the observations it was fitted to count as tests); wrong
+  transient validations, checked against the noiseless continuation, fell from 9 to 0 (10 seeds, 11 conditions).
 - Robustness: with 10%, 20% or 30% corrupted observations, 100% of rule streams validated; with **half** of the
   observations corrupted, 97.5% (100% when 8 of 10 streams are pure noise). A rule must beat the chance measured
   on its own stream, through an anytime-valid test, not be right more often than wrong: the old majority
@@ -350,18 +353,20 @@ or refuted it (`inspect --explain`).
   With 5%, 10% or 20% of experiment outcomes corrupted, still 100% held-out accuracy and 18/18 confounded causes
   found, never a wrong cause validated (noise-tolerant conditionals).
 - Memory: retention 1.0 across sessions, forgetting 0.0 after a second world. Planning: 100% vs 78.5% random.
-- Tight budget (60 observations): curiosity with budget-aware focus validates 59% of rule streams (random 24%,
-  round-robin 0%). Remembered rule shapes cut search 16×; on 7-node worlds they also cut observations to
-  validation by 24% (11.6 → 8.7), at no CPU cost.
+- Tight budget (60 observations): curiosity with budget-aware focus validates 55% of rule streams (random 21%,
+  round-robin 0%). Remembered rule shapes cut the search that discovers a rule 16× (2× including the rival
+  search that verifies it, which memory must not bias); on 7-node worlds they also cut observations to
+  validation by 24% (11.6 → 8.8), at no CPU cost.
 - Library learning (wake-sleep): sub-programs promoted to invented primitives during sleep let a learner limited
   to 7-node searches learn later 9-node worlds (late rule streams validated 33% → 100%, linear solver off).
-- Stage 6: learning-progress allocation beats round-robin at budget 150 (0.848 vs 0.786, half the noise) and
-  stops itself at 300 with slightly more knowledge (0.979 vs 0.968).
-- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.705 vs 0.725); on standard
-  worlds remembered shapes do not reduce observations to validation; learning half-corrupted streams costs CPU
-  on clean worlds (0.31 vs 0.23 s per seed) and keeps noise streams open longer, so curiosity spends more on
-  noise (43.9 vs 30 observations for round-robin at budget 150) and leads round-robin by only one stream at
-  budget 100; the recognition model's effect on observations is marginal (it postpones
+- Stage 6: learning-progress allocation beats round-robin at budget 150 (0.834 vs 0.784, half the noise) and
+  stops itself at 300 with slightly more knowledge (0.981 vs 0.964).
+- Negative results, also reported: stage 6 loses to round-robin at budget 100 (0.705 vs 0.722); on standard
+  worlds remembered shapes do not reduce observations to validation; severe validation makes a rule with an
+  untested rival wait for the decisive observation (9.0 vs 8.45 observations to validation, 55% vs 59% at budget
+  60); learning half-corrupted streams costs CPU on clean worlds (0.26 vs 0.22 s per seed) and keeps noise
+  streams open longer, so curiosity spends more on noise (41 vs 30 observations for round-robin at budget 150)
+  and leads round-robin by only one stream at budget 100; the recognition model's effect on observations is marginal (it postpones
   deep searches on series that look like noise unless a hypothesis already explains most observations: −8 to
   −11% expressions evaluated, same validation); stage 7 finds no variant that improves the trial score, and most tunable parameters have no
   effect.

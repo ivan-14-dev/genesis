@@ -80,6 +80,12 @@ class InductionConfig:
     # fixed rate alone makes each of its errors cost log(outcome_range / noise); at low error rates the posterior is
     # unchanged (within log(1 - weight)). 0 disables it.
     noise_unknown_weight: float = 0.0
+    # Severity: every rule within max_size, exact or not and whatever its size, is challenged before its validation
+    # (RuleLearner._challenge), and is validated only once the evidence, not its prior alone, separates it from each
+    # rival that fits the observations at least as well but predicts another future on its probes
+    # (RuleLearner._untested_rival): a simple rule is no longer validated on its simplicity alone, before the
+    # input that decides between it and a longer rule. Off: only rules that already err are challenged.
+    severe_validation: bool = False
     # Under that "unknown rate" component (and its share of the null), corrupted values follow a law learned from
     # the observations rather than uniform(outcome_range): a Bayes mixture of uniform(outcome_range) and a uniform
     # law on an unknown interval (RuleLearner._value_law). A rule's hit is evidence only as far as the value was
@@ -197,6 +203,41 @@ def _in_range(inputs: dict, y: int) -> bool:
         v is None or -VALUE_LIMIT <= v <= VALUE_LIMIT for v in inputs.values())
 
 
+def _idle_modulus(e: Expr, data: list) -> bool:
+    """Whether a ``mod`` in ``e`` never changed its argument on the observations (a % m == a on each). Such a
+    rule is another rule plus a clause the data never touched, e.g. x[t-1] + x[t-2] % 27 on a Fibonacci stream
+    whose x[t-2] stayed below 27: an ad hoc exception, not a rival explanation of the data. A rule can always
+    be given one beyond the observations, so severity does not wait for them; a modulus once exercised stays so."""
+    if e.op == "mod":
+        a, m = e.args
+        idle = True
+        for d, _ in data:
+            v, mv = a.evaluate(d, True), m.evaluate(d, True)
+            if v is not None and mv is not None and mv > 0 and v % mv != v:
+                idle = False
+                break
+        if idle:
+            return True
+    return any(_idle_modulus(x, data) for x in e.args if isinstance(x, Expr))
+
+
+def _unseparated(top_bits: int, rival_bits: int, born_n: int) -> bool:
+    """Whether the evidence has not separated a rule from a rival (bit i of each mask: observation i predicted
+    exactly). Observations the rule was fitted to (before born_n, when it joined the pool) are not tests it could
+    have failed, so they cannot separate it alone: a rule found by search can fit a corrupted value by
+    coincidence, as -21 + x[t-1] % 38 fitted the one corrupted term of x[t-2] - 4 and every later term as well.
+    Unseparated: the rival errs no more often than the rule, or errs once more and the observations made since
+    the rule was proposed do not favour the rule. Two more errors are not excused: a second coincidence."""
+    top_only = (top_bits & ~rival_bits).bit_count()
+    rival_only = (rival_bits & ~top_bits).bit_count()
+    if top_only <= rival_only:
+        return True
+    if top_only > rival_only + 1:
+        return False
+    novel = ~((1 << born_n) - 1)
+    return (top_bits & ~rival_bits & novel).bit_count() <= (rival_bits & ~top_bits & novel).bit_count()
+
+
 def _logit(p: float) -> float:
     return math.inf if p >= 1 else -math.inf if p <= 0 else math.log(p / (1 - p))
 
@@ -268,7 +309,13 @@ class RuleLearner:
         self.noise_delays = 0
         self.rival_searches = 0
         self.rivals_found = 0
+        self.deep_rival_searches = 0
+        # Share of expressions_evaluated spent verifying rules (_challenge) rather than discovering them.
+        self.rival_expressions_evaluated = 0
         self._challenged: set = set()
+        # Rule -> its rivals that only a decisive observation can dismiss (severe_validation).
+        self._decisive: dict = {}
+        self._untested_memo: Optional[tuple] = None
         # probe_fn generates the inputs on which behavioural equivalence is judged.
         # Default: independent random values (appropriate when the agent can intervene).
         self.probe_fn = probe_fn
@@ -549,7 +596,7 @@ class RuleLearner:
             if (mass >= self.cfg.validation_posterior and top.fwd_ok >= self.cfg.validation_k
                     and (top.fwd_bad <= int(self.cfg.validation_max_error * fwd) or self._sprt_accepts(top)
                          or self._beats_chance(top))
-                    and not self._structured_errors(top)):
+                    and not self._structured_errors(top) and not self._untested_rival(top)):
                 return "validated"
             if mass >= 0.5:
                 return "candidate"
@@ -674,14 +721,21 @@ class RuleLearner:
         (the inputs it would be used on), so rivals that disagree there stay distinct; they join the pool and the
         posterior weighs them. Returns whether any was found. The probes are labelled with a value no program
         reaches (the kernels are bounded by VALUE_LIMIT), so every candidate misses all of them and the tolerance
-        admits exactly the programs that fit the observations as well as the rule. Only rules larger than
-        KEEP_ALL_UPTO and within max_size can hide an equally simple rival: the search keeps every smaller program,
-        and an equally good rival within max_size would outrank a larger rule. Only rules that already err: an
-        exact rule errs on the first decisive input, which no corruption excuses, so the search runs again then;
-        a rule whose errors pass for corruption would absorb that one too."""
+        admits exactly the programs that fit the observations as well as the rule.
+
+        Under severe_validation every rule within max_size is challenged, exact or not and whatever its size: a
+        rival larger than the rule fits as well but weighs far less in the prior (x[t-3] + 1 against
+        (x[t-1] - 2) % 7), so the posterior alone would validate the shorter one before the decisive input. The
+        rivals that fit as well and disagree on the probes are kept in _decisive and hold the validation back
+        (_untested_rival). A rule that already errs also faces a deeper search, up to deepen_size nodes, for rules
+        that explain some of its errors: errors that a longer rule predicts are not corruption. Off, only rules
+        larger than KEEP_ALL_UPTO that already err are challenged (an equally simple rival would be in the pool,
+        and an exact rule errs on the first decisive input)."""
         cfg = self.cfg
         key = str(top.expr)
-        if key in self._challenged or top.n_bad == 0 or not KEEP_ALL_UPTO < top.expr.size <= cfg.max_size:
+        if key in self._challenged or top.expr.size > cfg.max_size:
+            return False
+        if not cfg.severe_validation and (top.n_bad == 0 or top.expr.size <= KEEP_ALL_UPTO):
             return False
         self._challenged.add(key)
         rows = [(d, y) for d, y in self.data if _in_range(d, y)]
@@ -694,27 +748,93 @@ class RuleLearner:
         if len(rows) < 5 or not labelled:
             return False
         self.rival_searches += 1
+        evaluated_before = self.expressions_evaluated
         top_bad = sum(top.expr.evaluate(d, True) != y for d, y in self.data)
+        rows_bad = sum(top.expr.evaluate(d, True) != y for d, y in rows)
         inputs = [d for d, _ in rows]
         ys = [y for _, y in rows]
         consts = self._propose_constants(inputs, tuple(ys))
+        # Severe: also rivals with one more mismatch, kept only if it falls on the observations the rule was
+        # fitted to (_unseparated).
+        extra = 1 if cfg.severe_validation else 0
         sr = search_programs(inputs + [p for p, _ in labelled], ys + [VALUE_LIMIT + 1] * len(labelled),
                              self.var_names, sorted(consts),
-                             sum(top.expr.evaluate(d, True) != y for d, y in rows) + len(labelled), cfg.max_size,
+                             rows_bad + extra + len(labelled), cfg.max_size,
                              cfg.max_candidates, cfg.max_seconds, 0, keep_all_upto=KEEP_ALL_UPTO)
         self.expressions_evaluated += sr.evaluated
         rivals = []
+        top_bits = self._hit_bits(top) if extra else 0
         for e, _ in sr.matches:
             if _has_trivial(e) or all(e.evaluate(p, True) == v for p, v in labelled):
                 continue
             exact = sum(e.evaluate(d, True) != y for d, y in self.data)
-            if exact <= top_bad:
-                rivals.append((e, exact, self._base_prior(e, sr.counts)))
-        if not rivals:
+            if exact > top_bad:
+                if exact > top_bad + extra:
+                    continue
+                bits = 0
+                for i, (d, y) in enumerate(self.data):
+                    if e.evaluate(d, True) == y:
+                        bits |= 1 << i
+                if not _unseparated(top_bits, bits, top.born_n):
+                    continue
+            rivals.append((e, exact, self._base_prior(e, sr.counts)))
+        if cfg.severe_validation and rows_bad and cfg.deepen_size > cfg.max_size:
+            # Errors that a deeper rule explains are not corruption: rules of up to deepen_size nodes that explain
+            # more of the observations than this one (the deepening only runs when nothing smaller does).
+            found, _, _ = self._search(inputs, tuple(ys), rows_bad - 1, consts, {}, rows_bad - 1, cfg.deepen_size)
+            self.deep_rival_searches += 1
+            seen = {str(e) for e, _, _ in rivals}
+            for e, _, lp in found:
+                if str(e) not in seen and not _has_trivial(e):
+                    exact = sum(e.evaluate(d, True) != y for d, y in self.data)
+                    if exact < top_bad:
+                        seen.add(str(e))
+                        rivals.append((e, exact, lp))
+        self.rival_expressions_evaluated += self.expressions_evaluated - evaluated_before
+        if rivals:
+            self.rivals_found += len(rivals)
+            self._merge(rivals, len(self.data))
+        if cfg.severe_validation:
+            # Every pooled rule as good on the evidence and disagreeing on the probes, whether just found or not.
+            pending = [str(h.expr) for h in self.hyps if h is not top and self._unseparated(top, h)
+                       and any(h.expr.evaluate(p, True) != v for p, v in labelled)
+                       and not _idle_modulus(h.expr, self.data)]
+            if pending:
+                self._decisive[key] = pending
+                self._untested_memo = None
+                return True
+        return bool(rivals)
+
+    def _unseparated(self, top: Hypothesis, rival: Hypothesis) -> bool:
+        return _unseparated(self._hit_bits(top), self._hit_bits(rival), top.born_n)
+
+    def _untested_rival(self, top: Hypothesis) -> bool:
+        """Severity (severe_validation): a rival found when the rule was challenged is not separated from it yet
+        (_unseparated) and still predicts a different value on one of the rule's probes, so only the prior, or
+        the observations the rule was fitted to, prefer the rule. The prior ranks rules; it does not test them:
+        x[t-3] + 1 fits five terms of a counter modulo 7 as well as (x[t-1] - 2) % 7, and is 2 nodes shorter, but
+        only the term after the wrap-around can tell them apart. The rule waits for it: either the rival errs
+        there (the rule passed a test it could have failed), or the rule does and is not validated. A rival that
+        left the pool, that the rule's predictions have separated from it, or that agrees with the rule on all
+        of its current probes no longer stands in the way."""
+        names = self._decisive.get(str(top.expr))
+        if not names:
             return False
-        self.rivals_found += len(rivals)
-        self._merge(rivals, len(self.data))
-        return True
+        memo_key = (len(self.data), id(top), id(self.hyps))
+        if self._untested_memo is not None and self._untested_memo[0] == memo_key:
+            return self._untested_memo[1]
+        pool = {str(h.expr): h for h in self.hyps}
+        rivals = [pool[k] for k in names if k in pool and self._unseparated(top, pool[k])]
+        result = False
+        if rivals:
+            probes = self.probe_fn(self, top.expr) if self.probe_fn is not None else self._probes
+            for p in probes:
+                v = top.expr.evaluate(p, True)
+                if any(r.expr.evaluate(p, True) != v for r in rivals):
+                    result = True
+                    break
+        self._untested_memo = (memo_key, result)
+        return result
 
     def _propose_constants(self, inputs: list, ys: list) -> set:
         proposals: Counter = Counter()
@@ -1174,6 +1294,9 @@ class RuleLearner:
             "linear_searches": self.linear_searches, "linear_hits": self.linear_hits,
             "noise_delays": self.noise_delays, "rival_searches": self.rival_searches,
             "rivals_found": self.rivals_found, "challenged": sorted(self._challenged),
+            "deep_rival_searches": self.deep_rival_searches,
+            "rival_expressions_evaluated": self.rival_expressions_evaluated,
+            "decisive": self._decisive,
         }
 
     @classmethod
@@ -1194,7 +1317,10 @@ class RuleLearner:
         lr.noise_delays = state.get("noise_delays", 0)
         lr.rival_searches = state.get("rival_searches", 0)
         lr.rivals_found = state.get("rivals_found", 0)
+        lr.deep_rival_searches = state.get("deep_rival_searches", 0)
+        lr.rival_expressions_evaluated = state.get("rival_expressions_evaluated", 0)
         lr._challenged = set(state.get("challenged", ()))
+        lr._decisive = {k: list(v) for k, v in state.get("decisive", {}).items()}
         lr.data = [(dict(d), y) for d, y in state["data"]]
         lr.episodes = list(state["episodes"])
         lr.provenance = list(state["provenance"])

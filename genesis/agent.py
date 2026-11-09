@@ -44,7 +44,7 @@ def default_configs(safety: SafetyPolicy) -> dict:
         # divert the experiments that settle them.
         "sequence": InductionConfig(max_size=5, search_mismatch_frac=0.75, max_mismatch_frac=0.75,
                                     noise_unknown_weight=0.01, learned_chance=True, validation_chance=0.1,
-                                    **common),
+                                    severe_validation=True, **common),
         "lab": InductionConfig(max_size=3, allow_conditionals=True, outcome_range=101, deepen_size=0, **common),
     }
 

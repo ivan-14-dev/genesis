@@ -42,8 +42,10 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 - The hypothesis space is an inductive bias chosen by the designers. Rules outside it (e.g. requiring
   division or loops) cannot be learned yet; the agent then reports them as *unpredictable* rather than inventing
   an answer.
-- Black-swan induction: a rule can be validated before the evidence that would refute it has appeared
-  (observed once on a decrementing modular counter before wrap-around; see §H).
+- Black-swan induction: a rule can be validated before the evidence that would refute it has appeared. Severe
+  validation (§E) withholds a rule until its own predictions, not its prior or the observations it was fitted
+  to, separate it from every rival within reach (5 nodes; 7 for rules that err); a rival beyond reach can still
+  be the true rule (see §H).
 - Noise robustness is bounded by identifiability: a sequence rule must be right far more often than chance, not
   more often than wrong, so a stream with half of its observations corrupted is learned, but not one whose rule
   is right barely more often than a coincidence would be. In the lab, new rules are proposed only below 40%
@@ -428,16 +430,34 @@ Details of the core learner (`RuleLearner`):
     is a nonnegative supermartingale under chance, so by Ville's inequality it ever reaches 1/α (α = 0.01) with
     probability ≤ α, however long the record (checked exactly in the tests). Six right and six wrong forward
     predictions pass; two right in eight do not. The same ratio above 1 keeps a rule *promising*;
-  - challenge a rule about to be validated (`_challenge`): the search keeps one program per behaviour on the
-    observations, so an equally good rival that differs only on inputs never observed (`(x − 1) mod 10` next to
+  - challenge every rule about to be validated (`_challenge`): the search keeps one program per behaviour on the
+    observations, so a rival that differs only on inputs never observed (`(x − 1) mod 10` next to
     `x mod 10 − 1` when no multiple of 10 was seen) can be missing from the pool. Once per rule, the search
     reruns on the observations plus the rule's own probes, labelled with a value no program reaches, so the
-    tolerance admits exactly the programs that fit the observations as well; rivals join the pool and the
-    posterior splits until the decisive input is seen. Only rules of 4–5 nodes can hide such a rival: every
-    program of ≤ 3 nodes is kept, and an equally good rival within the size limit would outrank a larger rule.
-    Only rules that already err are challenged: an exact rule errs on the first decisive input, which no
-    corruption excuses, so the search reruns then, whereas a rule whose errors pass for corruption would absorb
-    that one too (the search would cost 4× more per rule stream on clean worlds for nothing);
+    tolerance admits exactly the programs that fit the observations as well (or with one more mismatch, below).
+    A rule that already errs also faces a deeper search, up to `deepen_size` = 7 nodes, for rules that explain
+    some of its errors: errors that a longer rule predicts are not corruption (`−2·x[t−2] + 8` errs on one term
+    in five of the cycle 8, 4, 3, 0, 2, which `((x[t−2] − x[t−1]) mod 11) − 1` predicts);
+  - validate a rule only through **severe** tests (`severe_validation`, `_untested_rival`, after Popper and
+    Mayo): the evidence must separate it from each rival the challenge found that predicts another value on its
+    probes. Two things cannot separate them:
+    - *the prior*: it ranks rules, it does not test them. `x[t−3] + 1` fits five terms of a counter modulo 7 as
+      well as `(x[t−1] − 2) mod 7` and is 2 nodes shorter, so the posterior alone gave it 99% before the
+      wrap-around (a longer rival weighs about 10⁻³ of a shorter one);
+    - *the observations the rule was fitted to* (before `born_n`): they are not tests it could have failed. On
+      `x[t−2] − 4` with its first term corrupted, `−21 + x[t−1] mod 38` was found after that term, fits it by
+      coincidence and predicts every later term as `x[t−2] − 4` does, until t = 14. A rival may therefore err
+      once more than the rule, on those observations (`_unseparated`); two more errors would be a second
+      coincidence.
+
+    The rule waits for the decisive observation: either the rival errs there (the rule passed a test it could
+    have failed), or the rule does. A rule with no such rival is validated as soon as before. A rival that is
+    the rule plus a clause no observation exercised is not waited for (`_idle_modulus`): `x[t−1] + x[t−2] mod 27`
+    on a Fibonacci stream whose `x[t−2]` stayed below 27 is an exception added beyond the data, which any rule
+    can be given, not another explanation of the data. Once an observation exercises its modulus, it is one
+    (the counter modulo 7 above wraps in the data). In a harness that checks every validation against the
+    noiseless continuation (10 seeds, 11 conditions from clean to 50% noise and 13-node rules), wrong transient
+    validations fell from 9 to 0. The lab keeps the old gate (only erring 4–5-node rules are challenged);
   - tell an *incomplete* rule from a corrupted one (`_incomplete_ids`). Corruption strikes at independent times,
     so a corrupted rule's hit/miss record is a sequence of independent draws, and another rule hits a corrupted
     value only by coincidence. Two anytime-valid tests, at level α/2 each, refute this:
@@ -553,7 +573,7 @@ future source must be tagged with provenance `external` and kept separate from e
 |---|---|---|
 | 1 ✅ | Innate core, induction, memory, curiosity, metacognition, consolidation, sequence + causal worlds, benchmarks, demo | stages 0–5 gates pass on held-out seeds |
 | 2 ✅ | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Met:* sequences (majority-residual fits, structured-error check, deep hits that must err less than shorter rules, sequential validation test, exact beliefs, anytime-valid test against chance): 100% at 10%, 20% and 30% innovation noise, 97.5% at 50%; causal lab with noisy conditionals: 100% held-out accuracy and every confounded cause found at 5%, 10% and 20% outcome noise; 0 false validations (RESULTS, robustness). Probabilistic transitions remain open |
-| 3 ✅ | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Met:* library-first search over remembered shapes cuts search 16× on standard worlds and observations to validation by 25% on 7-node worlds; sleep-time sub-program promotion and dreaming (`library.py`) let a 7-node search budget learn later 9-node rules (curriculum, RESULTS) |
+| 3 ✅ | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Met:* library-first search over remembered shapes cuts discovery search 16× on standard worlds (the rival search of severe validation, the same with or without memory, brings the total to 2×) and observations to validation by 25% on 7-node worlds; sleep-time sub-program promotion and dreaming (`library.py`) let a 7-node search budget learn later 9-node rules (curriculum, RESULTS) |
 | 4 ✅ | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction (met at budget 150 and 300; **not** at 100) |
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
 | 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
@@ -568,7 +588,7 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Search explosion for larger rules | cannot learn | budgets (candidates, seconds) in the safety policy; meet-in-the-middle deepening; library learning (phase 3) |
-| Inductive black swan (validated too early) | false knowledge | forward-validation, spaced review, refutation tracking; residual risk documented |
+| Inductive black swan (validated too early) | false knowledge | forward-validation, severe validation against rivals within reach, spaced review, refutation tracking; residual risk documented |
 | Designer bias in the hypothesis space | "learning" limited to what designers anticipated | explicit manifest; report "unpredictable" honestly; expand primitives only via documented versions |
 | Benchmark overfitting during development | inflated results | report held-out seeds (100–109) not used during development |
 | Symbolic-neural bridge | perception may not yield usable symbols | phase 5 has its own measurable criterion |
@@ -588,12 +608,18 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
   a rule must beat the chance measured on its own stream, not be right more often than wrong. A stream whose rule
   is right barely more often than a coincidence would be (few distinct values and very heavy corruption) stays
   unvalidated. The tolerance has costs:
-  - +24% CPU on clean worlds (0.27 vs 0.22 s per seed), because searches keep candidates with up to 75%
+  - +20% CPU on clean worlds (0.26 vs 0.22 s per seed), because searches keep candidates with up to 75%
     mismatches;
   - spurious rules keep noise streams open longer (unpredictable after 8.65 observations instead of 8.0), so
     curiosity spends more observations on noise;
   - the structure tests that tell an incomplete rule from a corrupted one need evidence, so an incomplete rule
-    whose errors still look independent can be validated before a rival or a pattern refutes it (black swan).
+    whose errors still look independent can be validated before a pattern refutes it, or a rival beyond reach
+    of the rival search (5 nodes, 7 for rules that err, or trimmed from the pool) does (black swan).
+- Severe validation makes a rule with an untested rival wait for the decisive observation: 9.0 observations to
+  validation on clean worlds instead of 8.45, about one more on procedural worlds, and a rival search per rule
+  (about 38,000 programs per rule stream, which remembered shapes do not reduce). A rival that only adds a
+  modulus no observation exercised does not hold validation back, so a counter observed before its first
+  wrap-around is validated without one (as without severity); the wrap-around refutes it.
 
   The lab keeps the majority requirement (proposals below 40% mismatches).
 - The search is bounded by ±10¹⁸ (beliefs are exact): proposals are found on the in-range part of a stream, and

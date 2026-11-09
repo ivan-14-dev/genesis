@@ -9,7 +9,8 @@ from genesis import library
 from genesis.adapters import SEQ_VARS, sequence_dream, sequence_rollout_probes
 from genesis.agent import default_configs
 from genesis.expressions import app, const, enumerate_programs, if_eq, var
-from genesis.induction import PATTERN_ORDERS, Hypothesis, InductionConfig, RuleLearner, _chance_log_ratio
+from genesis.induction import (PATTERN_ORDERS, Hypothesis, InductionConfig, RuleLearner, _chance_log_ratio,
+                               _idle_modulus, _unseparated)
 from genesis.innate import DEFAULT_SAFETY
 
 
@@ -383,23 +384,128 @@ def test_a_rule_right_more_often_than_wrong_can_still_be_incomplete():
     assert id(top) in learner._incomplete_ids() and learner.status() != "validated"
 
 
-def test_exact_rules_skip_the_rival_search():
-    """An exact rule errs on the first decisive input, which no corruption excuses: the search runs again then."""
+def _exact_counter(severe):
     rng = random.Random(0)
     learner = passive_learner("w", ["x"])
-    for _ in range(40):
+    learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+    for _ in range(40):  # never a multiple of 10: x % 10 - 1 fits as exactly as (x - 1) % 10
         x = rng.choice([v for v in range(1, 40) if v % 10])
         learner.observe({"x": x}, (x - 1) % 10)
-    assert learner.rival_searches == 0
+    return learner
+
+
+def test_an_exact_rule_waits_for_the_input_that_could_refute_it():
+    lax = _exact_counter(severe=False)  # only rules that already err were challenged: the prior alone validated it
+    assert lax.status() == "validated" and lax.predict({"x": 40}).value == -1 and lax.rival_searches == 0
+    learner = _exact_counter(severe=True)
+    assert all(r["status"] != "validated" for r in learner.status_history)
+    assert learner.rival_searches == 1 and learner._untested_rival(learner.best()[0])
     for x in (10, 20, 30):
         learner.observe({"x": x}, 9)
-    assert learner.predict({"x": 40}).value == 9
+    assert learner.status() == "validated" and learner.predict({"x": 40}).value == 9
+    clone = RuleLearner.from_state(learner.to_state(), learner.cfg)
+    assert clone._decisive == learner._decisive and clone._challenged == learner._challenged
+    assert clone.status() == "validated"
 
 
-def test_small_rules_skip_the_rival_search():
-    learner = passive_learner()
-    feed_sequence(learner, [3 * t + 1 for t in range(20)])
-    assert learner.status() == "validated" and learner.rival_searches == 0
+def _observe_terms(learner, terms, start, stop):
+    for t in range(start, stop):
+        learner.observe({"x[t-1]": terms[t - 1], "x[t-2]": terms[t - 2], "x[t-3]": terms[t - 3], "t": t}, terms[t])
+
+
+def test_a_short_rule_is_not_validated_on_its_simplicity_alone():
+    terms = [4]
+    for _ in range(30):
+        terms.append((terms[-1] - 2) % 7)  # x[t-3] + 1 holds until the counter wraps around, at t = 9
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        _observe_terms(learner, terms, 3, 9)
+        assert str(learner.best()[0].expr) == "(x[t-3] + 1)"
+        assert any(r["status"] == "validated" for r in learner.status_history) is not severe
+    _observe_terms(learner, terms, 9, len(terms))
+    assert learner.status() == "validated" and str(learner.best()[0].expr) == "((x[t-1] + -2) % 7)"
+
+
+def test_errors_a_deeper_rule_predicts_are_not_corruption():
+    """((x[t-2] - x[t-1]) % 11) - 1 has 7 nodes, beyond max_size; x[t-2] * -2 + 8 errs on one term in five, which
+    passed for corruption. The deeper rival search finds the 7-node rule, which explains that error too."""
+    terms = [8, 4, 3, 0, 2] * 10
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        feed_sequence(learner, terms[:10])
+        assert str(learner.best()[0].expr) == ("((x[t-2] * -2) + 8)" if not severe else
+                                               "(((x[t-2] - x[t-1]) % 11) + -1)")
+        assert any(r["status"] == "validated" for r in learner.status_history) is not severe
+    assert learner.deep_rival_searches == 1 and learner.cfg.max_size < 7 <= learner.cfg.deepen_size
+    _observe_terms(learner, terms, 10, len(terms))
+    assert learner.status() == "validated" and str(learner.best()[0].expr) == "(((x[t-2] - x[t-1]) % 11) + -1)"
+
+
+def test_observations_a_rule_was_fitted_to_do_not_test_it():
+    """The term at t = 3 was corrupted (16 instead of 3), and x[t-2] - 4 errs there. -21 + x[t-1] % 38, found
+    after it, fits it by coincidence, then predicts every later term as x[t-2] - 4 does, until t = 14."""
+    terms = [3, 7, -1, 16]
+    while len(terms) < 30:
+        terms.append(terms[-2] - 4)
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        _observe_terms(learner, terms, 3, 14)
+        assert str(learner.best()[0].expr) == "(-21 + (x[t-1] % 38))"
+        assert any(r["status"] == "validated" for r in learner.status_history) is not severe
+    assert "(x[t-2] + -4)" in learner._decisive["(-21 + (x[t-1] % 38))"]
+    _observe_terms(learner, terms, 14, len(terms))
+    assert learner.status() == "validated" and str(learner.best()[0].expr) == "(x[t-2] + -4)"
+
+
+def test_only_predictions_separate_a_rule_from_a_rival():
+    assert _unseparated(0b1111, 0b1111, 4)  # the prior alone prefers the rule
+    assert _unseparated(0b1101, 0b1110, 4)  # each errs once
+    assert _unseparated(0b1111, 0b1110, 2)  # one more error, on an observation the rule was fitted to
+    assert not _unseparated(0b1111, 0b1110, 0)  # on one it predicted
+    assert not _unseparated(0b1111, 0b0111, 2)
+    assert not _unseparated(0b1111, 0b1100, 4)  # two more errors: a second coincidence
+
+
+def test_a_clause_the_observations_never_exercised_is_not_a_rival():
+    fib = [1, 2]
+    while len(fib) < 20:
+        fib.append(fib[-1] + fib[-2])
+    first = {}
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        for t in range(3, len(fib)):
+            learner.observe({"x[t-1]": fib[t - 1], "x[t-2]": fib[t - 2], "x[t-3]": fib[t - 3], "t": t}, fib[t])
+            if learner.status() == "validated":
+                first[severe] = (t, str(learner.hyps[0].expr))
+                break
+        if severe:
+            # x[t-1] + x[t-2] % 21 fits as well and differs later, but no observation ever used its modulus.
+            assert learner.rival_searches == 1 and not learner._decisive
+    assert first[True] == first[False] == (7, "(x[t-1] + x[t-2])")
+
+
+def test_an_idle_modulus_is_one_the_observations_never_exercised():
+    rule = app("add", var("x"), app("mod", var("y"), const(27)))
+    assert _idle_modulus(rule, [({"x": 5, "y": y}, 0) for y in (0, 3, 26)])
+    assert not _idle_modulus(rule, [({"x": 5, "y": y}, 0) for y in (3, 30)])
+    assert not _idle_modulus(app("add", var("x"), var("y")), [({"x": 5, "y": 30}, 0)])
+    assert _idle_modulus(app("mul", const(2), app("mod", app("add", var("x"), var("y")), const(9))),
+                         [({"x": 1, "y": 2}, 0)])
+
+
+def test_a_rule_without_an_untested_rival_is_validated_as_soon_as_before():
+    histories = []
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        feed_sequence(learner, [3 * t + 1 for t in range(20)])
+        assert learner.status() == "validated" and not learner._decisive
+        histories.append([(r["n"], r["status"]) for r in learner.status_history])
+    assert histories[0] == histories[1]
 
 
 def test_a_constant_stream_stays_validated():

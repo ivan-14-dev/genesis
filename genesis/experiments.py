@@ -387,7 +387,7 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
         for key, value in (overrides or {}).items():
             family, attr = key.split(".")
             setattr(agent.configs[family], attr, value)
-        per_world, evals, rule_evals, cpu, acc, lib, val, inv = [], [], [], [], [], [], [], []
+        per_world, evals, rule_evals, rule_checks, cpu, acc, lib, val, inv = [], [], [], [], [], [], [], [], []
         for i in range(n_worlds):
             world = SequenceWorld(seed * 100 + i, **curriculum[i])
             keys = [f"{world.env_id}/{sid}" for sid in world.stream_ids()]
@@ -403,6 +403,8 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
                         if world._family(sid) != "noise" and f"{world.env_id}/{sid}" in agent.learners]
             evals.append(sum(lr.expressions_evaluated for lr in lrs))
             rule_evals.append(round(sum(lr.expressions_evaluated for lr in rule_lrs) / max(len(rule_lrs), 1)))
+            rule_checks.append(round(sum(lr.rival_expressions_evaluated for lr in rule_lrs)
+                                     / max(len(rule_lrs), 1)))
             searches = sum(lr.library_searches + lr.full_searches for lr in lrs)
             lib.append(round(sum(lr.library_searches for lr in lrs) / searches, 4) if searches else 0.0)
             inv.append(len((agent.ltm.get_meta("library") or {}).get("inventions", [])))
@@ -413,10 +415,14 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
                 "inventions_per_world": inv, "final_inventions": inventions,
                 "expressions_evaluated_per_world": evals, "cpu_seconds_per_world": cpu,
                 "search_cost_per_rule_stream_per_world": rule_evals,
+                "verification_cost_per_rule_stream_per_world": rule_checks,
                 "accuracy_per_world": acc, "library_search_share_per_world": lib,
                 "late_worlds_mean": _mean(per_world[late]),
                 "late_worlds_expressions": _mean(evals[late]), "late_worlds_cpu": _mean(cpu[late]),
                 "late_worlds_search_cost_per_rule_stream": _mean(rule_evals[late]),
+                "late_worlds_verification_cost_per_rule_stream": _mean(rule_checks[late]),
+                "late_worlds_discovery_cost_per_rule_stream": _mean(
+                    [e - c for e, c in zip(rule_evals[late], rule_checks[late])]),
                 "late_worlds_accuracy": _mean(acc[late]), "late_worlds_validated": _mean(val[late])}
 
 
@@ -1146,6 +1152,16 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
                 [p["late_worlds_search_cost_per_rule_stream"] for p in proc_on]),
             "late_search_cost_per_rule_stream_without_prior": _mean(
                 [p["late_worlds_search_cost_per_rule_stream"] for p in proc_off]),
+            # The search cost splits into discovery (finding the rule; what remembered shapes speed up) and
+            # verification (the rival search of severe validation, a full search that memory must not bias).
+            "late_discovery_cost_per_rule_stream_with_prior": _mean(
+                [p["late_worlds_discovery_cost_per_rule_stream"] for p in proc_on]),
+            "late_discovery_cost_per_rule_stream_without_prior": _mean(
+                [p["late_worlds_discovery_cost_per_rule_stream"] for p in proc_off]),
+            "late_verification_cost_per_rule_stream_with_prior": _mean(
+                [p["late_worlds_verification_cost_per_rule_stream"] for p in proc_on]),
+            "late_verification_cost_per_rule_stream_without_prior": _mean(
+                [p["late_worlds_verification_cost_per_rule_stream"] for p in proc_off]),
             "late_cpu_seconds_per_world_with_prior": _mean([p["late_worlds_cpu"] for p in proc_on]),
             "late_cpu_seconds_per_world_without_prior": _mean([p["late_worlds_cpu"] for p in proc_off]),
             "late_accuracy_with_prior": _mean([p["late_worlds_accuracy"] for p in proc_on]),
@@ -1154,7 +1170,8 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             "inventions_per_world_with_prior": [p["inventions_per_world"] for p in proc_on],
             "deep_worlds": {
                 key: _mean([p[field] for p in runs])
-                for field in ("late_worlds_mean", "late_worlds_search_cost_per_rule_stream", "late_worlds_cpu",
+                for field in ("late_worlds_mean", "late_worlds_search_cost_per_rule_stream",
+                              "late_worlds_discovery_cost_per_rule_stream", "late_worlds_cpu",
                               "late_worlds_accuracy")
                 for key, runs in ((f"{field}_with_prior", deep_on), (f"{field}_without_prior", deep_off))},
         },
