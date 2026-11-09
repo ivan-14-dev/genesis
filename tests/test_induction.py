@@ -1,11 +1,17 @@
+import dataclasses
+import math
 import random
+from collections import defaultdict
 
 import pytest
 
 from genesis import library
 from genesis.adapters import SEQ_VARS, sequence_dream, sequence_rollout_probes
+from genesis.agent import default_configs
 from genesis.expressions import app, const, enumerate_programs, if_eq, var
-from genesis.induction import Hypothesis, InductionConfig, RuleLearner
+from genesis.induction import (PATTERN_ORDERS, Hypothesis, InductionConfig, RuleLearner, _chance_log_ratio,
+                               _idle_modulus, _unseparated)
+from genesis.innate import DEFAULT_SAFETY
 
 
 def seq_learner(key="s"):
@@ -248,3 +254,301 @@ def test_recognized_noise_postpones_deeper_searches_but_not_on_rules():
     learned, alone = run(terms, lambda: ([], rec)), run(terms, None)
     assert learned.noise_delays == 0 and learned.status() == alone.status() == "validated"
     assert learned.deep_searches == alone.deep_searches
+
+
+def test_evidence_for_a_rule_overrides_noise_like_features():
+    # Two interleaved lag-2 progressions with two corrupted terms alternate like random draws: the recognizer alone
+    # would call the series noise and postpone its deeper searches, although x[t-2] + 2 explains 13 of 15 terms.
+    lib = library.sleep([], ["add(V,C)", "mul(V,C)"], [], {"sequence": (SEQ_VARS, sequence_dream)}, seed=3)
+    rec = library.Recognizer.from_json(lib["recognizer"])
+    terms, corrupt = [23, 15], {7: -9, 12: 30}
+    for t in range(2, 16):
+        terms.append(terms[-2] + 2 + corrupt.get(t, 0))
+    learner = RuleLearner("s", SEQ_VARS, InductionConfig(max_size=5), probe_fn=sequence_rollout_probes,
+                          learned_library=lambda: ([], rec))
+    feed_sequence(learner, terms)
+    assert rec.p_noise(library.features([y for _, y in learner.data])) >= 0.9
+    assert str(learner.best()[0].expr) == "(x[t-2] + 2)" and learner.status() == "validated"
+    assert not learner._likely_noise() and learner.noise_delays == 0
+    learner.hyps = []  # without that evidence, the features decide
+    assert learner._likely_noise()
+
+
+def passive_learner(key="s", var_names=SEQ_VARS):
+    """A learner configured as the agent configures passive streams (wide tolerances, chance test)."""
+    probe_fn = sequence_rollout_probes if var_names is SEQ_VARS else None
+    return RuleLearner(key, var_names, default_configs(DEFAULT_SAFETY)["sequence"], probe_fn=probe_fn)
+
+
+def test_chance_test_is_anytime_valid():
+    rho, alpha = 0.1, 0.01
+    assert _chance_log_ratio(6, 6, rho) >= math.log(1 / alpha)  # right on half: passes after a dozen
+    assert _chance_log_ratio(2, 6, rho) < 0 and _chance_log_ratio(0, 100, rho) < 0
+    # Exact probability that a rule right only at the chance rate ever passes, over every record up to 120 long.
+    alive, crossed = {0: 1.0}, 0.0
+    for m in range(1, 121):
+        nxt = defaultdict(float)
+        for ok, p in alive.items():
+            nxt[ok + 1] += p * rho
+            nxt[ok] += p * (1 - rho)
+        alive = {}
+        for ok, p in nxt.items():
+            if _chance_log_ratio(ok, m - ok, rho) >= math.log(1 / alpha):
+                crossed += p
+            else:
+                alive[ok] = p
+    assert 0 < crossed <= alpha
+
+
+def test_chance_is_learned_from_the_range_of_values():
+    rng = random.Random(1)
+    digits, growing = passive_learner("d", ["x"]), passive_learner("g", ["x"])
+    for i in range(40):
+        digits.observe({"x": i}, rng.randint(0, 9))
+        growing.observe({"x": i}, 7 * i)
+    assert abs(digits._value_law() + math.log(10)) < 0.2  # a coincidental hit is a 1-in-10 event
+    assert abs(growing._value_law() + math.log(100)) < 0.01  # unbounded: uniform(outcome_range)
+    off = RuleLearner("d", ["x"], InductionConfig(noise_unknown_weight=0.01))
+    off.data, off.hyps = digits.data, digits.hyps
+    assert off._null_ll() == 40 * math.log(1 / 100) < digits._null_ll()
+
+
+def test_learns_a_stream_corrupted_more_often_than_not():
+    rng = random.Random(4)
+    terms, corrupted = [5, 8, 11], 0
+    for _ in range(67):
+        v = terms[-1] + 3
+        if rng.random() < 0.5:
+            v += rng.choice([d for d in range(-15, 16) if d])
+            corrupted += 1
+        terms.append(v)
+    learner = passive_learner()
+    feed_sequence(learner, terms)
+    top = learner.best()[0]
+    assert 2 * corrupted > len(terms) - 3  # 35 of the 67 generated terms
+    assert learner.status() == "validated" and str(top.expr) == "(x[t-1] + 3)"
+    assert top.fwd_bad > top.fwd_ok  # wrong more often than right, yet far better than chance
+    assert learner.predict({"x[t-1]": 500, "x[t-2]": 0, "x[t-3]": 0, "t": 70}).value == 503
+    strict = seq_learner()  # a rule must be right more often than wrong: the stream looks unpredictable
+    feed_sequence(strict, terms)
+    assert strict.status() != "validated"
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_wide_tolerances_never_validate_noise(seed):
+    rng = random.Random(seed)
+    for hi in (9, 60):
+        learner = passive_learner()
+        terms = [rng.randint(0, hi) for _ in range(60)]
+        for t in range(3, len(terms)):
+            learner.observe({"x[t-1]": terms[t - 1], "x[t-2]": terms[t - 2], "x[t-3]": terms[t - 3], "t": t},
+                            terms[t])
+            assert learner.status() != "validated", (hi, t)
+        assert learner.best()[2] > 0.99
+
+
+def _corrupted_counter(rng, x):
+    y = (x - 1) % 10
+    return y + rng.choice([d for d in range(-15, 16) if d]) if rng.random() < 0.2 else y
+
+
+def test_rival_search_withholds_a_rule_until_its_untested_case_is_seen():
+    rng = random.Random(6)
+    learner = passive_learner("w", ["x"])
+    for _ in range(40):  # (x - 1) % 10 and x % 10 - 1 agree unless x is a multiple of 10
+        x = rng.choice([v for v in range(1, 40) if v % 10])
+        learner.observe({"x": x}, _corrupted_counter(rng, x))
+        assert learner.status() != "validated"
+    assert learner.rival_searches >= 1 and learner.rivals_found >= 1
+    for x in (10, 20, 30):
+        learner.observe({"x": x}, 9)
+    for _ in range(20):
+        x = rng.randint(1, 39)
+        learner.observe({"x": x}, _corrupted_counter(rng, x))
+    assert learner.status() == "validated" and learner.predict({"x": 40}).value == 9
+    clone = RuleLearner.from_state(learner.to_state(), learner.cfg)
+    assert clone._challenged == learner._challenged and clone.rival_searches == learner.rival_searches
+
+
+def test_a_rule_right_more_often_than_wrong_can_still_be_incomplete():
+    """x % 30 - 1 is right on (x - 1) % 10 except for x in 11..29: errors on a region of the inputs, not corruption.
+    Its record beats chance, but a rival keeps hitting its errors, so it is not validated."""
+    rng = random.Random(1)
+    learner = passive_learner("w", ["x"])
+    for i in range(40):
+        x = rng.choice([v for v in range(1, 40) if v % 10])
+        y = (x - 1) % 10
+        learner.observe({"x": x}, y + rng.choice([d for d in range(-15, 16) if d]) if i % 5 == 2 else y)
+    top = learner.best()[0]
+    assert str(top.expr) == "(-1 + (x % 30))" and top.n_ok > top.n_bad and learner._beats_chance(top)
+    assert id(top) in learner._incomplete_ids() and learner.status() != "validated"
+
+
+def _exact_counter(severe):
+    rng = random.Random(0)
+    learner = passive_learner("w", ["x"])
+    learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+    for _ in range(40):  # never a multiple of 10: x % 10 - 1 fits as exactly as (x - 1) % 10
+        x = rng.choice([v for v in range(1, 40) if v % 10])
+        learner.observe({"x": x}, (x - 1) % 10)
+    return learner
+
+
+def test_an_exact_rule_waits_for_the_input_that_could_refute_it():
+    lax = _exact_counter(severe=False)  # only rules that already err were challenged: the prior alone validated it
+    assert lax.status() == "validated" and lax.predict({"x": 40}).value == -1 and lax.rival_searches == 0
+    learner = _exact_counter(severe=True)
+    assert all(r["status"] != "validated" for r in learner.status_history)
+    assert learner.rival_searches == 1 and learner._untested_rival(learner.best()[0])
+    for x in (10, 20, 30):
+        learner.observe({"x": x}, 9)
+    assert learner.status() == "validated" and learner.predict({"x": 40}).value == 9
+    clone = RuleLearner.from_state(learner.to_state(), learner.cfg)
+    assert clone._decisive == learner._decisive and clone._challenged == learner._challenged
+    assert clone.status() == "validated"
+
+
+def _observe_terms(learner, terms, start, stop):
+    for t in range(start, stop):
+        learner.observe({"x[t-1]": terms[t - 1], "x[t-2]": terms[t - 2], "x[t-3]": terms[t - 3], "t": t}, terms[t])
+
+
+def test_a_short_rule_is_not_validated_on_its_simplicity_alone():
+    terms = [4]
+    for _ in range(30):
+        terms.append((terms[-1] - 2) % 7)  # x[t-3] + 1 holds until the counter wraps around, at t = 9
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        _observe_terms(learner, terms, 3, 9)
+        assert str(learner.best()[0].expr) == "(x[t-3] + 1)"
+        assert any(r["status"] == "validated" for r in learner.status_history) is not severe
+    _observe_terms(learner, terms, 9, len(terms))
+    assert learner.status() == "validated" and str(learner.best()[0].expr) == "((x[t-1] + -2) % 7)"
+
+
+def test_errors_a_deeper_rule_predicts_are_not_corruption():
+    """((x[t-2] - x[t-1]) % 11) - 1 has 7 nodes, beyond max_size; x[t-2] * -2 + 8 errs on one term in five, which
+    passed for corruption. The deeper rival search finds the 7-node rule, which explains that error too."""
+    terms = [8, 4, 3, 0, 2] * 10
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        feed_sequence(learner, terms[:10])
+        assert str(learner.best()[0].expr) == ("((x[t-2] * -2) + 8)" if not severe else
+                                               "(((x[t-2] - x[t-1]) % 11) + -1)")
+        assert any(r["status"] == "validated" for r in learner.status_history) is not severe
+    assert learner.deep_rival_searches == 1 and learner.cfg.max_size < 7 <= learner.cfg.deepen_size
+    _observe_terms(learner, terms, 10, len(terms))
+    assert learner.status() == "validated" and str(learner.best()[0].expr) == "(((x[t-2] - x[t-1]) % 11) + -1)"
+
+
+def test_observations_a_rule_was_fitted_to_do_not_test_it():
+    """The term at t = 3 was corrupted (16 instead of 3), and x[t-2] - 4 errs there. -21 + x[t-1] % 38, found
+    after it, fits it by coincidence, then predicts every later term as x[t-2] - 4 does, until t = 14."""
+    terms = [3, 7, -1, 16]
+    while len(terms) < 30:
+        terms.append(terms[-2] - 4)
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        _observe_terms(learner, terms, 3, 14)
+        assert str(learner.best()[0].expr) == "(-21 + (x[t-1] % 38))"
+        assert any(r["status"] == "validated" for r in learner.status_history) is not severe
+    assert "(x[t-2] + -4)" in learner._decisive["(-21 + (x[t-1] % 38))"]
+    _observe_terms(learner, terms, 14, len(terms))
+    assert learner.status() == "validated" and str(learner.best()[0].expr) == "(x[t-2] + -4)"
+
+
+def test_only_predictions_separate_a_rule_from_a_rival():
+    assert _unseparated(0b1111, 0b1111, 4)  # the prior alone prefers the rule
+    assert _unseparated(0b1101, 0b1110, 4)  # each errs once
+    assert _unseparated(0b1111, 0b1110, 2)  # one more error, on an observation the rule was fitted to
+    assert not _unseparated(0b1111, 0b1110, 0)  # on one it predicted
+    assert not _unseparated(0b1111, 0b0111, 2)
+    assert not _unseparated(0b1111, 0b1100, 4)  # two more errors: a second coincidence
+
+
+def test_a_clause_the_observations_never_exercised_is_not_a_rival():
+    fib = [1, 2]
+    while len(fib) < 20:
+        fib.append(fib[-1] + fib[-2])
+    first = {}
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        for t in range(3, len(fib)):
+            learner.observe({"x[t-1]": fib[t - 1], "x[t-2]": fib[t - 2], "x[t-3]": fib[t - 3], "t": t}, fib[t])
+            if learner.status() == "validated":
+                first[severe] = (t, str(learner.hyps[0].expr))
+                break
+        if severe:
+            # x[t-1] + x[t-2] % 21 fits as well and differs later, but no observation ever used its modulus.
+            assert learner.rival_searches == 1 and not learner._decisive
+    assert first[True] == first[False] == (7, "(x[t-1] + x[t-2])")
+
+
+def test_an_idle_modulus_is_one_the_observations_never_exercised():
+    rule = app("add", var("x"), app("mod", var("y"), const(27)))
+    assert _idle_modulus(rule, [({"x": 5, "y": y}, 0) for y in (0, 3, 26)])
+    assert not _idle_modulus(rule, [({"x": 5, "y": y}, 0) for y in (3, 30)])
+    assert not _idle_modulus(app("add", var("x"), var("y")), [({"x": 5, "y": 30}, 0)])
+    assert _idle_modulus(app("mul", const(2), app("mod", app("add", var("x"), var("y")), const(9))),
+                         [({"x": 1, "y": 2}, 0)])
+
+
+def test_a_rule_without_an_untested_rival_is_validated_as_soon_as_before():
+    histories = []
+    for severe in (False, True):
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, severe_validation=severe)
+        feed_sequence(learner, [3 * t + 1 for t in range(20)])
+        assert learner.status() == "validated" and not learner._decisive
+        histories.append([(r["n"], r["status"]) for r in learner.status_history])
+    assert histories[0] == histories[1]
+
+
+def test_a_constant_stream_stays_validated():
+    learner = passive_learner()
+    feed_sequence(learner, [4] * 200)  # the learned chance is capped at 1/2: the null never catches up
+    assert learner.status() == "validated"
+    assert learner.predict({"x[t-1]": 4, "x[t-2]": 4, "x[t-3]": 4, "t": 203}).value == 4
+
+
+def test_pattern_test_is_anytime_valid():
+    threshold = math.log(2 / default_configs(DEFAULT_SAFETY)["sequence"].validation_sprt_alpha)
+    crossed = 0
+    for seed in range(300):
+        rng, rate = random.Random(seed), (0.25, 0.5, 0.75)[seed % 3]
+        learner, rule = passive_learner("p", ["x"]), Hypothesis(const(7), 0.0)
+        top = -math.inf
+        for i in range(200):  # a corrupted rule is right at independent times
+            learner.data.append(({"x": i}, 7 if rng.random() < rate else 8))
+            top = max(top, learner._pattern_log_ratio(rule))
+        crossed += top >= threshold
+    assert crossed <= 3  # at most alpha / 2 = 0.5% expected
+    learner, rule = passive_learner("p", ["x"]), Hypothesis(const(7), 0.0)
+    for i in range(40):  # right on one phase of a cycle of four
+        learner.data.append(({"x": i}, 7 if i % 4 == 0 else 8))
+    assert learner._pattern_log_ratio(rule) >= threshold > 0 and PATTERN_ORDERS >= 3
+
+
+def test_a_rule_right_on_one_phase_of_a_cycle_is_incomplete(monkeypatch):
+    terms, cycle = [8, 24], [-6, -5, 9, 8]  # second differences repeat every four terms
+    for t in range(2, 80):
+        terms.append(2 * terms[-1] - terms[-2] + cycle[t % 4])
+
+    def beyond_reach():  # x[t-1] + x[t-3] - x[t-2] + 3t + 40 is found only by the linear solver
+        learner = passive_learner()
+        learner.cfg = dataclasses.replace(learner.cfg, linear_terms=0)
+        feed_sequence(learner, terms)
+        return learner
+
+    learner = beyond_reach()
+    assert learner.status() == "unpredictable" and learner.best()[2] > 0.99
+    assert learner.hyps and all(2 * h.n_ok < h.n_bad for h in learner.hyps)  # each right on about a quarter
+    assert {id(h) for h in learner.hyps} <= learner._incomplete_ids()
+    assert all(r["status"] != "validated" for r in learner.status_history)
+    # Taken for corrupted rules, they beat chance and would keep the question open for ever.
+    monkeypatch.setattr(RuleLearner, "_incomplete_ids", lambda self: frozenset())
+    assert beyond_reach().status() == "unknown"

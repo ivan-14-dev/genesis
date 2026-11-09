@@ -37,7 +37,14 @@ from .perception import Perception
 def default_configs(safety: SafetyPolicy) -> dict:
     common = dict(max_candidates=safety.max_candidates_per_induction, max_seconds=safety.max_seconds_per_induction)
     return {
-        "sequence": InductionConfig(max_size=5, **common),
+        # A passive observer cannot step around a burst of corruption, so a sequence rule is proposed and survives
+        # while it is right on a quarter of the observations, and is judged against chance (a stream's values
+        # rarely repeat) rather than against its own errors: a rule right on half of a heavily corrupted stream is
+        # learned. In the lab, outcomes are a few small shifts (chance is high) and half-right conditionals would
+        # divert the experiments that settle them.
+        "sequence": InductionConfig(max_size=5, search_mismatch_frac=0.75, max_mismatch_frac=0.75,
+                                    noise_unknown_weight=0.01, learned_chance=True, validation_chance=0.1,
+                                    severe_validation=True, **common),
         "lab": InductionConfig(max_size=3, allow_conditionals=True, outcome_range=101, deepen_size=0, **common),
     }
 

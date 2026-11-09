@@ -161,6 +161,23 @@ def test_shape_kernel_matches_python_reference():
     assert search.match_shape(parse_shape("if_eq(V,C,V,V)"), [{"a": 1}], [1], ["a"], [0], 0) is None
 
 
+def test_bias_fit_at_half_tolerance_stays_on_the_kernel(monkeypatch):
+    """A fitted constant must be the residual of a strict majority: a tolerance of n / 2 is capped below it, on both
+    backends, instead of sending every bias-fitted shape to the slow Python path."""
+    inputs = [{"a": a, "t": t} for t, a in enumerate([3, 1, 4, 1, 5, 9, 2, 6])]
+    ys = [a + 2 if t % 2 else a + 5 for t, a in ((d["t"], d["a"]) for d in inputs)]
+    tree = parse_shape("V")
+    got = search.match_shape(tree, inputs, ys, ["a", "t"], [0, 1, 2], 4, fit_bias=True)
+    assert got[0] == []  # +2 and +5 tie: no strict majority, no fitted constant
+    ys[0] = inputs[0]["a"] + 2
+    got = search.match_shape(tree, inputs, ys, ["a", "t"], [0, 1, 2], 4, fit_bias=True)
+    assert got[0] == [(("a",), (), 2, 3)]
+    if search.backend_info()["active"] == "c":
+        assert got[2] == "c"
+    monkeypatch.setenv("GENESIS_SEARCH_BACKEND", "python")
+    assert search.match_shape(tree, inputs, ys, ["a", "t"], [0, 1, 2], 4, fit_bias=True)[:2] == got[:2]
+
+
 def test_remembered_deep_shapes_transfer_to_new_worlds():
     from genesis.experiments import run_procedural_transfer
 

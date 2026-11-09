@@ -1,3 +1,4 @@
+import math
 import random
 
 from genesis import library
@@ -116,6 +117,10 @@ def test_recognizer_tells_rule_less_series_from_rules_it_has_never_seen():
                series(lambda h, t: t * t - 3 * t, [0, 0]), series(lambda h, t: h[-1] + h[-2], [1, 2])):
         assert rec.p_noise(library.features(ys)) < 0.1
     assert library.Recognizer().p_noise(frozenset()) is None
+    assert library.Recognizer().noise_log_odds(frozenset()) is None
+    for ys in ([rng.randint(0, 60) for _ in range(12)], series(lambda h, t: h[-2] + 5, [3, 9])):
+        odds, p = rec.noise_log_odds(library.features(ys)), rec.p_noise(library.features(ys))
+        assert math.isclose(1 / (1 + math.exp(-odds)), p, rel_tol=1e-9)
     geometric = library.features([3 * 2 ** i for i in range(12)])
     assert rec.rank(["add(V,C)", "mul(V,C)"], geometric) == ["mul(V,C)", "add(V,C)"]  # never a reserved class
     # Dreams are cached; statistics computed with another (or an unrecorded) feature set are dreamt again.

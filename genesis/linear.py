@@ -21,9 +21,13 @@ hypothesis (Occam prior on their size, likelihood on all observations). Pure Pyt
 
 from __future__ import annotations
 
+import ctypes
 from itertools import combinations
 
+from . import search
 from .expressions import Expr, app, const, var
+
+_C_SAFE = 2**62  # larger |values| are flagged for the kernel, whose systems on them are solved in Python
 
 
 def solve_exact(m: list) -> tuple | None:
@@ -119,9 +123,9 @@ def linear_rules(inputs: list, ys, var_names: list, windows, tol: int, max_terms
     (window rank, then subsets by size and feature order, then rows). ``windows(length)`` gives the windows of
     that many rows, most informative first. A rule with k unknowns (its coefficients and the constant) is solved
     on every k rows of a window of max(4, k + 1) rows: corrupted observations spaced closer than k rows apart
-    leave no k consecutive clean rows, but one row to spare per window is enough to step over each of them."""
+    leave no k consecutive clean rows, but one row to spare per window is enough to step over each of them.
+    The C kernel (genesis/_search.c, gn_linear) computes the same result as the Python reference below."""
     ys = tuple(ys)
-    n = len(ys)
     feats = features(inputs, var_names, products)
     # A product costs two terms (it is three nodes, not one): at most one, within the same budget.
     subsets = [s for k in range(1, max_terms + 1) for s in combinations(range(len(feats)), k)
@@ -131,6 +135,41 @@ def linear_rules(inputs: list, ys, var_names: list, windows, tol: int, max_terms
         length = max(4, len(s) + 1 + spare)
         if length not in by_len:
             by_len[length] = windows(length)
+    args = (ys, feats, subsets, by_len, tol, max_terms, max_coef, max_const, min_support, cap, spare)
+    if search._requested_backend() != "python" and search._load_c() and search._c.get("linear") is not None:
+        got = _linear_c(*args)
+        if got is not None:
+            return got
+    return _linear_python(*args)
+
+
+def _solve_system(cols: list, rows, ys, max_coef: int, max_const: int) -> tuple | None:
+    """``(coefficients, constant)`` of the system on ``rows`` when it has an admissible solution, else None."""
+    sol = solve_exact([[col[r] for col in cols] + [1, ys[r]] for r in rows])
+    if sol is None:
+        return None
+    num, d = sol
+    if any(x % d for x in num):
+        return None
+    coefs = [x // d for x in num]
+    c = coefs.pop()
+    if any(a == 0 or abs(a) > max_coef for a in coefs) or abs(c) > max_const:
+        return None
+    return coefs, c
+
+
+def _mismatches(cols: list, coefs: list, c: int, ys, tol: int) -> int:
+    """Observations the rule mispredicts, counted until one more than ``tol``."""
+    bad = 0
+    for r in range(len(ys)):
+        bad += sum(a * col[r] for a, col in zip(coefs, cols)) + c != ys[r]
+        if bad > tol:
+            break
+    return bad
+
+
+def _linear_python(ys, feats, subsets, by_len, tol, max_terms, max_coef, max_const, min_support, cap, spare):
+    n = len(ys)
     out, seen, tried, solved = [], set(), set(), 0
     for w in range(max((len(ws) for ws in by_len.values()), default=0)):
         for s in subsets:
@@ -143,28 +182,90 @@ def linear_rules(inputs: list, ys, var_names: list, windows, tol: int, max_terms
                     continue
                 tried.add((s, rows))
                 cols = [feats[i][1] for i in s]
-                sol = solve_exact([[col[r] for col in cols] + [1, ys[r]] for r in rows])
+                sol = _solve_system(cols, rows, ys, max_coef, max_const)
                 solved += 1
                 if sol is None:
                     continue
-                num, d = sol
-                if any(x % d for x in num):
-                    continue
-                coefs = [x // d for x in num]
-                c = coefs.pop()
-                if any(a == 0 or abs(a) > max_coef for a in coefs) or abs(c) > max_const:
-                    continue
+                coefs, c = sol
                 key = (s, tuple(coefs), c)
                 if key in seen:
                     continue
                 seen.add(key)
-                bad = 0
-                for r in range(n):
-                    bad += sum(a * col[r] for a, col in zip(coefs, cols)) + c != ys[r]
-                    if bad > tol:
-                        break
+                bad = _mismatches(cols, coefs, c, ys, tol)
                 if bad <= tol and n - bad >= k + min_support:
                     out.append((build([feats[i][0] for i in s], coefs, c), bad))
                     if len(out) >= cap:
                         return out, solved
     return out, solved
+
+
+def _linear_c(ys, feats, subsets, by_len, tol, max_terms, max_coef, max_const, min_support, cap, spare):
+    """The reference's loop in C. Each system is solved modulo 31-bit primes (an admissible solution is unique when
+    the system is nonsingular modulo a prime, and equals the symmetric residues) and substituted back exactly
+    (128-bit integers where the compiler has them, overflow-checked int64 otherwise); singularity is proven when the
+    product of the primes it is singular modulo exceeds Hadamard's bound on the determinant. Systems this cannot
+    settle (values flagged big, an overflow, a bound beyond the primes) are handed back one at a time and solved
+    here, exactly as in the reference, before the kernel resumes; None when the configuration is out of the
+    kernel's range."""
+    n = len(ys)
+    if not subsets or max_terms + 1 > 9 or max_coef > 2**16 or max_const > 2**29:
+        return None
+    n_win = max((len(ws) for ws in by_len.values()), default=0)
+    # Row combinations per (unknowns k, window rank), each tried once per subset: the reference's ``tried`` set.
+    off, cnt, flat = [0] * ((max_terms + 2) * n_win), [0] * ((max_terms + 2) * n_win), []
+    for k in sorted({len(s) + 1 for s in subsets}):
+        ws, seen = by_len[max(4, k + spare)], set()
+        for w in range(n_win):
+            off[k * n_win + w] = len(flat)
+            if w >= len(ws) or k > len(ws[w]) or n < k + min_support:
+                continue
+            for rows in combinations(ws[w], k) if spare else (tuple(ws[w][:k]),):
+                if rows not in seen:
+                    seen.add(rows)
+                    flat.extend(rows)
+                    cnt[k * n_win + w] += 1
+    I8, I32, I64 = ctypes.c_int8, ctypes.c_int32, ctypes.c_int64
+    values = [v for _, vals, _ in feats for v in vals] + list(ys)
+    big = [abs(v) > _C_SAFE for v in values]
+    sub_feat = [0] * (len(subsets) * max_terms)
+    for i, s in enumerate(subsets):
+        sub_feat[i * max_terms: i * max_terms + len(s)] = s
+    out_sub, out_bad = (I32 * cap)(), (I32 * cap)()
+    out_coef, out_c = (I64 * (cap * max_terms))(), (I64 * cap)()
+    n_out, solved, pos = I32(), I64(), (I32 * 3)()
+    masked = [0 if b else v for v, b in zip(values, big)]
+    nfv = n * len(feats)
+    args = (n, (I64 * n)(*masked[nfv:]), len(feats), (I64 * max(1, nfv))(*masked[:nfv]), (I8 * len(big))(*big), len(subsets), (I32 * len(subsets))(*map(len, subsets)),
+            (I32 * len(sub_feat))(*sub_feat), max_terms, n_win, (I32 * len(off))(*off), (I32 * len(cnt))(*cnt),
+            (I32 * max(1, len(flat)))(*flat), tol, max_coef, max_const, min_support, cap, out_sub, out_coef, out_c,
+            out_bad, ctypes.byref(n_out), ctypes.byref(solved), pos)
+    while (rc := search._c["linear"](*args)) == 3:
+        w, si, ci = pos
+        s = subsets[si]
+        k = len(s) + 1
+        start = off[k * n_win + w] + ci * k
+        cols = [feats[i][1] for i in s]
+        solved.value += 1
+        sol = _solve_system(cols, flat[start:start + k], ys, max_coef, max_const)
+        if sol is not None and not any(out_sub[o] == si and out_c[o] == sol[1]
+                                       and list(out_coef[o * max_terms: o * max_terms + len(s)]) == sol[0]
+                                       for o in range(n_out.value)):
+            coefs, c = sol
+            bad = _mismatches(cols, coefs, c, ys, tol)
+            if bad <= tol and n - bad >= k + min_support:
+                o = n_out.value
+                out_sub[o], out_c[o], out_bad[o] = si, c, bad
+                out_coef[o * max_terms: o * max_terms + len(s)] = coefs
+                n_out.value += 1
+                if n_out.value >= cap:
+                    break
+        pos[2] = ci + 1
+    else:
+        if rc != 0:
+            raise ValueError("linear kernel rejected its arguments")
+    out = []
+    for i in range(n_out.value):
+        s = subsets[out_sub[i]]
+        coefs = list(out_coef[i * max_terms: i * max_terms + len(s)])
+        out.append((build([feats[j][0] for j in s], coefs, out_c[i]), out_bad[i]))
+    return out, solved.value
