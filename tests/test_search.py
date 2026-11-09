@@ -14,27 +14,31 @@ def _random_case(rng):
     inputs = [{"a": rng.randint(-9, 9), "b": rng.randint(0, 12), "t": t} for t in range(n)]
     k1, k2 = rng.randint(-4, 4), rng.randint(2, 9)
     f = rng.choice([lambda d: d["t"] * (d["t"] + k1) + k2, lambda d: (2 * d["a"] + k1) % k2,
-                    lambda d: d["a"] + 2 * d["t"] - k1, lambda d: rng.randint(-50, 50)])
+                    lambda d: d["a"] + 2 * d["t"] - k1, lambda d: rng.randint(-50, 50),
+                    lambda d: 2 * d["a"] - 3 * d["t"] + k1, lambda d: d["t"] * (2 * d["t"] + k1) - k2])
     ys = [f(d) for d in inputs]
     for _ in range(rng.randint(0, 2)):
         ys[rng.randrange(n)] += rng.randint(1, 9)
     consts = sorted({0, 1, 2, 3} | {rng.randint(-6, 12) for _ in range(rng.randint(0, 4))})
     tol = rng.randint(0, int(0.4 * n))
-    return (inputs, tuple(ys), names, consts, tol, 5, rng.choice([300, 5000, 60000]), 100.0, 3, search.OPS, 3,
-            rng.choice([-1, 0, tol, n]), 7, search._windows(n, rng.choice([4, 6, 8]), rng.randint(1, 4)))
+    return (inputs, tuple(ys), names, consts, tol, rng.choice([3, 5, 5]), rng.choice([300, 5000, 60000]), 100.0, 3,
+            search.OPS, 3, rng.choice([-1, 0, tol, n]), 7, search._windows(n, rng.choice([2, 4, 6, 8]),
+                                                                           rng.randint(1, 4)),
+            rng.choice([0, 7, 9, 11]))
 
 
 def test_c_kernel_matches_python_reference():
     if search.backend_info()["active"] != "c":
         pytest.skip("no C compiler: the Python reference is the only backend")
     rng = random.Random(11)
-    deep_hits = 0
-    for _ in range(80):
+    deep_hits = affine_hits = 0
+    for _ in range(160):
         args = _random_case(rng)
         c, py = search._search_c(*args), search._search_python(*args)
         assert search._summary(c) == search._summary(py)
         deep_hits += bool(py.deep)
-    assert deep_hits > 0
+        affine_hits += any(e.size > args[5] + 2 and e.op == "add" and e.args[1].op == "const" for e, _ in py.deep)
+    assert deep_hits > 0 and affine_hits > 0
 
 
 def test_bias_fit_tolerates_corrupted_observations():
@@ -63,6 +67,32 @@ def test_deepening_finds_rules_beyond_the_enumerated_size():
     t = 20
     assert any(e.evaluate({"t": t}) == t * (t + 3) - 2 for e, _ in deep.deep)
     assert deep.counts[7] > deep.counts[5]
+
+
+def test_iterative_deepening_reaches_nine_and_eleven_nodes():
+    inputs = [{"a": a, "b": b, "t": t} for t, (a, b) in enumerate(zip([3, -1, 4, 1, -5, 9, 2, -6, 5, 3, 5, 8],
+                                                                      [2, 7, 1, -8, 2, 8, -1, 8, 2, 8, 4, 5]))]
+    cases = [  # (rule, smallest size, constants): none is reachable by enumeration (5) or size-7 deepening
+        (lambda d: 2 * d["a"] - 3 * d["b"] + 7, 9, [0, 1, 2, 3]),
+        (lambda d: 2 * d["a"] + 3 * d["t"] * d["t"] - 4, 11, [0, 1, 2, 3]),
+    ]
+    for rule, size, consts in cases:
+        ys = [rule(d) for d in inputs]
+        ys[1] += 6  # one corrupted observation (outside the most recent window)
+        for backend in ["python"] + (["c"] if search.backend_info()["active"] == "c" else []):
+            search.set_backend(backend)
+            try:
+                seven = search.search_programs(inputs, ys, ["a", "b", "t"], consts, 2, 5, 60000, 20.0, 3,
+                                               deepen_bad=2, deep_size=7)
+                deep = search.search_programs(inputs, ys, ["a", "b", "t"], consts, 2, 5, 60000, 20.0, 3,
+                                              deepen_bad=2, deep_size=7, deep_max_size=11)
+            finally:
+                search.set_backend(None)
+            assert not any(b <= 2 for _, b in seven.deep)
+            probe = {"a": 40, "b": -13, "t": 30}
+            hits = [e for e, b in deep.deep if b <= 2 and e.evaluate(probe) == rule(probe)]
+            assert hits and min(e.size for e in hits) == size
+            assert deep.counts[size] > deep.counts[size - 2]
 
 
 def test_search_rejects_inconsistent_inputs(monkeypatch):

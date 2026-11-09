@@ -25,6 +25,32 @@ def test_expression_evaluation_and_serialisation():
     assert app("mod", var("x"), const(0)).evaluate({"x": 5}) is None
 
 
+def test_belief_evaluation_is_exact_beyond_the_search_bound():
+    double = app("mul", var("x"), const(2))
+    assert double.evaluate({"x": 10**18}) is None  # bounded innate semantics (search kernels)
+    assert double.evaluate({"x": 10**18}, True) == 2 * 10**18
+    square = app("mul", var("x"), var("x"))
+    assert square.evaluate({"x": 1 << 3000}, True) is None  # exact values are length-capped
+    assert app("mod", var("x"), const(0)).evaluate({"x": 5}, True) is None
+
+
+def test_geometric_rule_survives_past_the_search_bound():
+    rng = random.Random(3)
+    terms = [3, 6]
+    while len(terms) < 90:  # 3 * 2^t passes 10^18 near t = 59
+        v = terms[-1] * 2
+        if len(terms) % 7 == 0:
+            v += rng.randint(1, 15) * rng.choice([-1, 1])  # innovation noise: later terms continue from it
+        terms.append(v)
+    learner = seq_learner()
+    feed_sequence(learner, terms)
+    best, _, _ = learner.best()
+    assert learner.status() == "validated"
+    assert str(best.expr) in ("(x[t-1] * 2)", "(x[t-1] + x[t-1])")
+    nxt = {"x[t-1]": terms[-1], "x[t-2]": terms[-2], "x[t-3]": terms[-3], "t": len(terms)}
+    assert learner.predict(nxt).value == 2 * terms[-1] > 10**27
+
+
 def test_enumeration_is_deduplicated_and_grows_with_size():
     rng = random.Random(0)
     probes = [{"x": rng.randint(-9, 9), "y": rng.randint(-9, 9)} for _ in range(10)]
@@ -89,6 +115,25 @@ def test_discovers_conditional_rule():
         learner.observe(s, y)
     assert learner.status() == "validated"
     assert learner.best()[0].expr.condition_variable() == "p1"
+
+
+def test_discovers_conditional_rule_through_corrupted_outcomes():
+    rng = random.Random(2)
+    cfg = InductionConfig(max_size=3, allow_conditionals=True, outcome_range=101, deepen_size=0)
+    learner = RuleLearner("c", ["p0", "p1", "p2"], cfg)
+    corrupted = 0
+    for i in range(60):
+        s = {p: rng.randint(0, 5) for p in ("p0", "p1", "p2")}
+        y = s["p2"] if s["p0"] == 3 else s["p1"]  # "if p0 == 3: copy p2", else unchanged
+        if i == 1 or rng.random() < 0.1:  # an early corrupted outcome: no exact conditional ever exists
+            y += rng.choice([-3, -2, -1, 1, 2, 3])
+            corrupted += 1
+        learner.observe(s, y)
+    best = learner.best()[0].expr
+    assert corrupted >= 3
+    assert learner.status() == "validated"
+    assert best.condition_variable() == "p0" and best.args[1].value == 3
+    assert [best.evaluate({"p0": p0, "p1": 1, "p2": 4}) for p0 in (2, 3)] == [1, 4]
 
 
 def test_learner_state_round_trip():

@@ -8,11 +8,14 @@
  *   - a candidate whose output on any observation is undefined is dropped;
  *   - candidates up to keep_all_upto nodes are all kept, larger ones only if their output signature is new;
  *   - enumeration order, commutativity and triviality pruning, candidate budget and counters are identical.
- * Deepening (only when nothing enumerated fits well) reaches expressions two nodes larger without enumerating
- * them: bias fits "e + r" on the largest level, "e % c" on the largest level, and a meet-in-the-middle step
- * that, for each candidate A and operator, computes the output B must have (y - A, A - y, y + A, y / A) on a
- * window of observations and looks it up in a hash table of the enumerated signatures. Every hit is checked on
- * all observations against the mismatch tolerance, so noisy observations inside one window only cost a miss.
+ * Deepening (only when nothing enumerated fits well) reaches larger expressions without enumerating them:
+ * bias fits "e + r" and remainders "e % c" on the level two nodes below, and a meet-in-the-middle step that,
+ * for each candidate A and operator, computes the output B must have (y - A, A - y, y + A, y / A) on a window
+ * of observations and looks it up in a hash table of the enumerated signatures. When that lower level is not
+ * enumerated either, an affine meet in the middle finds "(A op B) + c" by looking B up up to a constant shift
+ * (window differences), c being fitted. Sizes grow by two (iterative deepening) until one explains the data.
+ * Every hit is checked on all observations against the mismatch tolerance, so noisy observations inside one
+ * window only cost a miss.
  * The kernel never allocates more than the caller-sized arena and only reads/writes caller buffers.
  */
 #define _POSIX_C_SOURCE 199309L
@@ -22,6 +25,7 @@
 #include <time.h>
 
 #define LIMIT 1000000000000000000LL
+#define SAFE_ABS (1LL << 61) /* inputs are at most 2^61 (genesis.search._SAFE): differences fit in int64 */
 enum { OP_ADD = 0, OP_SUB = 1, OP_MUL = 2, OP_MOD = 3 };
 
 static double now_s(void) {
@@ -127,6 +131,16 @@ static int verify(int op, const int64_t *l, const int64_t *r, const int64_t *ys,
     return bad;
 }
 
+/* Mismatches of (op(row_l, row_r) + c) against ys, stopping once above tol. */
+static int verify_affine(int op, const int64_t *l, const int64_t *r, int64_t c, const int64_t *ys, int n, int tol) {
+    int bad = 0;
+    for (int t = 0; t < n && bad <= tol; t++) {
+        int64_t v, w;
+        if (!combine(op, l[t], r[t], &v) || !combine(OP_ADD, v, c, &w) || w != ys[t]) bad++;
+    }
+    return bad;
+}
+
 #define CHAIN_MAX 64
 
 /*
@@ -139,8 +153,10 @@ static int verify(int op, const int64_t *l, const int64_t *r, const int64_t *ys,
  * match_*      out: nodes with <= tol mismatches, in enumeration order (capacity cap)
  * off_*        out: bias fits "node + r" (r != 0) with n - count(y - node == r) <= tol (capacity cap)
  * deepen_bad   deepen only if no match/offset has <= deepen_bad mismatches (-1: never)
- * deep_size    size of the deepened expressions; win_rows[n_win * win_len] observation windows for the lookup
- * deep_*       out: kind -2 = bias (l + val), otherwise operator code with children l, r (capacity cap)
+ * deep_size    size of the deepened expressions; deep_max: iterative deepening up to this size (step 2)
+ * win_rows[n_win * win_len] observation windows for the lookup
+ * deep_*       out: kind -2 = bias (l + val), otherwise operator code with children l, r, plus val when
+ *              val != 0 (affine: "(l op r) + val") (capacity cap)
  * Returns 0 on success, -1 on allocation failure.
  */
 int gn_search(int n, const int64_t *ys, int n_leaves, const int64_t *leaf_sigs, const int32_t *leaf_const,
@@ -150,7 +166,7 @@ int gn_search(int n, const int64_t *ys, int n_leaves, const int64_t *leaf_sigs, 
               int64_t *counts, int64_t *stats,
               int32_t *match_node, int32_t *match_bad, int64_t *n_match,
               int32_t *off_node, int32_t *off_bad, int64_t *off_val, int64_t *n_off,
-              int deepen_bad, int deep_size, int n_win, int win_len, const int32_t *win_rows,
+              int deepen_bad, int deep_size, int deep_max, int n_win, int win_len, const int32_t *win_rows,
               int32_t *deep_kind, int32_t *deep_l, int32_t *deep_r, int32_t *deep_bad, int64_t *deep_val,
               int64_t *n_deep) {
     double t0 = now_s();
@@ -261,122 +277,207 @@ int gn_search(int n, const int64_t *ys, int n_leaves, const int64_t *leaf_sigs, 
     if (deepen_bad >= 0 && best > deepen_bad && deep_size > top && deep_size - 1 - top >= 1) {
         stats[3] = 1;
         int64_t nd = 0;
-        int last = deep_size - 2; /* level whose bias / mod fits have deep_size nodes */
-        /* 1. Bias fits on the level just below deep_size. */
-        if (last <= max_size && n >= 2) {
-            for (int64_t k = lv_start[last]; k < lv_end[last] && nd < cap; k++) {
-                const int64_t *row = sigs + k * n;
-                int64_t cand = 0, votes = 0;
-                for (int t = 0; t < n; t++) {
-                    int64_t r = ys[t] - row[t];
-                    if (votes == 0) { cand = r; votes = 1; } else votes += (r == cand) ? 1 : -1;
-                }
-                if (tol == 0) cand = ys[0] - row[0];
-                if (cand == 0) continue;
-                int miss = 0;
-                for (int t = 0; t < n && miss <= tol; t++) miss += (ys[t] - row[t]) != cand;
-                if (miss <= tol) { deep_kind[nd] = -2; deep_l[nd] = (int32_t)k; deep_r[nd] = -1;
-                                   deep_bad[nd] = miss; deep_val[nd] = cand; nd++; }
-            }
-            /* 2. Remainders of that level by a constant leaf. */
-            int has_mod = 0;
-            for (int pi = 0; pi < n_ops; pi++) has_mod |= ops[pi] == OP_MOD;
-            for (int64_t k = lv_start[last]; has_mod && k < lv_end[last] && nd < cap; k++) {
-                for (int64_t c = lv_start[1]; c < lv_end[1] && nd < cap; c++) {
-                    if (!is_const[c] || sigs[c * n] <= 1) continue;
-                    int bad = verify(OP_MOD, sigs + k * n, sigs + c * n, ys, n, tol);
-                    if (bad <= tol) { deep_kind[nd] = OP_MOD; deep_l[nd] = (int32_t)k; deep_r[nd] = (int32_t)c;
-                                      deep_bad[nd] = bad; deep_val[nd] = 0; nd++; }
-                }
-            }
-        }
-        /* 3. Meet in the middle on each window: A op B = y  =>  B's window outputs are determined by A's. */
+        int has_mod = 0;
+        for (int pi = 0; pi < n_ops; pi++) has_mod |= ops[pi] == OP_MOD;
         uint64_t wsize = 1;
         while (wsize < (uint64_t)ncand * 2 + 2) wsize <<= 1;
+        /* Two window indexes: exact window outputs (for A op B) and outputs up to a shift (for A op B + c). */
         int32_t *wslots = (int32_t *)malloc(sizeof(int32_t) * wsize);
+        int32_t *dslots = (int32_t *)malloc(sizeof(int32_t) * wsize);
         int32_t *wnext = (int32_t *)malloc(sizeof(int32_t) * (size_t)(ncand + 1));
         int32_t *wtail = (int32_t *)malloc(sizeof(int32_t) * (size_t)(ncand + 1));
+        int32_t *dnext = (int32_t *)malloc(sizeof(int32_t) * (size_t)(ncand + 1));
+        int32_t *dtail = (int32_t *)malloc(sizeof(int32_t) * (size_t)(ncand + 1));
         uint64_t *whash = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(ncand + 1));
+        uint64_t *dhash = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(ncand + 1));
         int64_t *need = (int64_t *)malloc(sizeof(int64_t) * (size_t)(win_len + 1));
-        if (!wslots || !wnext || !wtail || !whash || !need) rc = -1;
+        if (!wslots || !dslots || !wnext || !wtail || !dnext || !dtail || !whash || !dhash || !need) rc = -1;
         int timed_out = 0;
-        for (int w = 0; rc == 0 && w < n_win && nd < cap && !timed_out; w++) {
-            const int32_t *rows = win_rows + (int64_t)w * win_len;
-            memset(wslots, 0, sizeof(int32_t) * wsize);
-            for (int64_t k = 0; k < ncand; k++) {
-                uint64_t h = 0x9E3779B97F4A7C15ULL;
-                for (int i = 0; i < win_len; i++) {
-                    h ^= (uint64_t)sigs[k * n + rows[i]] * 0xff51afd7ed558ccdULL;
-                    h = ((h << 31) | (h >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+        /* Iterative deepening: deep_size, deep_size + 2, ... deep_max, stopping at the first size that explains
+         * all but deepen_bad observations. */
+        for (int ds = deep_size; rc == 0 && ds <= deep_max && nd < cap && !timed_out; ds += 2) {
+            int64_t nd0 = nd;
+            int last = ds - 2; /* level whose bias / mod fits have ds nodes */
+            /* 1. Bias fits on the level just below ds. */
+            if (last <= max_size && n >= 2) {
+                for (int64_t k = lv_start[last]; k < lv_end[last] && nd < cap; k++) {
+                    const int64_t *row = sigs + k * n;
+                    int64_t cand = 0, votes = 0;
+                    for (int t = 0; t < n; t++) {
+                        int64_t r = ys[t] - row[t];
+                        if (votes == 0) { cand = r; votes = 1; } else votes += (r == cand) ? 1 : -1;
+                    }
+                    if (tol == 0) cand = ys[0] - row[0];
+                    if (cand == 0) continue;
+                    int miss = 0;
+                    for (int t = 0; t < n && miss <= tol; t++) miss += (ys[t] - row[t]) != cand;
+                    if (miss <= tol) { deep_kind[nd] = -2; deep_l[nd] = (int32_t)k; deep_r[nd] = -1;
+                                       deep_bad[nd] = miss; deep_val[nd] = cand; nd++; }
                 }
-                h ^= h >> 29;
-                whash[k] = h;
-                wnext[k] = -1;
-                uint64_t i = h & (wsize - 1);
-                for (;; i = (i + 1) & (wsize - 1)) {
-                    int32_t s = wslots[i];
-                    if (!s) { wslots[i] = (int32_t)k + 1; wtail[k] = (int32_t)k; break; }
-                    int64_t hd = s - 1;
-                    if (whash[hd] != h) continue;
-                    int eq = 1;
-                    for (int q = 0; q < win_len && eq; q++) eq = sigs[hd * n + rows[q]] == sigs[k * n + rows[q]];
-                    if (eq) { wnext[wtail[hd]] = (int32_t)k; wtail[hd] = (int32_t)k; break; }
-                }
-            }
-            for (int64_t a = 0; a < ncand && nd < cap; a++) {
-                if ((a & 1023) == 0 && now_s() - t0 > max_seconds) { stats[1] = 1; timed_out = 1; break; }
-                int sa = node_size[a];
-                if (deep_size - 1 - sa < 1) continue;
-                const int64_t *A = sigs + a * n;
-                /* (op, a on the left?) in a fixed order: add, sub(A - B), sub(B - A), mul */
-                for (int variant = 0; variant < 4 && nd < cap; variant++) {
-                    int op = variant == 0 ? OP_ADD : variant == 3 ? OP_MUL : OP_SUB;
-                    int a_left = variant != 2;
-                    int allowed = 0;
-                    for (int pi = 0; pi < n_ops; pi++) allowed |= ops[pi] == op;
-                    if (!allowed) continue;
-                    int ok = 1;
-                    for (int i = 0; i < win_len && ok; i++) {
-                        int64_t y = ys[rows[i]], x = A[rows[i]];
-                        if (variant == 0) need[i] = y - x;
-                        else if (variant == 1) need[i] = x - y;
-                        else if (variant == 2) need[i] = y + x;
-                        else if (x == 0 || y % x != 0) ok = 0;
-                        else need[i] = y / x;
-                    }
-                    if (!ok) continue;
-                    uint64_t h = 0x9E3779B97F4A7C15ULL;
-                    for (int i = 0; i < win_len; i++) {
-                        h ^= (uint64_t)need[i] * 0xff51afd7ed558ccdULL;
-                        h = ((h << 31) | (h >> 33)) * 0xc4ceb9fe1a85ec53ULL;
-                    }
-                    h ^= h >> 29;
-                    int64_t head = -1;
-                    for (uint64_t i = h & (wsize - 1);; i = (i + 1) & (wsize - 1)) {
-                        int32_t s = wslots[i];
-                        if (!s) break;
-                        int64_t hd = s - 1;
-                        if (whash[hd] != h) continue;
-                        int eq = 1;
-                        for (int q = 0; q < win_len && eq; q++) eq = sigs[hd * n + rows[q]] == need[q];
-                        if (eq) { head = hd; break; }
-                    }
-                    int steps = 0;
-                    for (int64_t b = head; b >= 0 && steps < CHAIN_MAX && nd < cap; b = wnext[b], steps++) {
-                        if (sa + node_size[b] + 1 != deep_size) continue;
-                        int64_t l = a_left ? a : b, r = a_left ? b : a;
-                        if ((op == OP_ADD || op == OP_MUL) &&
-                            (node_size[l] > node_size[r] || (node_size[l] == node_size[r] && l > r))) continue;
-                        if (trivial(op, is_const[l], is_const[l] ? sigs[l * n] : 0, is_const[r],
-                                    is_const[r] ? sigs[r * n] : 0, l == r)) continue;
-                        int bad = verify(op, sigs + l * n, sigs + r * n, ys, n, tol);
-                        if (bad <= tol) { deep_kind[nd] = op; deep_l[nd] = (int32_t)l; deep_r[nd] = (int32_t)r;
+                /* 2. Remainders of that level by a constant leaf. */
+                for (int64_t k = lv_start[last]; has_mod && k < lv_end[last] && nd < cap; k++) {
+                    for (int64_t c = lv_start[1]; c < lv_end[1] && nd < cap; c++) {
+                        if (!is_const[c] || sigs[c * n] <= 1) continue;
+                        int bad = verify(OP_MOD, sigs + k * n, sigs + c * n, ys, n, tol);
+                        if (bad <= tol) { deep_kind[nd] = OP_MOD; deep_l[nd] = (int32_t)k; deep_r[nd] = (int32_t)c;
                                           deep_bad[nd] = bad; deep_val[nd] = 0; nd++; }
                     }
                 }
             }
+            /* When level ds - 2 is not enumerated, its bias fits come from an affine meet in the middle. */
+            int affine = last > max_size;
+            /* 3. Meet in the middle on each window: A op B (+ c) = y => B's window outputs follow from A's. */
+            for (int w = 0; w < n_win && nd < cap && !timed_out; w++) {
+                const int32_t *rows = win_rows + (int64_t)w * win_len;
+                memset(wslots, 0, sizeof(int32_t) * wsize);
+                if (affine) memset(dslots, 0, sizeof(int32_t) * wsize);
+                for (int64_t k = 0; k < ncand; k++) {
+                    const int64_t *S = sigs + k * n;
+                    uint64_t h = 0x9E3779B97F4A7C15ULL;
+                    for (int i = 0; i < win_len; i++) {
+                        h ^= (uint64_t)S[rows[i]] * 0xff51afd7ed558ccdULL;
+                        h = ((h << 31) | (h >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+                    }
+                    h ^= h >> 29;
+                    whash[k] = h;
+                    wnext[k] = -1;
+                    for (uint64_t i = h & (wsize - 1);; i = (i + 1) & (wsize - 1)) {
+                        int32_t s = wslots[i];
+                        if (!s) { wslots[i] = (int32_t)k + 1; wtail[k] = (int32_t)k; break; }
+                        int64_t hd = s - 1;
+                        if (whash[hd] != h) continue;
+                        int eq = 1;
+                        for (int q = 0; q < win_len && eq; q++) eq = sigs[hd * n + rows[q]] == S[rows[q]];
+                        if (eq) { wnext[wtail[hd]] = (int32_t)k; wtail[hd] = (int32_t)k; break; }
+                    }
+                    if (!affine) continue;
+                    h = 0x9E3779B97F4A7C15ULL;
+                    for (int i = 1; i < win_len; i++) {
+                        h ^= (uint64_t)(S[rows[i]] - S[rows[0]]) * 0xff51afd7ed558ccdULL;
+                        h = ((h << 31) | (h >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+                    }
+                    h ^= h >> 29;
+                    dhash[k] = h;
+                    dnext[k] = -1;
+                    for (uint64_t i = h & (wsize - 1);; i = (i + 1) & (wsize - 1)) {
+                        int32_t s = dslots[i];
+                        if (!s) { dslots[i] = (int32_t)k + 1; dtail[k] = (int32_t)k; break; }
+                        int64_t hd = s - 1;
+                        if (dhash[hd] != h) continue;
+                        const int64_t *H = sigs + hd * n;
+                        int eq = 1;
+                        for (int q = 1; q < win_len && eq; q++)
+                            eq = H[rows[q]] - H[rows[0]] == S[rows[q]] - S[rows[0]];
+                        if (eq) { dnext[dtail[hd]] = (int32_t)k; dtail[hd] = (int32_t)k; break; }
+                    }
+                }
+                for (int64_t a = 0; a < ncand && nd < cap; a++) {
+                    if ((a & 1023) == 0 && now_s() - t0 > max_seconds) { stats[1] = 1; timed_out = 1; break; }
+                    int sa = node_size[a];
+                    const int64_t *A = sigs + a * n;
+                    int want = ds - 1 - sa;
+                    /* (op, a on the left?) in a fixed order: add, sub(A - B), sub(B - A), mul */
+                    for (int variant = 0; want >= 1 && want <= top && variant < 4 && nd < cap; variant++) {
+                        int op = variant == 0 ? OP_ADD : variant == 3 ? OP_MUL : OP_SUB;
+                        int a_left = variant != 2;
+                        int allowed = 0;
+                        for (int pi = 0; pi < n_ops; pi++) allowed |= ops[pi] == op;
+                        if (!allowed) continue;
+                        int ok = 1;
+                        for (int i = 0; i < win_len && ok; i++) {
+                            int64_t y = ys[rows[i]], x = A[rows[i]];
+                            if (variant == 0) need[i] = y - x;
+                            else if (variant == 1) need[i] = x - y;
+                            else if (variant == 2) need[i] = y + x;
+                            else if (x == 0 || y % x != 0) ok = 0;
+                            else need[i] = y / x;
+                        }
+                        if (!ok) continue;
+                        uint64_t h = 0x9E3779B97F4A7C15ULL;
+                        for (int i = 0; i < win_len; i++) {
+                            h ^= (uint64_t)need[i] * 0xff51afd7ed558ccdULL;
+                            h = ((h << 31) | (h >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+                        }
+                        h ^= h >> 29;
+                        int64_t head = -1;
+                        for (uint64_t i = h & (wsize - 1);; i = (i + 1) & (wsize - 1)) {
+                            int32_t s = wslots[i];
+                            if (!s) break;
+                            int64_t hd = s - 1;
+                            if (whash[hd] != h) continue;
+                            int eq = 1;
+                            for (int q = 0; q < win_len && eq; q++) eq = sigs[hd * n + rows[q]] == need[q];
+                            if (eq) { head = hd; break; }
+                        }
+                        int steps = 0;
+                        for (int64_t b = head; b >= 0 && steps < CHAIN_MAX && nd < cap; b = wnext[b], steps++) {
+                            if (sa + node_size[b] + 1 != ds) continue;
+                            int64_t l = a_left ? a : b, r = a_left ? b : a;
+                            if ((op == OP_ADD || op == OP_MUL) &&
+                                (node_size[l] > node_size[r] || (node_size[l] == node_size[r] && l > r))) continue;
+                            if (trivial(op, is_const[l], is_const[l] ? sigs[l * n] : 0, is_const[r],
+                                        is_const[r] ? sigs[r * n] : 0, l == r)) continue;
+                            int bad = verify(op, sigs + l * n, sigs + r * n, ys, n, tol);
+                            if (bad <= tol) { deep_kind[nd] = op; deep_l[nd] = (int32_t)l; deep_r[nd] = (int32_t)r;
+                                              deep_bad[nd] = bad; deep_val[nd] = 0; nd++; }
+                        }
+                    }
+                    int awant = ds - 3 - sa;
+                    /* Affine: (A + B) + c, (A - B) + c, (B - A) + c with c != 0 fitted on the window. */
+                    for (int variant = 0; affine && awant >= 1 && awant <= top && variant < 3 && nd < cap; variant++) {
+                        int op = variant == 0 ? OP_ADD : OP_SUB;
+                        int a_left = variant != 2;
+                        int allowed = 0;
+                        for (int pi = 0; pi < n_ops; pi++) allowed |= ops[pi] == op;
+                        if (!allowed) continue;
+                        int ok = 1;
+                        for (int i = 0; i < win_len && ok; i++) {
+                            int64_t y = ys[rows[i]], x = A[rows[i]];
+                            need[i] = variant == 0 ? y - x : variant == 1 ? x - y : y + x;
+                            ok = need[i] >= -SAFE_ABS && need[i] <= SAFE_ABS;
+                        }
+                        if (!ok) continue;
+                        uint64_t h = 0x9E3779B97F4A7C15ULL;
+                        for (int i = 1; i < win_len; i++) {
+                            h ^= (uint64_t)(need[i] - need[0]) * 0xff51afd7ed558ccdULL;
+                            h = ((h << 31) | (h >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+                        }
+                        h ^= h >> 29;
+                        int64_t head = -1;
+                        for (uint64_t i = h & (wsize - 1);; i = (i + 1) & (wsize - 1)) {
+                            int32_t s = dslots[i];
+                            if (!s) break;
+                            int64_t hd = s - 1;
+                            if (dhash[hd] != h) continue;
+                            const int64_t *H = sigs + hd * n;
+                            int eq = 1;
+                            for (int q = 1; q < win_len && eq; q++) eq = H[rows[q]] - H[rows[0]] == need[q] - need[0];
+                            if (eq) { head = hd; break; }
+                        }
+                        int steps = 0;
+                        for (int64_t b = head; b >= 0 && steps < CHAIN_MAX && nd < cap; b = dnext[b], steps++) {
+                            if (sa + node_size[b] + 3 != ds) continue;
+                            int64_t l = a_left ? a : b, r = a_left ? b : a;
+                            if (op == OP_ADD &&
+                                (node_size[l] > node_size[r] || (node_size[l] == node_size[r] && l > r))) continue;
+                            if (trivial(op, is_const[l], is_const[l] ? sigs[l * n] : 0, is_const[r],
+                                        is_const[r] ? sigs[r * n] : 0, l == r)) continue;
+                            int64_t b0 = sigs[b * n + rows[0]];
+                            int64_t c = variant == 1 ? b0 - need[0] : need[0] - b0;
+                            if (c == 0) continue;
+                            int bad = verify_affine(op, sigs + l * n, sigs + r * n, c, ys, n, tol);
+                            if (bad <= tol) { deep_kind[nd] = op; deep_l[nd] = (int32_t)l; deep_r[nd] = (int32_t)r;
+                                              deep_bad[nd] = bad; deep_val[nd] = c; nd++; }
+                        }
+                    }
+                }
+            }
+            int good = 0;
+            for (int64_t k = nd0; k < nd && !good; k++) good = deep_bad[k] <= deepen_bad;
+            if (good) break;
         }
-        free(wslots); free(wnext); free(wtail); free(whash); free(need);
+        free(wslots); free(dslots); free(wnext); free(wtail); free(dnext); free(dtail); free(whash); free(dhash);
+        free(need);
         *n_deep = nd;
     }
     free(tb.slots); free(hashes); free(is_const);

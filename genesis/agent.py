@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from .adapters import LabAdapter, PassiveLabAdapter, SequenceAdapter, sequence_rollout_probes
+from . import library
 from . import language
 from .attention import Attention
 from .consolidation import Consolidation
@@ -79,7 +80,7 @@ class Genesis:
     def __init__(self, memory_path: str, safety: SafetyPolicy = DEFAULT_SAFETY, seed: int = 0,
                  procedural_prior: bool = True, consolidate_every: int = 50, idle_patience: int = 20,
                  review_interval: int = 10, reviews_to_graduate: int = 3, config: Optional[dict] = None,
-                 check_same_thread: bool = True):
+                 check_same_thread: bool = True, library_learning: bool = True):
         self.safety = safety
         self.seed = seed
         self.rng = random.Random(seed)
@@ -92,6 +93,9 @@ class Genesis:
         self.consolidator = Consolidation()
         self.configs = default_configs(safety)
         self.procedural_prior = procedural_prior
+        # Sleep-time abstraction (invented primitives) and dreaming (recognition model): genesis.library.
+        self.library_learning = library_learning
+        self._library_cache: Optional[tuple] = None
         self.consolidate_every = consolidate_every
         self.idle_patience = idle_patience
         self.review_interval = review_interval
@@ -185,7 +189,8 @@ class Genesis:
         for key, env_id, state in self.ltm.load_learners():
             kind = state["kind"]
             self.learners[key] = RuleLearner.from_state(state, self.configs[kind], self._shape_prior,
-                                                        self._probe_fn(kind), self._library())
+                                                        self._probe_fn(kind), self._library(),
+                                                        self._learned())
             self.learner_env[key] = env_id
             self.learner_kind[key] = kind
 
@@ -210,6 +215,17 @@ class Genesis:
             self._shape_cache = self.ltm.shape_successes()
         return [s for s, n in sorted(self._shape_cache.items(), key=lambda t: -t[1]) if n > 0]
 
+    def _learned(self):
+        return self._learned_library if self.library_learning else None
+
+    def _learned_library(self) -> tuple:
+        """(invented primitives, recognition model) from the last sleep phase."""
+        if self._library_cache is None:
+            lib = self.ltm.get_meta("library") or {}
+            self._library_cache = ([library.Invention.from_json(d) for d in lib.get("inventions", [])],
+                                   library.Recognizer.from_json(lib.get("recognizer")))
+        return self._library_cache
+
     @staticmethod
     def _probe_fn(kind: str):
         return sequence_rollout_probes if kind == "sequence" else None
@@ -218,7 +234,7 @@ class Genesis:
         lr = self.learners.get(key)
         if lr is None:
             lr = RuleLearner(key, var_names, self.configs[kind], self._shape_prior, self._probe_fn(kind),
-                             self._library())
+                             self._library(), self._learned())
             self.learners[key] = lr
             self.learner_env[key] = env_id
             self.learner_kind[key] = kind
@@ -420,6 +436,7 @@ class Genesis:
         self.ltm.set_meta("resolution_costs", self.resolution_costs)
         summary = self.consolidator.run(self)
         self._shape_cache = None
+        self._library_cache = None
         cal = self.metacog.calibration()
         if cal["n"]:
             self.ltm.record_metric(self.session, "calibration", cal["ece"], cal)
@@ -544,4 +561,6 @@ class Genesis:
             "self_report": Metacognition.self_report(self.learners),
             "questions": [q.text for q in Curiosity.knowledge_gaps(self.learners)],
             "procedural_memory": ltm.shape_successes(),
+            "invented_primitives": [{k: d[k] for k in ("name", "statement", "support", "uses", "gain")}
+                                    for d in (ltm.get_meta("library") or {}).get("inventions", [])],
         }

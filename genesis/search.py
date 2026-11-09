@@ -8,12 +8,16 @@
   ``r != 0`` on all but at most ``tol`` observations (the majority residual, so isolated noisy observations do
   not hide an otherwise exact rule);
 * ``deep``: when nothing enumerated fits with at most ``deepen_bad`` mismatches, expressions of ``deep_size``
-  nodes found *without enumerating them*: bias fits and remainders of the largest level, and a meet-in-the-middle
-  step. For every candidate ``A`` and operator, the outputs ``B`` must have so that ``A op B = y`` are computed on
-  a window of observations (``y - A``, ``A - y``, ``y + A``, ``y / A``) and looked up among the enumerated
-  signatures; each hit is then checked on all observations against ``tol``. Several windows are tried, so a
-  noisy observation in one window does not hide the rule. The candidate budget is unchanged: deepening costs a
-  hash lookup per candidate and operator, not a larger enumeration.
+  nodes found *without enumerating them*: bias fits and remainders of the level two nodes below, and a
+  meet-in-the-middle step. For every candidate ``A`` and operator, the outputs ``B`` must have so that
+  ``A op B = y`` are computed on a window of observations (``y - A``, ``A - y``, ``y + A``, ``y / A``) and looked
+  up among the enumerated signatures; each hit is then checked on all observations against ``tol``. Several
+  windows are tried, so a noisy observation in one window does not hide the rule. When the level two nodes below
+  is not enumerated either, an *affine* meet in the middle finds ``(A op B) + c``: ``B`` is looked up up to a
+  constant shift (window differences) and ``c`` is fitted. Iterative deepening tries ``deep_size``,
+  ``deep_size + 2``, ... ``deep_max_size`` and stops at the first size that explains all but ``deepen_bad``
+  observations. The candidate budget is unchanged: deepening costs hash lookups per candidate and operator, not
+  a larger enumeration.
 
 Two interchangeable backends compute the same result. The C kernel (``_search.c``, built from this repository
 through :mod:`genesis.native` and self-tested against the Python reference before use) is used when available;
@@ -43,6 +47,7 @@ _SAFE = 2**61  # |values| above this go to the Python path (no int64 overflow in
 _C_MAX_LEVELS = 64  # the C kernel keeps fixed per-size level tables; larger max_size runs in Python
 CHAIN_MAX = 64  # candidates sharing one window signature that are checked on all observations
 _VARIANTS = (("add", True), ("sub", True), ("sub", False), ("mul", True))  # (operator, A on the left?)
+_AFFINE = (("add", True), ("sub", True), ("sub", False))  # (A op B) + c, c fitted
 
 _c: dict = {"tried": False, "fn": None, "shapes": None, "failure": None, "library": None, "compiler": None}
 _requested: str | None = None
@@ -93,7 +98,8 @@ def _majority_offset(ys, sig, tol: int):
     return (r, miss) if miss <= tol else None
 
 
-def _deep_python(cands, by_size, ys, tol, max_size, ops, deep_size, windows, cap, t0, max_seconds):
+def _deep_python(cands, by_size, ys, tol, max_size, ops, deep_size, windows, cap, t0, max_seconds, deep_max=0,
+                 deepen_bad=-1):
     """Reference for the deepening phase of the C kernel: returns (raw results, timed out)."""
     from .innate import ARITHMETIC_PRIMITIVES as P
     n = len(ys)
@@ -101,73 +107,117 @@ def _deep_python(cands, by_size, ys, tol, max_size, ops, deep_size, windows, cap
     for size in sorted(by_size):
         start[size] = k
         k += len(by_size[size])
-    out = []
-    last = deep_size - 2
-    level = list(enumerate(by_size.get(last, []), start.get(last, 0))) if last <= max_size and n >= 2 else []
-    for k, (e, sig) in level:
-        if len(out) >= cap:
-            break
-        fit = _majority_offset(ys, sig, tol)
-        if fit is not None:
-            out.append((-2, k, -1, fit[1], fit[0]))
+    top = max([size for size, level in by_size.items() if level], default=1)
     leaves = list(enumerate(by_size.get(1, [])))
-    for k, (e, sig) in level if "mod" in ops else []:
-        for c, (ce, _) in leaves:
-            if len(out) >= cap:
-                break
-            if ce.op == "const" and ce.value > 1:
-                bad = sum(v % ce.value != y for v, y in zip(sig, ys))
-                if bad <= tol:
-                    out.append(("mod", k, c, bad, 0))
+    out = []
     timed_out = False
-    for rows in windows:
+    for ds in range(deep_size, max(deep_size, deep_max) + 1, 2):
         if len(out) >= cap or timed_out:
             break
-        index: dict = {}
-        for k, (e, sig) in enumerate(cands):
-            index.setdefault(tuple(sig[r] for r in rows), []).append(k)
-        for a, (ea, sa) in enumerate(cands):
-            if a % 1024 == 0 and time.perf_counter() - t0 > max_seconds:
-                timed_out = True
+        n0 = len(out)
+        last = ds - 2
+        level = list(enumerate(by_size.get(last, []), start.get(last, 0))) if last <= max_size and n >= 2 else []
+        for k, (e, sig) in level:
+            if len(out) >= cap:
                 break
-            if deep_size - 1 - ea.size < 1:
-                continue
-            for op, a_left in _VARIANTS:
-                if op not in ops or len(out) >= cap:
-                    continue
-                need = []
-                for r in rows:
-                    y, x = ys[r], sa[r]
-                    if op == "add":
-                        need.append(y - x)
-                    elif op == "sub":
-                        need.append(x - y if a_left else y + x)
-                    elif x == 0 or y % x:
-                        break
-                    else:
-                        need.append(y // x)
-                if len(need) != len(rows):
-                    continue
-                for b in index.get(tuple(need), [])[:CHAIN_MAX]:
-                    if len(out) >= cap:
-                        break
-                    if ea.size + cands[b][0].size + 1 != deep_size:
-                        continue
-                    l, r = (a, b) if a_left else (b, a)
-                    el, er = cands[l][0], cands[r][0]
-                    if op in ("add", "mul") and (el.size, l) > (er.size, r):
-                        continue
-                    if _trivial(op, el, er):
-                        continue
-                    fn = P[op].fn
-                    bad = 0
-                    for x1, x2, y in zip(cands[l][1], cands[r][1], ys):
-                        v = fn(x1, x2)
-                        bad += v is None or v != y
-                        if bad > tol:
-                            break
+            fit = _majority_offset(ys, sig, tol)
+            if fit is not None:
+                out.append((-2, k, -1, fit[1], fit[0]))
+        for k, (e, sig) in level if "mod" in ops else []:
+            for c, (ce, _) in leaves:
+                if len(out) >= cap:
+                    break
+                if ce.op == "const" and ce.value > 1:
+                    bad = sum(v % ce.value != y for v, y in zip(sig, ys))
                     if bad <= tol:
-                        out.append((op, l, r, bad, 0))
+                        out.append(("mod", k, c, bad, 0))
+        affine = last > max_size
+        for rows in windows:
+            if len(out) >= cap or timed_out:
+                break
+            index: dict = {}
+            shifted: dict = {}
+            for k, (e, sig) in enumerate(cands):
+                index.setdefault(tuple(sig[r] for r in rows), []).append(k)
+                if affine:
+                    shifted.setdefault(tuple(sig[r] - sig[rows[0]] for r in rows[1:]), []).append(k)
+            for a, (ea, sa) in enumerate(cands):
+                if len(out) >= cap:
+                    break
+                if a % 1024 == 0 and time.perf_counter() - t0 > max_seconds:
+                    timed_out = True
+                    break
+                want = ds - 1 - ea.size
+                for op, a_left in _VARIANTS if 1 <= want <= top else ():
+                    if op not in ops or len(out) >= cap:
+                        continue
+                    need = []
+                    for r in rows:
+                        y, x = ys[r], sa[r]
+                        if op == "add":
+                            need.append(y - x)
+                        elif op == "sub":
+                            need.append(x - y if a_left else y + x)
+                        elif x == 0 or y % x:
+                            break
+                        else:
+                            need.append(y // x)
+                    if len(need) != len(rows):
+                        continue
+                    for b in index.get(tuple(need), [])[:CHAIN_MAX]:
+                        if len(out) >= cap:
+                            break
+                        if ea.size + cands[b][0].size + 1 != ds:
+                            continue
+                        l, r = (a, b) if a_left else (b, a)
+                        el, er = cands[l][0], cands[r][0]
+                        if op in ("add", "mul") and (el.size, l) > (er.size, r):
+                            continue
+                        if _trivial(op, el, er):
+                            continue
+                        fn = P[op].fn
+                        bad = 0
+                        for x1, x2, y in zip(cands[l][1], cands[r][1], ys):
+                            v = fn(x1, x2)
+                            bad += v is None or v != y
+                            if bad > tol:
+                                break
+                        if bad <= tol:
+                            out.append((op, l, r, bad, 0))
+                awant = ds - 3 - ea.size
+                for op, a_left in _AFFINE if affine and 1 <= awant <= top else ():
+                    if op not in ops or len(out) >= cap:
+                        continue
+                    need = [ys[r] - sa[r] if op == "add" else sa[r] - ys[r] if a_left else ys[r] + sa[r]
+                            for r in rows]
+                    if any(abs(v) > _SAFE for v in need):
+                        continue
+                    for b in shifted.get(tuple(v - need[0] for v in need[1:]), [])[:CHAIN_MAX]:
+                        if len(out) >= cap:
+                            break
+                        if ea.size + cands[b][0].size + 3 != ds:
+                            continue
+                        l, r = (a, b) if a_left else (b, a)
+                        el, er = cands[l][0], cands[r][0]
+                        if op == "add" and (el.size, l) > (er.size, r):
+                            continue
+                        if _trivial(op, el, er):
+                            continue
+                        b0 = cands[b][1][rows[0]]
+                        c = b0 - need[0] if op == "sub" and a_left else need[0] - b0
+                        if c == 0:
+                            continue
+                        fn, add = P[op].fn, P["add"].fn
+                        bad = 0
+                        for x1, x2, y in zip(cands[l][1], cands[r][1], ys):
+                            v = fn(x1, x2)
+                            bad += v is None or add(v, c) != y
+                            if bad > tol:
+                                break
+                        if bad <= tol:
+                            out.append((op, l, r, bad, c))
+        if any(o[3] <= deepen_bad for o in out[n0:]):
+            break
     return out, timed_out
 
 
@@ -183,6 +233,8 @@ def _finish_deep(raw, node, size_of) -> list:
             e = app("add", node(l), const(val))
         else:
             e = Expr(kind, (node(l), node(r)), None, size_of(l) + size_of(r) + 1)
+            if val:
+                e = app("add", e, const(val))
         deep.append((e, bad))
     return deep
 
@@ -203,15 +255,18 @@ def _windows(n: int, win_len: int, n_win: int) -> list:
 
 def _with_deep_count(counts: dict, deep: list, deep_size: int) -> dict:
     """Occam prior for unenumerated sizes: extrapolate the growth of the enumerated levels."""
-    if deep and deep_size not in counts:
-        counts = dict(counts)
-        a, b = counts.get(deep_size - 2, 1), counts.get(deep_size - 4, 1)
-        counts[deep_size] = max(a, a * a // max(b, 1))
+    if not deep:
+        return counts
+    counts = dict(counts)
+    for size in range(deep_size, max(e.size for e, _ in deep) + 1, 2):
+        if size not in counts:
+            a, b = counts.get(size - 2, 1), counts.get(size - 4, 1)
+            counts[size] = max(a, a * a // max(b, 1))
     return counts
 
 
 def _search_python(inputs, ys, var_names, constants, tol, max_size, max_candidates, max_seconds, bias_max_size,
-                   ops, keep_all_upto, deepen_bad=-1, deep_size=0, windows=()) -> SearchResult:
+                   ops, keep_all_upto, deepen_bad=-1, deep_size=0, windows=(), deep_max=0) -> SearchResult:
     t0 = time.perf_counter()
     en = enumerate_programs(inputs, var_names, constants, max_size, max_candidates, max_seconds, ops, keep_all_upto)
     n = len(ys)
@@ -235,7 +290,7 @@ def _search_python(inputs, ys, var_names, constants, tol, max_size, max_candidat
         deep_ran = True
         cap = max(max_candidates, len(en.by_size.get(1, [])) + 1) + 1
         raw, timed_out = _deep_python(en.candidates, en.by_size, ys, tol, max_size, ops, deep_size, windows, cap,
-                                      t0, max_seconds)
+                                      t0, max_seconds, deep_max, deepen_bad)
         truncated = truncated or timed_out
         deep = _finish_deep(raw, lambda k: en.candidates[k][0], lambda k: en.candidates[k][0].size)
     return SearchResult(matches, offsets, deep, _with_deep_count(en.counts, deep, deep_size), en.evaluated,
@@ -244,7 +299,7 @@ def _search_python(inputs, ys, var_names, constants, tol, max_size, max_candidat
 
 
 def _search_c(inputs, ys, var_names, constants, tol, max_size, max_candidates, max_seconds, bias_max_size,
-              ops, keep_all_upto, deepen_bad=-1, deep_size=0, windows=()) -> SearchResult:
+              ops, keep_all_upto, deepen_bad=-1, deep_size=0, windows=(), deep_max=0) -> SearchResult:
     t0 = time.perf_counter()
     n = len(ys)
     leaves = _leaves(inputs, var_names, constants)
@@ -268,7 +323,8 @@ def _search_c(inputs, ys, var_names, constants, tol, max_size, max_candidates, m
     rc = _c["fn"](n, (I64 * n)(*ys), nl, leaf_sigs, leaf_const, max_size, keep_all_upto, len(ops), op_codes,
                   max_candidates, float(max_seconds), tol, bias_max_size, cap, node_op, node_l, node_r, node_size,
                   sigs, counts, stats, match_node, match_bad, ctypes.byref(n_match), off_node, off_bad, off_val,
-                  ctypes.byref(n_off), deepen_bad, deep_size, len(windows), win_len, win_rows, deep_kind, deep_l,
+                  ctypes.byref(n_off), deepen_bad, deep_size, max(deep_size, deep_max), len(windows), win_len,
+                  win_rows, deep_kind, deep_l,
                   deep_r, deep_bad, deep_val, ctypes.byref(n_deep))
     if rc != 0:
         raise MemoryError("search kernel could not allocate its tables")
@@ -305,16 +361,19 @@ def _setup(lib):
     fn.argtypes = [ctypes.c_int, P64, ctypes.c_int, P64, P32, ctypes.c_int, ctypes.c_int, ctypes.c_int, P32,
                    ctypes.c_int64, ctypes.c_double, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
                    P32, P32, P32, P32, P64, P64, P64, P32, P32, P64, P32, P32, P64, P64,
-                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, P32, P32, P32, P32, P32, P64, P64]
+                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, P32, P32, P32, P32, P32,
+                   P64, P64]
     fn.restype = ctypes.c_int
     _c["fn"], _c["shapes"] = fn, sh
     # Self-test against the reference: wrap-around, a noisy observation, bias fits and deepening.
     inputs = [{"x": x, "t": t} for t, x in enumerate([3, 5, 7, 9, 0, 2, 4, 6, 8, 1])]
     ys = tuple((d["x"] + 2) % 10 for d in inputs)
     deep_ys = tuple(d["t"] * (d["t"] + 3) - 2 for d in inputs)
-    for tol, y in ((0, ys), (2, ys[:4] + (ys[4] + 5,) + ys[5:]), (0, deep_ys), (2, deep_ys[:3] + (7,) + deep_ys[4:])):
+    affine_ys = tuple(2 * d["x"] - 3 * d["t"] + 7 for d in inputs)
+    for tol, y in ((0, ys), (2, ys[:4] + (ys[4] + 5,) + ys[5:]), (0, deep_ys), (2, deep_ys[:3] + (7,) + deep_ys[4:]),
+                   (2, affine_ys[:6] + (0,) + affine_ys[7:])):
         args = (inputs, y, ["x", "t"], [0, 1, 2, 3, 10], tol, 5, 50000, 60.0, 3, OPS, 3, 0, 7,
-                _windows(len(y), 6, 3))
+                _windows(len(y), 6, 3), 9)
         if _summary(_search_c(*args)) != _summary(_search_python(*args)):
             _c["fn"] = None
             raise RuntimeError("search kernel self-test failed")
@@ -467,8 +526,9 @@ def backend_info() -> dict:
 
 def search_programs(inputs: list, ys, var_names, constants, tol: int, max_size: int, max_candidates: int,
                     max_seconds: float, bias_max_size: int, ops=OPS, keep_all_upto: int = 3, deepen_bad: int = -1,
-                    deep_size: int = 0, window: int = 8, n_windows: int = 4) -> SearchResult:
-    """See the module docstring. ``deepen_bad < 0`` disables deepening."""
+                    deep_size: int = 0, window: int = 8, n_windows: int = 4, deep_max_size: int = 0) -> SearchResult:
+    """See the module docstring. ``deepen_bad < 0`` disables deepening; sizes ``deep_size``, ``deep_size + 2``,
+    ... ``deep_max_size`` are tried in turn until one explains all but ``deepen_bad`` observations."""
     ys = tuple(ys)
     n = len(ys)
     if n == 0 or len(inputs) != n:
@@ -480,7 +540,7 @@ def search_programs(inputs: list, ys, var_names, constants, tol: int, max_size: 
         raise ValueError(f"GENESIS_SEARCH_BACKEND must be auto, python or c, not {req!r}")
     windows = _windows(n, window, n_windows) if deepen_bad >= 0 else []
     args = (inputs, ys, list(var_names), list(constants), tol, max_size, max_candidates, max_seconds,
-            bias_max_size, tuple(ops), keep_all_upto, deepen_bad, deep_size, windows)
+            bias_max_size, tuple(ops), keep_all_upto, deepen_bad, deep_size, windows, deep_max_size)
     if req != "python" and _load_c():
         values = [abs(v) for v in ys] + [abs(c) for c in constants]
         values += [abs(inp[v]) for inp in inputs for v in var_names if inp.get(v) is not None]

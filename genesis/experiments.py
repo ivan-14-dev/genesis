@@ -18,7 +18,7 @@ from .adapters import LabAdapter, SequenceAdapter
 from .agent import Genesis
 from .autonomy import Explorer
 from .environments import CausalWorld, SequenceWorld, sandboxed
-from .environments.sequence_world import DEEP_FAMILIES
+from .environments.sequence_world import DEEP_FAMILIES, DEEPER_FAMILIES
 
 
 @contextmanager
@@ -118,6 +118,9 @@ ROBUSTNESS_CONDITIONS = {
     "deep": ({"families": DEEP_FAMILIES}, {}),
     "deep_noise_10": ({"families": DEEP_FAMILIES, "noise": 0.1}, {}),
     "deep_without_deepening": ({"families": DEEP_FAMILIES}, {"sequence.deepen_size": 0}),
+    "deeper": ({"families": DEEPER_FAMILIES}, {}),
+    "deeper_noise_10": ({"families": DEEPER_FAMILIES, "noise": 0.1}, {}),
+    "deeper_without_nine": ({"families": DEEPER_FAMILIES}, {"sequence.deepen_max_size": 7}),
 }
 
 
@@ -211,11 +214,14 @@ def confound_resolved(agent: Genesis, world: CausalWorld) -> dict:
 
 
 def run_lab_benchmark(seed: int, watch: int = 60, budget: int = 120, strategy: str = "curiosity",
-                      checkpoints=(0, 5, 10, 20, 40, 80, 120), db: str | None = None, keep_agent: bool = False):
+                      checkpoints=(0, 5, 10, 20, 40, 80, 120), db: str | None = None, keep_agent: bool = False,
+                      world_options: dict | None = None):
+    """``world_options`` go to :class:`CausalWorld` (e.g. ``noise``: corrupted experiment outcomes; the
+    held-out sets are always scored against the true, noise-free physics)."""
     with _tmpdb() as tmp:
         path = db or tmp
         agent = Genesis(path, seed=seed)
-        world = CausalWorld(seed)
+        world = CausalWorld(seed, **(world_options or {}))
         sb = sandboxed(world, watch + budget + 1000)
         held = lab_eval_set(world, 400, seed + 991, 0, world.n_values - 1)
         natural = lab_eval_set(world, 400, seed + 992, 0, world.n_values - 1, natural=True)
@@ -256,6 +262,30 @@ def run_lab_benchmark(seed: int, watch: int = 60, budget: int = 120, strategy: s
             return res, agent, world, sb
         agent.ltm.close()
         return res
+
+
+LAB_NOISE_LEVELS = (0.05, 0.1, 0.2)
+
+
+def run_lab_robustness(seeds, noises=LAB_NOISE_LEVELS) -> dict:
+    """Stages 2-3 with corrupted experiment outcomes (the target property is shifted by 1-3 with probability
+    ``noise``). Held-out sets use the true physics. ``conditional_rules_wrongly_validated`` counts conditional
+    rules whose validated belief names the wrong cause (or none): it must stay at 0."""
+    out = {}
+    for noise in noises:
+        runs = [run_lab_benchmark(s, world_options={"noise": noise}) for s in seeds]
+        conds = [v for r in runs for v in r["confound_after_experiments"].values()]
+        out[f"noise_{int(round(noise * 100))}"] = {
+            "final_heldout_unseen": _mean([r["final_heldout_unseen"] for r in runs]),
+            "transfer_out_of_range": _mean([r["final_transfer_out_of_range"] for r in runs]),
+            "runs_reaching_perfect": _mean([r["experiments_to_perfect_heldout"] is not None for r in runs]),
+            "conditional_rules_correct_cause": _mean([v["correct_cause"] for v in conds]),
+            "conditional_rules_wrongly_validated": sum(v["status"] == "validated" and not v["correct_cause"]
+                                                       for v in conds),
+            "conditional_rules": len(conds),
+            "cpu_seconds": _mean([r["cpu_seconds"] for r in runs]),
+        }
+    return out
 
 
 # ===================================================================== stage 6
@@ -329,12 +359,23 @@ def run_memory_benchmark(seed: int) -> dict:
 
 # ================================================================ meta-learning
 def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool = True,
-                            world_options: dict | None = None) -> dict:
+                            world_options: dict | None = None, library_learning: bool | None = None,
+                            curriculum: list | None = None, overrides: dict | None = None) -> dict:
+    """A succession of new worlds explored by one agent (sleeping after each). ``curriculum`` gives per-world
+    :class:`SequenceWorld` options (else ``world_options`` for all). Without the procedural prior, library
+    learning is off too unless asked: the ablation removes all procedural meta-learning."""
+    if library_learning is None:
+        library_learning = procedural_prior
+    curriculum = curriculum or [world_options or {}] * n_worlds
+    n_worlds = len(curriculum)
     with _tmpdb() as path:
-        agent = Genesis(path, seed=seed, procedural_prior=procedural_prior)
-        per_world, evals, rule_evals, cpu, acc, lib = [], [], [], [], [], []
+        agent = Genesis(path, seed=seed, procedural_prior=procedural_prior, library_learning=library_learning)
+        for key, value in (overrides or {}).items():
+            family, attr = key.split(".")
+            setattr(agent.configs[family], attr, value)
+        per_world, evals, rule_evals, cpu, acc, lib, val, inv = [], [], [], [], [], [], [], []
         for i in range(n_worlds):
-            world = SequenceWorld(seed * 100 + i, **(world_options or {}))
+            world = SequenceWorld(seed * 100 + i, **curriculum[i])
             keys = [f"{world.env_id}/{sid}" for sid in world.stream_ids()]
             t0 = time.process_time()
             agent.explore_sequences(sandboxed(world, 401), 400)
@@ -342,6 +383,7 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
             ev = evaluate_sequences(agent, world)
             per_world.append(ev["observations_to_validation"])
             acc.append(ev["rule_extrapolation_accuracy"])
+            val.append(ev["rule_streams_validated"])
             lrs = [agent.learners[k] for k in keys if k in agent.learners]
             rule_lrs = [agent.learners[f"{world.env_id}/{sid}"] for sid in world.stream_ids()
                         if world._family(sid) != "noise" and f"{world.env_id}/{sid}" in agent.learners]
@@ -349,16 +391,40 @@ def run_procedural_transfer(seed: int, n_worlds: int = 6, procedural_prior: bool
             rule_evals.append(round(sum(lr.expressions_evaluated for lr in rule_lrs) / max(len(rule_lrs), 1)))
             searches = sum(lr.library_searches + lr.full_searches for lr in lrs)
             lib.append(round(sum(lr.library_searches for lr in lrs) / searches, 4) if searches else 0.0)
+            inv.append(len((agent.ltm.get_meta("library") or {}).get("inventions", [])))
+        inventions = [d["statement"] for d in (agent.ltm.get_meta("library") or {}).get("inventions", [])]
         agent.ltm.close()
         late = slice(n_worlds // 2, None)
-        return {"observations_to_validation_per_world": per_world,
+        return {"observations_to_validation_per_world": per_world, "validated_per_world": val,
+                "inventions_per_world": inv, "final_inventions": inventions,
                 "expressions_evaluated_per_world": evals, "cpu_seconds_per_world": cpu,
                 "search_cost_per_rule_stream_per_world": rule_evals,
                 "accuracy_per_world": acc, "library_search_share_per_world": lib,
                 "late_worlds_mean": _mean(per_world[late]),
                 "late_worlds_expressions": _mean(evals[late]), "late_worlds_cpu": _mean(cpu[late]),
                 "late_worlds_search_cost_per_rule_stream": _mean(rule_evals[late]),
-                "late_worlds_accuracy": _mean(acc[late])}
+                "late_worlds_accuracy": _mean(acc[late]), "late_worlds_validated": _mean(val[late])}
+
+
+def run_library_curriculum(seeds, n_worlds: int = 6, budgets=(7, 9)) -> dict:
+    """Library learning (sleep-time abstraction + dreaming) on a curriculum: worlds of 7-node rules, then worlds
+    of 9-node rules. With a 7-node search budget the late rules are out of reach of the base language; inventions
+    learned on the early worlds can bring them within reach. With the 9-node budget it measures the cost."""
+    half = n_worlds // 2
+    curriculum = [{"families": DEEP_FAMILIES}] * half + [{"families": DEEPER_FAMILIES}] * (n_worlds - half)
+    out = {}
+    for budget in budgets:
+        for on in (True, False):
+            runs = [run_procedural_transfer(s, curriculum=curriculum, library_learning=on,
+                                            overrides={"sequence.deepen_max_size": budget}) for s in seeds]
+            out[f"deepen_max_{budget}/library_{'on' if on else 'off'}"] = {
+                field: _mean([r[key] for r in runs])
+                for field, key in (("late_validated", "late_worlds_validated"),
+                                   ("late_accuracy", "late_worlds_accuracy"),
+                                   ("late_observations_to_validation", "late_worlds_mean"),
+                                   ("late_cpu_seconds", "late_worlds_cpu"))} | {
+                "inventions": [r["final_inventions"] for r in runs] if on else []}
+    return out
 
 
 # ============================================================ word learning
@@ -960,12 +1026,15 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
     mem = [run_memory_benchmark(s) for s in seeds]
     robustness = run_robustness_benchmark(seeds[: 3 if quick else len(seeds)],
                                           ("clean", "noise_20", "deep") if quick else None)
+    lab_robustness = run_lab_robustness(seeds[: 3 if quick else len(seeds)], (0.1,) if quick else LAB_NOISE_LEVELS)
     proc_seeds = seeds[: 2 if quick else 5]
     proc_on = [run_procedural_transfer(s, procedural_prior=True) for s in proc_seeds]
     proc_off = [run_procedural_transfer(s, procedural_prior=False) for s in proc_seeds]
     deep_worlds = {"families": DEEP_FAMILIES}
     deep_on = [run_procedural_transfer(s, procedural_prior=True, world_options=deep_worlds) for s in proc_seeds]
     deep_off = [run_procedural_transfer(s, procedural_prior=False, world_options=deep_worlds) for s in proc_seeds]
+    library_curriculum = run_library_curriculum(proc_seeds[:2] if quick else proc_seeds[:3],
+                                                n_worlds=4 if quick else 6, budgets=(7,) if quick else (7, 9))
     auto_budgets = (150,) if quick else (100, 150, 300)
     auto = {(b, strat): [run_autonomy(s, b, strat) for s in seeds]
             for b in auto_budgets for strat in ("progress", "round_robin", "random")}
@@ -1036,6 +1105,7 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             "calibration_ece": _mean([r["calibration"]["ece"] for r in lab_c]),
         },
         "stage1_robustness": robustness,
+        "stage2_3_robustness": lab_robustness,
         "stage4_memory": {
             "accuracy_world_a": _mean([m["accuracy_world_a"] for m in mem]),
             "retention_after_reload": _mean([m["accuracy_world_a_after_reload"] / m["accuracy_world_a"]
@@ -1064,12 +1134,14 @@ def run_benchmark_suite(seeds=range(10), quick: bool = False) -> dict:
             "late_accuracy_with_prior": _mean([p["late_worlds_accuracy"] for p in proc_on]),
             "late_accuracy_without_prior": _mean([p["late_worlds_accuracy"] for p in proc_off]),
             "library_search_share_with_prior": [p["library_search_share_per_world"] for p in proc_on],
+            "inventions_per_world_with_prior": [p["inventions_per_world"] for p in proc_on],
             "deep_worlds": {
                 key: _mean([p[field] for p in runs])
                 for field in ("late_worlds_mean", "late_worlds_search_cost_per_rule_stream", "late_worlds_cpu",
                               "late_worlds_accuracy")
                 for key, runs in ((f"{field}_with_prior", deep_on), (f"{field}_without_prior", deep_off))},
         },
+        "library_learning": library_curriculum,
         "stage6_autonomy": {
             f"budget_{b}/{strat}": {
                 "knowledge_score": _mean([r["knowledge_score"] for r in runs]),

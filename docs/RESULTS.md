@@ -9,9 +9,9 @@ python -m genesis benchmark --seeds 100-109 --out results/benchmark-seeds100-109
 - **Seeds and data:** 10 held-out seeds (100–109), not used during development. Every world's rules are
   sampled from its seed and never shown to the agent. The raw output is in
   [`../results/benchmark-seeds100-109.json`](../results/benchmark-seeds100-109.json).
-- **Runtime:** about 5 minutes wall time on one CPU core for the whole suite (three strategies, budget sweep,
-  robustness conditions, ablations, stage 6 allocation, one stage 7 self-improvement cycle); it was about
-  16 minutes before the C search kernel (v0.2.0).
+- **Runtime:** about 10 minutes wall time on one CPU core for the whole suite (three strategies, budget sweep,
+  robustness conditions including 9-node worlds, noisy causal labs, ablations, the library-learning curriculum,
+  stage 6 allocation, one stage 7 self-improvement cycle).
 - **Determinism:** results do not depend on `PYTHONHASHSEED` (a set ordering that did was fixed; regression
   test `test_behaviour_independent_of_hash_seed`).
 - **Accuracy definition:** every accuracy below is measured against the *hidden* rules, on inputs the agent has
@@ -41,8 +41,10 @@ python -m genesis benchmark --seeds 100-109 --out results/benchmark-seeds100-109
 Cost per seed:
 - **Observations per stream to validation:** 8.4 on average.
 - **Interactions:** 191 in total, including spaced reviews.
-- **Compute:** **0.23 s CPU** (2.74 s in v0.2.0, 12× less) for about 1.3M candidate programs evaluated; the
-  search runs in a C kernel whose results are identical to the Python reference.
+- **Compute:** **0.32 s CPU** (2.74 s in v0.2.0, 8.6× less) for about 1.3M candidate programs evaluated; the
+  search runs in a C kernel whose results are identical to the Python reference. It was 0.23 s before the
+  9-node deepening and library learning: the extra cost is spent on the two noise streams, which a learner
+  cannot tell from an out-of-reach rule until it has looked deeper.
 - **Memory:** about 240 KB.
 - **Calibration:** ECE 0.063.
 
@@ -54,28 +56,35 @@ constants now include the three largest observed values + 1, not only the maximu
 Same seeds, same budget per stream (40 observations). *Noise p* replaces each observed term, with probability
 p, by a random value; the stream keeps evolving from the true value (innovation noise). The true rules are
 evaluated on clean terms. "Deep" worlds draw rules that need **7 nodes** (e.g. `y = x·(x+3)−2`,
-`y = 2·x[t−1] − x[t−2] + 3`, `y = (3·x + 5) mod 17`), beyond the 5-node enumeration.
+`y = 2·x[t−1] − x[t−2] + 3`, `y = (3·x + 5) mod 17`), beyond the 5-node enumeration. "Deeper" worlds draw
+rules that need **9 nodes**: `y = 3·x[t−1] − 2·x[t−2] + c` (or 2 and 3 swapped) and `y = 2·x[t−1] ± 3·t + c`.
 
 | Condition | Rule streams validated | Extrapolation accuracy | Accuracy of validated rules | False validations on noise | CPU / seed |
 |---|---|---|---|---|---|
-| Clean | **100%** | 100% | 100% | **0 / 20** | 0.22 s |
-| Noise 10% | **100%** | 99.5% | 99.5% | **0 / 20** | 0.44 s |
-| Noise 20% | 85.0% | 87.9% | 98.8% | **0 / 20** | 3.3 s |
-| Noise 20%, 2 rules + 8 noise streams per seed | 95.0% | 93.0% | 98.0% | **0 / 80** | 0.79 s |
-| Deep (7-node rules) | **98.75%** | 99.0% | 100% | **0 / 20** | 0.37 s |
-| Deep + noise 10% | 97.5% | 96.3% | 98.6% | **0 / 20** | 0.68 s |
-| Deep, deepening disabled (ablation) | 37.5% | 37.8% | 100% | 0 / 20 | 0.26 s |
+| Clean | **100%** | 100% | 100% | **0 / 20** | 0.31 s |
+| Noise 10% | **100%** | 100% | 100% | **0 / 20** | 0.70 s |
+| Noise 20% | **92.5%** (85.0% in v0.3.0) | 96.3% (87.9%) | 100% | **0 / 20** | 2.4 s (3.3 s) |
+| Noise 20%, 2 rules + 8 noise streams per seed | **100%** (95.0%) | 100% | 100% | **0 / 80** | 1.08 s |
+| Deep (7-node rules) | **98.75%** | 99.0% | 100% | **0 / 20** | 0.51 s |
+| Deep + noise 10% | 98.75% (97.5%) | 97.5% | 98.6% | **0 / 20** | 1.21 s |
+| Deep, deepening disabled (ablation) | 37.5% | 37.8% | 100% | 0 / 20 | 0.28 s |
+| Deeper (9-node rules) | **100%** | 100% | 100% | **0 / 20** | 0.48 s |
+| Deeper + noise 10% | 93.75% | 93.75% | 100% | **0 / 20** | 1.20 s |
+| Deeper, 9-node level disabled (ablation) | 36.25% | 36.25% | 100% | 0 / 20 | 0.46 s |
 
 How it works (see `docs/ARCHITECTURE.md`, learner): biases are fitted on the *majority* residual; a rule may keep
 up to 40% mismatches but is validated only with ≤ 25% forward errors **and** unstructured errors (a rule whose
-errors share one residual is incomplete, not noisy); 7-node rules are found by a meet-in-the-middle search that
-costs at most one extra enumeration and backs off geometrically.
+errors share one residual is incomplete, not noisy); deep rules are found by an iterative meet-in-the-middle
+search (7 nodes, then 9) on windows of 4 observations, most recent first, which backs off geometrically.
+Beliefs are evaluated with exact integers, so a geometric stream that leaves the ±10¹⁸ search bound is still
+predicted: 6 of the 7 geometric streams lost at 20% noise in v0.3.0 are now learned.
 
-Failures, honestly: at 20% noise, 7 of the 12 misses are geometric streams (values overflow the ±10¹⁸ bound
-before enough clean terms are seen); the others are streams whose actual corruption rate reached ~30%. They are
-left *candidate*, never validated wrongly. The 20% condition is also where CPU grows (3.3 s per seed): values
-beyond ±2⁶¹ fall back to the exact Python search. In deep worlds, the remaining misses are one affine-modular and
-one quadratic rule, both left unvalidated.
+Failures, honestly: at 20% noise, the 6 misses are streams whose actual corruption rate reached ~30% (two
+lag-2 recurrences, one geometric, one modular counter, one periodic, one quadratic). In deeper worlds with 10%
+noise, 4 of the 5 misses are `2·x[t−1] ± 3·t + c` streams. Every miss is left *candidate*, never validated
+wrongly. CPU grew in the clean and 10%-noise conditions (0.22 → 0.31 s and 0.44 → 0.70 s per seed): the 9-node
+level runs on noise streams too (about +0.05 s and +0.15 s per seed, measured by disabling it), and the rest
+comes from the extra windows and the library-learning stage.
 
 ### Attention / curiosity allocation (fraction of rule streams validated within a fixed budget)
 
@@ -127,6 +136,22 @@ Experiments needed to reach 100%: **24.5** with curiosity (10/10 runs) vs 51.7 w
 | Associations labelled causal / spurious | 7 / 6 |
 | Spurious labels that coincide with a real rule condition | 0 |
 
+### Noisy experiments (`run_lab_robustness`)
+
+Same labs and seeds, but each experiment outcome is corrupted with probability p (the target property is shifted
+by 1–3). Held-out sets use the true physics. Conditional rules are learned with noise-tolerant branches: each
+branch keeps its exact blocks when there are any, otherwise the blocks with the fewest mismatches within its
+tolerance.
+
+| Outcome noise | Held-out accuracy (unseen) | Out-of-range transfer | Runs reaching 100% | Confounded rules: correct cause | Wrong cause validated | CPU / run |
+|---|---|---|---|---|---|---|
+| 5% | **100%** | 100% | 10 / 10 | **18 / 18** | **0** | 1.5 s |
+| 10% | **100%** | 100% | 10 / 10 | **18 / 18** | **0** | 2.7 s |
+| 20% | **100%** | 100% | 10 / 10 | **18 / 18** | **0** | 4.4 s |
+
+In v0.3.0 each branch had to match all of its observations exactly, so one corrupted outcome in a branch was
+enough to block that conditional.
+
 ## Stage 4 — memory
 
 | Metric | Value |
@@ -156,9 +181,9 @@ first (*library-first search*); full enumeration is skipped when one of them fit
 
 | Metric (later worlds) | With procedural memory | Without |
 |---|---|---|
-| Candidate programs evaluated per rule stream | **2,492** | 41,229 (16.5×) |
-| CPU seconds per world | 0.233 | 0.279 (−17%) |
-| Observations to validation | 8.11 | 8.25 |
+| Candidate programs evaluated per rule stream | **2,498** | 41,229 (16.5×) |
+| CPU seconds per world | 0.415 | 0.361 |
+| Observations to validation | 8.13 | 8.25 |
 | Extrapolation accuracy | 100% | 100% |
 
 Same protocol on **deep worlds** (7-node rules; remembered shapes now go up to 7 nodes and are instantiated by
@@ -166,10 +191,16 @@ a C kernel):
 
 | Metric (later worlds, deep) | With procedural memory | Without |
 |---|---|---|
-| Candidate programs evaluated per rule stream | **37,420** | 182,110 (4.9×) |
-| CPU seconds per world | **0.457** | 0.668 (−32%) |
-| Observations to validation | **8.78** | 11.64 (−25%) |
-| Extrapolation accuracy | 98.7% | 98.0% |
+| Candidate programs evaluated per rule stream | **38,967** | 182,110 (4.7×) |
+| CPU seconds per world | **0.700** | 0.792 (−12%) |
+| Observations to validation | **8.75** | 11.64 (−25%) |
+| Extrapolation accuracy | 98.0% | 98.0% |
+
+"With procedural memory" now includes library learning (below), which costs CPU on these worlds without
+helping them: measured in pairs on seeds 100–104, standard worlds take 0.417 s per world with it and 0.353 s
+without (shapes only); the extra time is the second search stage, run at deepening points where nothing fits,
+mostly on noise streams (sleep itself costs about 5 ms per world). The deep-world accuracy (98.0% vs 98.7%
+in v0.3.0) is the same with library learning disabled; it comes from the deepening changes.
 
 **Fixed:** remembering rule shapes gives a large, measured reduction in search. On deep worlds it also cuts
 **observations** by a quarter: without memory, a 7-node rule is found only after the deepening threshold
@@ -177,6 +208,32 @@ a C kernel):
 observations barely change, because validation requires 4 correct *forward* predictions whatever the search
 does. In v0.2.0 the shape loop was in Python (2.6 s per world with memory); it is now 11× faster with identical
 results.
+
+### Library learning: invented primitives and dreams (`library.py`, `run_library_curriculum`)
+
+A curriculum of six worlds per seed (seeds 100–102): three worlds of 7-node rules, then three worlds of 9-node
+rules. During each sleep, sub-programs shared by validated rules of different problems are promoted to invented
+primitives (MDL gain), dreams of validated shapes train a recognition model, and the next searches may use the
+inventions as single leaves when the innate language finds nothing. Measured on the three late worlds.
+
+| Search budget | Library learning | Rule streams validated | Observations to validation | CPU / world |
+|---|---|---|---|---|
+| Deepening up to 7 nodes | **on** | **100%** | 12.2 | 1.11 s |
+| Deepening up to 7 nodes | off | 33.3% | 10.9 (validated streams only) | 0.64 s |
+| Deepening up to 9 nodes | on | 100% | 10.4 | 1.03 s |
+| Deepening up to 9 nodes | off | 100% | 10.4 | 0.79 s |
+
+Inventions found, for example: `x[t−1] + (x[t−1] − x[t−2])` (a second-order step), `x[t−1] + (t + t)`,
+`2·(x[t−1] + t)`. With them, `3·x[t−1] − 2·x[t−2] + c` and `2·x[t−1] ± 3·t + c` become small programs over the
+extended language, so a learner that can search only 7-node rules learns the 9-node worlds; without the library
+it validates only the late streams whose rules happen to fit in 7 nodes. Validated beliefs are always inlined
+into innate primitives and still need 4 correct forward predictions; dreams never become knowledge.
+
+**Honest costs:** when the 9-node level is available, the library adds CPU (+30% here, about +20% on deep
+procedural worlds and +18% on standard ones) for the same accuracy and observations. The recognition model's
+own effect is a tie-breaker: on deep procedural worlds (development seeds 2–4, equal CPU), observations to
+validation go from 8.34 to 8.31, 8.48 to 8.29 and 8.59 to 8.59 when it is enabled.
+`library_learning=False` disables the whole mechanism.
 
 ## Stage 6 — autonomous exploration (`autonomy.py`)
 

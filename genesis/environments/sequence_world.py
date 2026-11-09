@@ -9,7 +9,7 @@ Optional harder settings (defaults leave the original world unchanged):
 * ``noise``: probability that a rule stream emits a corrupted term. The corruption is an *innovation*: the
   generator continues from the corrupted value, so the rule stays exact on every other term.
 * ``families``: generator families to sample from, e.g. :data:`DEEP_FAMILIES`, whose shortest rules have
-  seven nodes (beyond the default size-5 hypothesis space).
+  seven nodes (beyond the default size-5 hypothesis space), or :data:`DEEPER_FAMILIES` (nine nodes).
 """
 
 from __future__ import annotations
@@ -88,6 +88,21 @@ def _index_recurrence(rng):
 
 
 DEEP_FAMILIES = [_lcg, _quadratic_linear, _second_order, _index_recurrence]
+
+
+def _weighted_recurrence(rng):
+    a, b = rng.choice([(3, 2), (2, 3)])
+    c = rng.choice([v for v in range(-5, 6) if v])
+    return {"family": "weighted-recurrence", "start": [rng.randint(-5, 5), rng.randint(-5, 5)],
+            "step": lambda h, t: a * h[-1] - b * h[-2] + c}
+
+
+def _doubling_index(rng):
+    k, c = rng.choice([3, -3]), rng.choice([v for v in range(-5, 6) if v])  # k = 2 would factor to 7 nodes
+    return {"family": "doubling-index", "start": [rng.randint(-5, 5)], "step": lambda h, t: 2 * h[-1] + k * t + c}
+
+
+DEEPER_FAMILIES = [_weighted_recurrence, _doubling_index]
 
 
 class SequenceWorld:

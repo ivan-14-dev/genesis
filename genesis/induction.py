@@ -15,12 +15,18 @@ Key properties
 * Hypotheses that agree on every probe input are merged into one behavioural
   equivalence class, so ``(x + x)`` and ``(x * 2)`` do not split confidence.
 * Procedural memory (meta-learning): rule *shapes* that were validated before
-  are tried first. If an instantiation of a familiar shape explains all the
-  data, the exhaustive search is skipped; otherwise it runs as usual.
+  are tried first, in the order a recognition model trained during sleep
+  (genesis.library) finds most plausible for the data at hand. If an
+  instantiation of a familiar shape explains all the data, the exhaustive
+  search is skipped; otherwise it runs as usual.
+* Invented primitives (genesis.library): sub-programs promoted during sleep are
+  extra leaves of the exhaustive search, so rules built on them are shorter.
+  Rules found with them are inlined: beliefs only ever use innate primitives.
 """
 
 from __future__ import annotations
 
+import heapq
 import math
 import random
 import time
@@ -33,7 +39,8 @@ import itertools
 
 from .expressions import (Expr, _trivial, app, const, enumerate_programs, fill_shape, if_eq, parse_shape,
                           shape_slots)
-from .innate import INNATE_CONSTANTS
+from .library import features as task_features, inline
+from .innate import INNATE_CONSTANTS, VALUE_LIMIT
 from .search import match_shape, search_programs
 
 
@@ -57,10 +64,12 @@ class InductionConfig:
     # Deepening (genesis.search): when no enumerated rule mispredicts at most deepen_below * n observations,
     # look for rules of deepen_size nodes by meet-in-the-middle, within the same candidate budget.
     deepen_size: int = 7
+    deepen_max_size: int = 9  # iterative deepening: deepen_size, deepen_size + 2, ... up to this size
     deepen_below: float = 0.25
     deepen_min_n: int = 6
-    deepen_window: int = 8
-    deepen_windows: int = 4
+    # Short windows (4 rows, 8 of them) keep finding a clean window when a few observations are corrupted.
+    deepen_window: int = 4
+    deepen_windows: int = 8
     deepen_growth: float = 0.5   # after a deep search at n, the next one waits until n * (1 + deepen_growth)
     unpredictable_min_n: int = 8
     max_backoff: int = 8
@@ -126,6 +135,11 @@ def _has_trivial(e: Expr) -> bool:
     return any(_has_trivial(a) for a in e.args)
 
 
+def _in_range(inputs: dict, y: int) -> bool:
+    return -VALUE_LIMIT <= y <= VALUE_LIMIT and all(
+        v is None or -VALUE_LIMIT <= v <= VALUE_LIMIT for v in inputs.values())
+
+
 def _logsumexp(xs: list) -> float:
     m = max(xs)
     return m + math.log(sum(math.exp(x - m) for x in xs))
@@ -135,10 +149,15 @@ class RuleLearner:
     def __init__(self, key: str, var_names: list, cfg: InductionConfig,
                  shape_prior: Optional[Callable[[str], float]] = None,
                  probe_fn: Optional[Callable[["RuleLearner", Expr], list]] = None,
-                 shape_library: Optional[Callable[[], list]] = None):
+                 shape_library: Optional[Callable[[], list]] = None,
+                 learned_library: Optional[Callable[[], tuple]] = None):
         self.key = key
         # shape_library() -> shapes from procedural memory, most successful first.
         self.shape_library = shape_library
+        # learned_library() -> (invented primitives, recognition model or None), both learned during sleep.
+        self.learned_library = learned_library
+        self.invention_searches = 0
+        self.invention_hits = 0
         self.library_searches = 0
         self.full_searches = 0
         self.deep_searches = 0
@@ -190,7 +209,7 @@ class RuleLearner:
         post, p_null = self.posterior()
         dist: dict = defaultdict(float)
         for h, p in post:
-            v = h.expr.evaluate(inputs)
+            v = h.expr.evaluate(inputs, True)
             if v is None:
                 p_null += p
             else:
@@ -199,7 +218,7 @@ class RuleLearner:
         if not ranked:
             return Prediction(None, 0.0, p_null, [], None)
         value = ranked[0][0]
-        top = next((str(h.expr) for h, _ in post if h.expr.evaluate(inputs) == value), None)
+        top = next((str(h.expr) for h, _ in post if h.expr.evaluate(inputs, True) == value), None)
         return Prediction(value, ranked[0][1], p_null, ranked, top)
 
     def status(self) -> str:
@@ -224,7 +243,7 @@ class RuleLearner:
             return False
         residuals: Counter = Counter()
         for d, y in self.data:
-            v = h.expr.evaluate(d)
+            v = h.expr.evaluate(d, True)
             if v != y:
                 residuals[None if v is None else y - v] += 1
         if not residuals:
@@ -245,7 +264,7 @@ class RuleLearner:
         top_before, _, _ = self.best()
 
         for h in self.hyps:
-            if h.expr.evaluate(inputs) == y:
+            if h.expr.evaluate(inputs, True) == y:
                 h.n_ok += 1
                 h.fwd_ok += 1
             else:
@@ -268,7 +287,7 @@ class RuleLearner:
         self.hyps = survivors
 
         reinduced = False
-        top_wrong = top_before is not None and top_before.expr.evaluate(inputs) != y
+        top_wrong = top_before is not None and top_before.expr.evaluate(inputs, True) != y
         if (not correct or not self.hyps or top_wrong) and n - self.last_induction_n >= self.backoff:
             self._induce()
             reinduced = True
@@ -315,7 +334,7 @@ class RuleLearner:
         self._probes = [{v: rng.randint(*ranges[v]) for v in self.var_names} for _ in range(self.cfg.n_probes)]
 
     def _probe_sig(self, e: Expr) -> tuple:
-        return tuple(e.evaluate(p) for p in self._probes)
+        return tuple(e.evaluate(p, True) for p in self._probes)
 
     def _base_prior(self, e: Expr, counts: dict) -> float:
         return -2 * math.log(e.size) - math.log(counts.get(e.size, 1))
@@ -329,22 +348,47 @@ class RuleLearner:
         else:
             self.backoff = 1
         t0 = time.perf_counter()
-        inputs = [d for d, _ in self.data]
-        ys = tuple(y for _, y in self.data)
-        n = len(ys)
+        n = len(self.data)
         tol = self._tol(n)
+        # The search kernels use bounded arithmetic; beliefs are exact. Observations beyond VALUE_LIMIT (a
+        # geometric stream past 10^18) are left out of the search and every proposal is re-scored on them
+        # exactly, so a rule found on the in-range data keeps its evidence instead of being refuted by overflow.
+        rows, check, partial = self.data, [], True
+        big = [i for i, (d, y) in enumerate(self.data) if not _in_range(d, y)]
+        if big:
+            skip = set(big)
+            kept = [r for i, r in enumerate(self.data) if i not in skip]
+            if len(kept) >= 5:
+                rows, check = kept, [self.data[i] for i in big]
+            else:
+                check, partial = self.data, False
+        inputs = [d for d, _ in rows]
+        ys = tuple(y for _, y in rows)
         consts = self._propose_constants(inputs, ys)
-        found = self._library_search(inputs, ys, tol, consts)
+        found = self._rescore(self._library_search(inputs, ys, tol, consts), check, partial, tol)
         if any(bad == 0 for _, bad, _ in found):
             self.library_searches += 1
         else:
             self.full_searches += 1
-            found = self._full_search(inputs, ys, tol, consts)
+            found = self._rescore(self._full_search(inputs, ys, tol, consts), check, partial, tol)
         self._merge(found, n)
         self._prev_top = self.hyps[0] if self.hyps else None
         self.last_induction_n = n
         self.n_inductions += 1
         self.induction_seconds += time.perf_counter() - t0
+
+    @staticmethod
+    def _rescore(found: list, check: list, partial: bool, tol: int) -> list:
+        """Exact mismatches on ``check``: added to the search count (``partial``) or replacing it."""
+        if not check:
+            return found
+        out = []
+        for e, bad, lp in found:
+            miss = sum(e.evaluate(d, True) != y for d, y in check)
+            bad = bad + miss if partial else miss
+            if bad <= tol:
+                out.append((e, bad, lp))
+        return out
 
     def _approx_prior(self, e: Expr, n_leaves: int) -> float:
         k = (e.size - 1) // 2
@@ -358,9 +402,14 @@ class RuleLearner:
         cfg = self.cfg
         consts = sorted(consts)
         n_leaves = len(self.var_names) + len(consts)
-        size_bound = max(cfg.max_size, cfg.deepen_size)
+        size_bound = max(cfg.max_size, cfg.deepen_size, cfg.deepen_max_size) if cfg.deepen_size > cfg.max_size \
+            else cfg.max_size
         found, seen = [], set()
-        for shape in self.shape_library()[: cfg.library_max_shapes]:
+        shapes = self.shape_library()
+        rec = self.learned_library()[1] if self.learned_library is not None else None
+        if rec is not None and len(shapes) > cfg.library_max_shapes:
+            shapes = rec.rank(shapes, task_features(list(ys)))
+        for shape in shapes[: cfg.library_max_shapes]:
             tree = parse_shape(shape)
             if not cfg.allow_conditionals and "if_eq" in shape:
                 continue
@@ -415,40 +464,98 @@ class RuleLearner:
 
     def _full_search(self, inputs: list, ys: tuple, tol: int, consts: set) -> list:
         cfg = self.cfg
-        # Candidates within the mismatch tolerance, plus bias fits: when y - e(x) is the same constant r on all
-        # but <= tol observations, propose e + r (see genesis.search; the C kernel and the Python reference agree).
-        n = len(ys)
+        n = len(self.data)
         deepen = cfg.deepen_size > cfg.max_size and n >= max(cfg.deepen_min_n, self.next_deep_n)
-        sr = search_programs(inputs, ys, self.var_names, sorted(consts), tol, cfg.max_size, cfg.max_candidates,
-                             cfg.max_seconds, cfg.max_size - 2, deepen_bad=int(cfg.deepen_below * n) if deepen else -1,
-                             deep_size=cfg.deepen_size, window=cfg.deepen_window, n_windows=cfg.deepen_windows)
-        self.expressions_evaluated += sr.evaluated
-        self.last_search = {"backend": sr.backend, "evaluated": sr.evaluated, "truncated": sr.truncated,
-                            "seconds": round(sr.seconds, 4), "max_size": cfg.max_size, "deep_found": len(sr.deep)}
-        if sr.deep_ran:
+        deepen_bad = int(cfg.deepen_below * len(ys)) if deepen else -1
+        found, counts, deep_ran = self._search(inputs, ys, tol, consts, {}, deepen_bad)
+        # Second stage, only when the innate language found nothing that fits: the same search over a language
+        # extended with the invented primitives. Problems the innate language solves cost exactly what they did,
+        # and the stage follows the deepening schedule (it is one more way of looking deeper). Its deepening stops
+        # at deepen_size: an invention already stands for several nodes, and deeper extended searches cost much
+        # more (mostly on noise, which a learner cannot tell from an out-of-reach rule) for no measured gain.
+        scheduled = deepen or cfg.deepen_size <= cfg.max_size
+        good = int(cfg.deepen_below * len(ys))
+        defs = self._usable_inventions(inputs) if scheduled and not any(bad <= good for _, bad, _ in found) else {}
+        if defs:
+            more, _, ran = self._search(inputs, ys, tol, consts, defs, deepen_bad, cfg.deepen_size)
+            self.invention_searches += 1
+            self.invention_hits += any(bad <= good for _, bad, _ in more)
+            found += more
+            deep_ran = deep_ran or ran
+        if deep_ran:
             self.deep_searches += 1
             self.next_deep_n = n + max(1, int(n * cfg.deepen_growth))
+        if cfg.allow_conditionals and not any(b == 0 for _, b, _ in found):
+            blocks = enumerate_programs(inputs, self.var_names, consts, cfg.branch_max_size, cfg.max_candidates,
+                                        cfg.max_seconds)
+            found += self._conditionals(blocks, counts, inputs, ys)
+        return found
+
+    def _search(self, inputs: list, ys: tuple, tol: int, consts: set, defs: dict, deepen_bad: int,
+                deep_max_size: int = 0) -> tuple:
+        """Candidates within the mismatch tolerance, plus bias fits: when y - e(x) is the same constant r on all but
+        <= tol observations, propose e + r (see genesis.search; the C kernel and the Python reference agree).
+        ``defs`` are invented leaves: their values are extra inputs, and every result is inlined, while the Occam
+        prior is that of the extended language (an invention is one node)."""
+        cfg = self.cfg
+        if defs:
+            inputs = [{**d, **{k: e.evaluate(d) for k, e in defs.items()}} for d in inputs]
+        sr = search_programs(inputs, ys, self.var_names + list(defs), sorted(consts), tol, cfg.max_size,
+                             cfg.max_candidates, cfg.max_seconds, cfg.max_size - 2, deepen_bad=deepen_bad,
+                             deep_size=cfg.deepen_size, window=cfg.deepen_window, n_windows=cfg.deepen_windows,
+                             deep_max_size=deep_max_size or cfg.deepen_max_size)
+        self.expressions_evaluated += sr.evaluated
+        self.last_search = {"backend": sr.backend, "evaluated": sr.evaluated, "truncated": sr.truncated,
+                            "seconds": round(sr.seconds, 4), "max_size": cfg.max_size, "deep_found": len(sr.deep),
+                            "invented_leaves": len(defs)}
         found = [(e, bad, self._base_prior(e, sr.counts)) for e, bad in sr.matches]
         for e, r, bad in sr.offsets:
             fe = app("add", e, const(r))
             found.append((fe, bad, self._base_prior(fe, sr.counts)))
         found += [(e, bad, self._base_prior(e, sr.counts)) for e, bad in sr.deep]
-        if cfg.allow_conditionals and not any(b == 0 for _, b, _ in found):
-            blocks = enumerate_programs(inputs, self.var_names, consts, cfg.branch_max_size, cfg.max_candidates,
-                                        cfg.max_seconds)
-            found += self._conditionals(blocks, sr.counts, inputs, ys)
-        return found
+        if defs:
+            found = [(inline(e, defs), bad, lp) for e, bad, lp in found]
+        return found, sr.counts, sr.deep_ran
+
+    def _recognition(self) -> Callable[[str], float]:
+        """Task-conditional prior from the recognition model: how much more plausible than uniform each familiar
+        shape is for the observations at hand (never negative, zero for unfamiliar shapes)."""
+        rec = self.learned_library()[1] if self.learned_library is not None else None
+        if rec is None or not rec.totals:
+            return lambda shape: 0.0
+        feats = task_features([y for _, y in self.data])
+        scores = {s: rec.log_score(s, feats) for s in rec.totals}
+        z = _logsumexp(list(scores.values()))
+        floor = -math.log(len(scores))
+        return lambda shape: max(0.0, scores[shape] - z - floor) if shape in scores else 0.0
+
+    def _usable_inventions(self, inputs: list) -> dict:
+        """Invented primitives whose variables are perceived here and whose values stay within the search bound on
+        every observation, as ``{leaf name: definition}``."""
+        if self.learned_library is None:
+            return {}
+        names = set(self.var_names)
+        out = {}
+        for inv in self.learned_library()[0]:
+            if inv.expr.variables() <= names and all(inv.expr.evaluate(d) is not None for d in inputs):
+                out[inv.name] = inv.expr
+        return out
 
     def _merge(self, found: list, n: int) -> None:
         cfg = self.cfg
         existing = {str(h.expr): h for h in self.hyps}
         fresh = []
+        recognition = None
         for e, bad, lp in found:
             key = str(e)
             if key in existing:
                 continue
             existing[key] = None
-            fresh.append(Hypothesis(e, lp + cfg.shape_bias * self.shape_prior(e.shape()), n - bad, bad, 0, 0, n))
+            shape = e.shape()
+            if recognition is None:
+                recognition = self._recognition()
+            fresh.append(Hypothesis(e, lp + cfg.shape_bias * (self.shape_prior(shape) + recognition(shape)),
+                                    n - bad, bad, 0, 0, n))
         pool = [h for h in self.hyps] + fresh
         self.hyps = pool
         post, _ = self.posterior()
@@ -458,34 +565,59 @@ class RuleLearner:
             h.probe_sig = self._probe_sig(h.expr)
 
     def _conditionals(self, en, counts: dict, inputs: list, ys: tuple) -> list:
+        """``if q == c then e1 else e0`` from small blocks. Each branch takes its exact blocks when there are
+        any (the first three, in enumeration order); otherwise, on a branch with enough observations, the three
+        blocks with the fewest mismatches within that branch's tolerance, so corrupted outcomes no longer hide a
+        conditional rule. Mismatch sets are bitmasks: one popcount per (block, condition, branch)."""
         cfg = self.cfg
-        blocks = [(e, sig) for e, sig in en.candidates if e.size <= cfg.branch_max_size]
+        n = len(ys)
+        blocks = []
+        for e, sig in en.candidates:
+            if e.size <= cfg.branch_max_size:
+                miss = 0
+                for i, (v, y) in enumerate(zip(sig, ys)):
+                    if v != y:
+                        miss |= 1 << i
+                blocks.append((e, miss))
         conditions = []
         for q in self.var_names:
             for c in sorted({inp[q] for inp in inputs if inp.get(q) is not None}):
                 i1 = [i for i, inp in enumerate(inputs) if inp.get(q) == c]
-                if 0 < len(i1) < len(inputs):
+                if 0 < len(i1) < n:
                     conditions.append((q, c, i1))
         if not conditions:
             return []
         log_nc = math.log(len(conditions))
+        full = (1 << n) - 1
         out = []
         for q, c, i1 in conditions:
-            s1 = set(i1)
-            i0 = [i for i in range(len(ys)) if i not in s1]
-            y1 = tuple(ys[i] for i in i1)
-            y0 = tuple(ys[i] for i in i0)
-            m1 = [e for e, sig in blocks if sig[i1[0]] == y1[0] and tuple(sig[i] for i in i1) == y1][:3]
+            mask1 = sum(1 << i for i in i1)
+            m1 = self._branch_blocks(blocks, mask1, len(i1))
             if not m1:
                 continue
-            m0 = [e for e, sig in blocks if sig[i0[0]] == y0[0] and tuple(sig[i] for i in i0) == y0][:3]
-            for e1 in m1:
-                for e0 in m0:
+            m0 = self._branch_blocks(blocks, full ^ mask1, n - len(i1))
+            for e1, b1 in m1:
+                for e0, b0 in m0:
                     if e1 == e0:
                         continue
                     lp = (-log_nc - math.log(4) + self._base_prior(e1, counts) + self._base_prior(e0, counts))
-                    out.append((if_eq(q, c, e1, e0), 0, lp))
+                    out.append((if_eq(q, c, e1, e0), b1 + b0, lp))
         return out
+
+    def _branch_blocks(self, blocks: list, mask: int, size: int, k: int = 3) -> list:
+        exact = []
+        for e, miss in blocks:
+            if not miss & mask:
+                exact.append((e, 0))
+                if len(exact) == k:
+                    return exact
+        if exact:
+            return exact
+        tol = max(self._tol(size), 1 if size >= 3 else 0)
+        if not tol:
+            return []
+        scored = ((bad, i) for i, (_, miss) in enumerate(blocks) if (bad := (miss & mask).bit_count()) <= tol)
+        return [(blocks[i][0], bad) for bad, i in heapq.nsmallest(k, scored)]
 
     # -------------------------------------------------------------- persistence
     def to_state(self) -> dict:
@@ -497,14 +629,18 @@ class RuleLearner:
             "status_history": self.status_history, "refutations": self.refutations, "status": self._status,
             "library_searches": self.library_searches, "full_searches": self.full_searches,
             "deep_searches": self.deep_searches, "next_deep_n": self.next_deep_n,
+            "invention_searches": self.invention_searches, "invention_hits": self.invention_hits,
         }
 
     @classmethod
     def from_state(cls, state: dict, cfg: InductionConfig,
                    shape_prior: Optional[Callable[[str], float]] = None,
                    probe_fn: Optional[Callable[["RuleLearner", Expr], list]] = None,
-                   shape_library: Optional[Callable[[], list]] = None) -> "RuleLearner":
-        lr = cls(state["key"], state["var_names"], cfg, shape_prior, probe_fn, shape_library)
+                   shape_library: Optional[Callable[[], list]] = None,
+                   learned_library: Optional[Callable[[], tuple]] = None) -> "RuleLearner":
+        lr = cls(state["key"], state["var_names"], cfg, shape_prior, probe_fn, shape_library, learned_library)
+        lr.invention_searches = state.get("invention_searches", 0)
+        lr.invention_hits = state.get("invention_hits", 0)
         lr.library_searches = state.get("library_searches", 0)
         lr.full_searches = state.get("full_searches", 0)
         lr.deep_searches = state.get("deep_searches", 0)

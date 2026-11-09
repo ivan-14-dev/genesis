@@ -50,12 +50,25 @@ def sequence_rollout_probes(lr, expr, k: int = 12) -> list:
     for _ in range(k):
         p = {"x[t-1]": w[-1], "x[t-2]": w[-2], "x[t-3]": w[-3], "t": t}
         probes.append(p)
-        v = expr.evaluate(p)
+        v = expr.evaluate(p, True)
         if v is None:
             break
         w.append(v)
         t += 1
     return probes
+
+
+def sequence_dream(expr, rng, length: int = 16) -> list:
+    """Generative hook for dreaming: the stream ``expr`` would produce from random starting terms."""
+    w = [rng.randint(-9, 9) for _ in range(3)]
+    ys = []
+    for t in range(3, 3 + length):
+        v = expr.evaluate({"x[t-1]": w[-1], "x[t-2]": w[-2], "x[t-3]": w[-3], "t": t})
+        if v is None:
+            break
+        w.append(v)
+        ys.append(v)
+    return ys
 
 
 class SequenceAdapter:

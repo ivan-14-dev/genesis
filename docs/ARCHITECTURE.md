@@ -38,13 +38,14 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 ### Main risks (see also §H)
 
 - Combinatorial explosion of the hypothesis space (mitigated: observational-equivalence pruning, budgets, size
-  limits; open: library learning / abstraction).
+  limits, meet-in-the-middle deepening, library learning of invented primitives).
 - The hypothesis space is an inductive bias chosen by the designers. Rules outside it (e.g. requiring
   division or loops) cannot be learned yet; the agent then reports them as *unpredictable* rather than inventing
   an answer.
 - Black-swan induction: a rule can be validated before the evidence that would refute it has appeared
   (observed once on a decrementing modular counter before wrap-around; see §H).
-- Noise robustness of conditional rules is limited (exact branch matching).
+- Noise robustness is bounded: rules survive up to 40% corrupted observations, but a stream whose actual
+  corruption rate reaches ~30% usually stays unvalidated.
 
 ---
 
@@ -63,6 +64,7 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Decision engine | `agent.py: live`, `adapters.py` | Utility maximisation over candidate experiments/actions; planning over learned model | implemented |
 | Metacognitive engine | `metacognition.py` | Calibration (Brier, ECE), learning progress, knowing-what-you-don't-know | implemented |
 | Consolidation engine | `consolidation.py` | Systems consolidation / hippocampal replay during sleep (McClelland et al. CLS) | implemented |
+| Library learning (sleep) | `library.py` | Wake-sleep program learning (DreamCoder, Ellis et al.): MDL promotion of recurring sub-programs to invented primitives; dreams from procedural memory train a recognition model | implemented (sequences) |
 | Environments + sandbox | `environments/` | Controlled micro-worlds with hidden, seed-sampled rules | implemented (sequences, causal lab) |
 | Developmental curriculum | `metacognition.py: CURRICULUM` | Piaget-inspired staged development with measurable gates | stages 0–7 gated |
 | Autonomous exploration | `autonomy.py: Explorer` | Learning-progress–driven allocation (Oudeyer & Kaplan, intelligent adaptive curiosity); self-generated objectives | implemented (stage 6) |
@@ -98,6 +100,7 @@ flowchart LR
         DEC[Decision<br/>choose experiment/action]
         META[Metacognition<br/>calibration · progress ·<br/>stage gates]
         CON[Consolidation<br/>replay · refute · associate]
+        LIB[Library learning sleep<br/>invented primitives · dreams ·<br/>recognition model]
         EXP[Autonomy<br/>learning-progress<br/>world selection · objectives]
     end
     SI[Self-improvement sandbox<br/>isolated trial agents]
@@ -122,6 +125,8 @@ flowchart LR
     CON <--> LTM
     CON -- refutations, generalisations --> LRN
     LTM -- procedural prior --> LRN
+    CON -- validated rules, shapes --> LIB
+    LIB -- inventions, recognition prior --> LRN
     META -- progress --> EXP
     EXP -- which world --> DEC
     SI -- pending version --> HUM
@@ -372,15 +377,34 @@ Details of the core learner (`RuleLearner`):
   with the same hardened loader as the NN kernels, `native.py`), 10–40× faster than Python. The pure-Python
   version is the specification: both give identical results (fuzzed, and checked by a self-test at load);
   values beyond ±2⁶¹ always use the exact Python path. `GENESIS_SEARCH_BACKEND=python` forces it.
-- **Deepening:** when no enumerated rule (≤ 5 nodes) mispredicts at most 25% of the observations, the kernel
-  looks for 7-node rules without enumerating them: bias fits and `mod c` on the largest level, then a
-  meet-in-the-middle step (for each candidate A and operator, the output B would need on a window of recent
-  observations is looked up in a hash table of enumerated signatures). Every hit is checked on all observations.
+- **Deepening (iterative, up to 9 nodes):** when no enumerated rule (≤ 5 nodes) mispredicts at most 25% of the
+  observations, the kernel looks for deeper rules without enumerating them, at 7 nodes then 9
+  (`deepen_size`, `deepen_max_size`): bias fits and `mod c` on the largest level, a meet-in-the-middle step (for
+  each candidate A and operator, the output B would need on a window of observations is looked up in a hash table
+  of enumerated signatures) and an affine step `(A op B) + c`. Windows are 4 observations, up to 8 of them, most
+  recent first, so a short noisy stream still contains a clean one. Every hit is checked on all observations.
   Deep searches back off geometrically (next one at n·1.5), and the candidate budget is unchanged, so the
   frozen safety policy and its digest are untouched.
 - **Noise tolerance:** a hypothesis survives up to 40% mismatches (`max_mismatch_frac`). Noise is
   *unstructured*: a rule whose errors mostly share one residual (a missed wrap-around, an off-by-one) is
-  incomplete and is never validated, whatever its error rate.
+  incomplete and is never validated, whatever its error rate. Conditionals `if q == c then e1 else e0` tolerate
+  noise too: each branch takes its exact blocks when there are any, otherwise the blocks with the fewest
+  mismatches within that branch's tolerance (mismatch sets are bitmasks, one popcount per block and branch).
+- **Exact beliefs, bounded search:** the search kernels use bounded arithmetic (±10¹⁸), but beliefs are
+  evaluated exactly (`Expr.evaluate(env, exact=True)`, big integers capped at 4096 bits). Observations beyond the
+  bound are left out of the search and every proposal is re-scored on them exactly, so a geometric stream keeps
+  being predicted after it overflows.
+- **Library learning (wake-sleep, `library.py`):** at each consolidation (*sleep*), sub-programs that recur in
+  validated rules of at least two problems are promoted to *invented primitives* when they save description
+  length (`uses·(size−1) − size − 2 > 0`, greedy, ≤ 6 inventions; behaviourally equal sub-programs such as
+  `x·2` and `x+x` count as one). During *wake*, when the innate language finds nothing that fits at a deepening
+  point, the same search runs once more with the inventions as extra leaves (one node each, deepening up to
+  `deepen_size`); results are inlined, so beliefs keep using innate primitives only and must still be validated
+  by forward predictions. Dreams (validated shapes instantiated with fresh variables and constants, rolled out by
+  the domain) and replays of validated problems train a naive-Bayes recognition model `q(shape | coarse series
+  features)`; it adds a task-conditional bonus to the prior of familiar shapes and decides which shapes are
+  tried when procedural memory exceeds the per-search cap. Everything is recomputed from validated knowledge at
+  every sleep, so an invention disappears with the rules that supported it.
 - **Validation:** equivalence-class posterior ≥ 0.9 **and** ≥ 4 correct forward predictions **and** ≤ 25%
   forward errors (`validation_max_error`) **and** no structured errors. **Unpredictable:** p(null) ≥ 0.9 with
   ≥ 8 observations.
@@ -407,7 +431,7 @@ Details of the core learner (`RuleLearner`):
 | `knowledge` (`kind=grounded-word`) | Grounded lexical hypotheses | Compatible sensor/effect predicates, external annotations, experiment provenance, novel-input prediction checks |
 | `knowledge` (`kind=construction`) | Learned interpretation forms | Literal/slot patterns, signed predicates, demonstrated meanings, prospective checks; state in `meta["constructions/<env>"]` |
 | `conversations` + `chat_messages` | Interaction log | conversation title/lang; messages (role, text, meta JSON with intent, knowledge id, status). Data typed by the user enters `episodes` with provenance `user-provided` (external information, distinct from own observation) |
-| `meta` | Identity and bounded object models | Core/language/grounding manifests and installation histories, safety digest, stage-0 audit, session counter, review schedule; `grounding/<env>` transitions and revisions, `grounded_evaluation` report; `grounded-language/<env>` lexical state, `object-dialogue/<conversation>` selection |
+| `meta` | Identity and bounded object models | Core/language/grounding manifests and installation histories, safety digest, stage-0 audit, session counter, review schedule; `grounding/<env>` transitions and revisions, `grounded_evaluation` report; `grounded-language/<env>` lexical state, `object-dialogue/<conversation>` selection; `library` (invented primitives, recognition model, per-shape dream statistics) |
 
 Consolidation never deletes episodes; refuted beliefs are kept with their refuting evidence.
 `checkpoint()` / `restore()` provide rollback.
@@ -433,8 +457,8 @@ future source must be tagged with provenance `external` and kept separate from e
 | Phase | Content | Acceptance criterion |
 |---|---|---|
 | 1 ✅ | Innate core, induction, memory, curiosity, metacognition, consolidation, sequence + causal worlds, benchmarks, demo | stages 0–5 gates pass on held-out seeds |
-| 2 (partial ✅) | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Done for sequences:* majority-residual fits, structured-error check, 40% tolerance — ≥ 0.98 extrapolation accuracy at 10% innovation noise, 0 false validations (RESULTS, robustness). Conditionals still exact |
-| 3 (partial ✅) | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Done so far:* library-first search over remembered shapes (now up to 7 nodes, evaluated by a C kernel) cuts search 16.5× on standard worlds; on 7-node worlds it also cuts observations to validation (11.6 → 8.8, −25%) and CPU (−32%); sub-program promotion and wake-sleep (dreaming) still open |
+| 2 ✅ | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Met:* sequences (majority-residual fits, structured-error check, 40% tolerance, exact beliefs): 100% at 10% innovation noise; causal lab with noisy conditionals: 100% held-out accuracy and every confounded cause found at 5%, 10% and 20% outcome noise; 0 false validations (RESULTS, robustness). Probabilistic transitions remain open |
+| 3 ✅ | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Met:* library-first search over remembered shapes cuts search 16.5× on standard worlds and observations to validation by 25% on 7-node worlds; sleep-time sub-program promotion and dreaming (`library.py`) let a 7-node search budget learn later 9-node rules (curriculum, RESULTS) |
 | 4 ✅ | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction (met at budget 150 and 300; **not** at 100) |
 | 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
 | 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
@@ -448,7 +472,7 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Search explosion for larger rules | cannot learn | budgets (candidates, seconds) in the safety policy; library learning (phase 3) |
+| Search explosion for larger rules | cannot learn | budgets (candidates, seconds) in the safety policy; meet-in-the-middle deepening; library learning (phase 3) |
 | Inductive black swan (validated too early) | false knowledge | forward-validation, spaced review, refutation tracking; residual risk documented |
 | Designer bias in the hypothesis space | "learning" limited to what designers anticipated | explicit manifest; report "unpredictable" honestly; expand primitives only via documented versions |
 | Benchmark overfitting during development | inflated results | report held-out seeds (100–109) not used during development |
@@ -460,12 +484,17 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 
 ### Known limitations of the current prototype
 
-- Hypothesis space: integer arithmetic/logic, size ≤ 5 enumerated plus size 7 by deepening (sequences), or ≤ 3
-  + one conditional (lab, no deepening). Rules of 9+ nodes are out of reach.
-- Conditional rules require exact branch matches (not noise-tolerant). Sequence rules tolerate innovation noise
-  up to ~20%; a stream whose actual corruption rate reaches ~30% usually stays *candidate*.
-- Values are bounded by ±10¹⁸: a geometric stream beyond that can no longer be predicted, and once values
-  exceed ±2⁶¹ the search falls back to the exact (slow) Python path.
+- Hypothesis space: integer arithmetic/logic, size ≤ 5 enumerated plus sizes 7 and 9 by deepening (sequences),
+  or ≤ 3 + one conditional (lab, no deepening). Deepening only finds deep rules of the shapes it composes (bias,
+  `mod c`, `A op B`, `(A op B) + c`); 11+ nodes need `deepen_max_size` raised and are only reachable through
+  invented primitives.
+- Rules tolerate innovation noise up to ~20%; a stream whose actual corruption rate reaches ~30% usually stays
+  *candidate*. 9-node rules under 10% noise are validated in ~94% of the runs.
+- The search is bounded by ±10¹⁸ (beliefs are exact): proposals are found on the in-range part of a stream, and
+  once values exceed ±2⁶¹ the search falls back to the slower Python path.
+- Library learning costs CPU where inventions do not help (about +20% on standard and deep worlds), because a stream
+  generated by an out-of-reach rule cannot be told apart from noise until the extra search has run. The
+  recognition model's effect on observations to validation is marginal; it mainly ranks shapes.
 - Modulus constants are found heuristically (three largest values + 1, differences, contrasts); an unusual modulus
   may be missed.
 - Zero forgetting is a property of per-context symbolic knowledge, not a general solution to catastrophic

@@ -125,8 +125,10 @@ REASONS_FR = {"step limit": "budget atteint", "sandbox budget exhausted": "budge
                   "plus rien à apprendre dans mon espace d'hypothèses actuel",
               "safety interaction limit": "limite de sécurité atteinte"}
 NOTES_FR = {
-    "hypothesis space is bounded by max_size; longer programs are unreachable":
-        "mon espace d'hypothèses est borné (max_size) : les programmes plus longs me sont inaccessibles",
+    "hypothesis space is bounded: programs up to max_size, deeper ones only as deepening compositions "
+    "(up to deepen_max_size) or through invented primitives":
+        "mon espace d'hypothèses est borné : programmes jusqu'à max_size, au-delà seulement par approfondissement "
+        "(jusqu'à deepen_max_size) ou via des primitives inventées",
     "constants are proposed from observed data only; unseen moduli cannot be discovered":
         "je ne propose des constantes qu'à partir des données : un modulo jamais observé m'échappe",
     "search budgets are safety-locked and cannot be raised by self-improvement":
