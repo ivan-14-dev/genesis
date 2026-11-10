@@ -14,6 +14,48 @@ also let it acquire simple facts from teaching; these external assertions are ne
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - Measured results on held-out seeds: [`docs/RESULTS.md`](docs/RESULTS.md)
 
+## Install in one command
+
+Linux, macOS or WSL (needs Python ≥ 3.10 with `venv`):
+
+```bash
+curl -fsSL https://github.com/ivan-14-dev/genesis/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://github.com/ivan-14-dev/genesis/releases/latest/download/install.ps1 | iex
+```
+
+The installer puts the latest release in its own virtual environment (`~/.genesis/venv`), adds a `genesis`
+command, runs `genesis init` and opens the web interface. **`genesis init` generates everything on your
+machine**: the Ed25519 admin key (`~/.genesis/admin.key`, 0600), an empty memory (`~/.genesis/memory.db`) where
+that key is pinned, a signed policy that requires authentication, and the web credentials, a user `admin` with a
+random password (~99 bits), printed once and saved in `~/.genesis/credentials.txt` (0600). The web interface
+asks for them from its very first opening; only the password's SHA-256 is stored in the memory. Running
+`genesis init` again changes nothing; `genesis init --reset-password` signs a new policy with a new password.
+
+```bash
+genesis start --open                              # serve ~/.genesis on http://127.0.0.1:8766 and open it
+genesis init --reset-password                     # lost the password: rotate it (needs the admin key)
+curl -fsSL .../install.sh | sh -s -- --version 0.4.0 --port 9000 --no-start   # installer options
+```
+
+Installer options (`--version`, `--home`, `--port`, `--bin-dir`, `--source WHEEL|DIR|URL`, `--no-start`, or the
+`GENESIS_VERSION` / `GENESIS_HOME` / `GENESIS_PORT` / `GENESIS_SOURCE` / `GENESIS_NO_START` environment variables
+for `install.ps1`) are documented at the top of each script. Uninstall: delete `~/.genesis` and the `genesis`
+link in `~/.local/bin` (Windows: `%USERPROFILE%\.genesis` and its `bin` entry in the user PATH).
+
+Publishing a release (maintainers): bump `version` in `pyproject.toml`, then attach the wheel and both scripts,
+which the one-line commands above download from the latest release:
+
+```bash
+python -m pip wheel --no-deps -w dist .
+sh install.sh --source dist/*.whl --home /tmp/g --bin-dir /tmp/g/bin --no-start   # smoke test, outside ~/.genesis
+gh release create v0.4.0 dist/*.whl install.sh install.ps1 --title "GENESIS v0.4.0" --generate-notes
+```
+
 ## Quickstart
 
 Requires Python ≥ 3.10. Runtime dependencies: none (stdlib + SQLite). pytest is needed for the tests.
@@ -30,6 +72,7 @@ python -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m genesis approve --db runs/demo.db --version 2 --by <name>   # human-only deployment
 .venv/bin/python -m genesis rollback --db runs/demo.db
 .venv/bin/python -m genesis benchmark --seeds 100-109                 # full suite (~15 min, CPU)
+.venv/bin/python -m genesis vision --seeds 100-109                    # phase 5: rules from pixels (~10 min)
 .venv/bin/python -m genesis grounded --seed 100 --db runs/objects.db # new file only; object-concept experiment
 .venv/bin/python -m pytest -q
 ```
@@ -166,7 +209,12 @@ GENESIS learns in any domain it is given, **but only under rules its administrat
   `audit verify` detects edits, deletions and (with `audit seal`) truncation; it also re-checks corpus documents,
   model weights and the policy signature. The DB file and checkpoints are created with mode 0600.
 - Without an installed policy, the built-in default applies (local user with the `teacher` role, no auth), which
-  preserves the original single-user behaviour.
+  preserves the original single-user behaviour. `genesis init` (see [Install](#install-in-one-command)) does
+  the key generation, pinning and policy installation in one step, with a generated `admin` password; the
+  web page then shows a sign-in form (`POST /api/login`, at most 10 attempts per minute and per address, every
+  attempt audited as `auth.login`, the password never logged). The password is that user's bearer token, kept
+  in an `HttpOnly`, `SameSite=Strict` cookie; it can only be changed by signing a new policy
+  (`genesis init --reset-password`), never from the browser, which holds no admin key.
 
 ## In-house language model (built here, nothing pretrained)
 
@@ -352,6 +400,13 @@ or refuted it (`inspect --explain`).
   causes found 0% by watching vs 100% after experiments; curiosity needs 24.5 experiments vs 51.7 for random.
   With 5%, 10% or 20% of experiment outcomes corrupted, still 100% held-out accuracy and 18/18 confounded causes
   found, never a wrong cause validated (noise-tolerant conditionals).
+- Pixels (phase 5): the same causal labs seen only as rendered images (glyph counts with same-ink distractors,
+  pixel noise). The agent learns a discrete visual code from unlabelled patches (vector-quantised autoencoder on
+  the in-house `genesis.nn`) and calibrates its readout with its own motor commands. It reaches 100% unseen
+  held-out accuracy on 10/10 seeds with 91.5 samples vs 82 symbolic (1.17×, at most 1.54×: criterion met on
+  every seed), reads values up to 30 after seeing only 0–5, and misread 0 of 4,800 checked panels. It abstains
+  on appearances it was never calibrated on. Counting only the interactions it chooses (10 looks + experiments,
+  watching excluded), it needs 31.5 vs 22 and only 3/10 seeds stay within 2×.
 - Memory: retention 1.0 across sessions, forgetting 0.0 after a second world. Planning: 100% vs 78.5% random.
 - Tight budget (60 observations): curiosity with budget-aware focus validates 55% of rule streams (random 21%,
   round-robin 0%). Remembered rule shapes cut the search that discovers a rule 16× (2× including the rival
@@ -384,6 +439,7 @@ genesis/
                      deepening, shape instantiation
   native.py          hardened local compilation/loading of the C kernels (private cache, digest-checked)
   perception.py      features, novelty
+  vision.py          phase 5: self-supervised VQ patch codes, efference-copy readout, abstention
   attention.py       salience
   memory.py          working memory + SQLite long-term memory (5 memory systems + evidence)
   curiosity.py       expected information gain, knowledge gaps/questions
@@ -393,7 +449,7 @@ genesis/
                      (with reserved noise / random-program classes)
   adapters.py        bridges between the cognitive cycle and each environment
   agent.py           the 12-step cognitive cycle, persistence, planning
-  environments/      sandbox + SequenceWorld + CausalWorld + ObjectWorld (hidden rules)
+  environments/      sandbox + SequenceWorld + CausalWorld + PixelCausalWorld + ObjectWorld (hidden rules)
   autonomy.py        stage 6: learning-progress allocation across worlds, self-generated objectives
   self_improvement.py stage 7: sandboxed evaluation of config variants, human approval, rollback, limitations
   dashboard.py       read-only monitoring web UI + JSON API (stdlib only)
@@ -411,9 +467,11 @@ genesis/
   lm/                BPE tokenizer, Kneser–Ney n-gram LM, model registry (train/approve/load/generate)
   nn/                from-scratch autograd, AdamW, TinyGPT Transformer, C kernels, safe weight format
   cli_admin.py       `admin`, `audit`, `corpus`, `lm` commands
+  bootstrap.py       `genesis init` / `start`: home folder, admin key, signed policy, generated web credentials
   experiments.py     benchmarks, baselines and controls
   demo.py, __main__.py
 tests/               pytest suite (incl. a static check that agent code never reads hidden world internals)
+install.sh, install.ps1  one-command installers (release assets): venv, `genesis` command, `genesis init`, start
 ```
 
 ## Honest scope
@@ -429,5 +487,6 @@ never touches the safety policy or deploys without a human. The in-house languag
 as the approved corpus; it predicts text, it does not reason, and its output is never treated as knowledge.
 Governance assumes the admin key stays secret and the host is trusted: someone with write access to the DB can
 still delete data (detected by `audit verify`, not prevented) and delete seals, so keep the last sealed head hash
-outside the DB. Limitations and next steps (non-linear rules beyond 9 nodes, coarse noise-recognition features, probabilistic
-transitions, neural perception) are listed in `docs/ARCHITECTURE.md`.
+outside the DB. Neural perception reads rendered glyph counts in a sensor layout given by the body; it is not
+general vision. Limitations and next steps (non-linear rules beyond 9 nodes, coarse noise-recognition features,
+probabilistic transitions, perception beyond rendered counts) are listed in `docs/ARCHITECTURE.md`.

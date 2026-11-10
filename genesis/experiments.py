@@ -14,10 +14,10 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 
-from .adapters import LabAdapter, SequenceAdapter
+from .adapters import LabAdapter, PixelLabAdapter, PixelPassiveAdapter, SequenceAdapter
 from .agent import Genesis
 from .autonomy import Explorer
-from .environments import CausalWorld, SequenceWorld, sandboxed
+from .environments import CausalWorld, PixelCausalWorld, SequenceWorld, sandboxed
 from .environments.sequence_world import DEEP_FAMILIES, DEEPER_FAMILIES, DEEPEST_FAMILIES
 
 
@@ -299,6 +299,213 @@ def run_lab_robustness(seeds, noises=LAB_NOISE_LEVELS) -> dict:
             "conditional_rules": len(conds),
             "cpu_seconds": _mean([r["cpu_seconds"] for r in runs]),
         }
+    return out
+
+
+# ================================================================ phase 5: pixels
+PIXEL_CHECKPOINTS = tuple(range(0, 121, 5))
+PERCEPTION_BANDS = {"negative_never_calibrated": (-5, -1), "calibrated_0_5": (0, 5), "lab_outcomes_6_10": (6, 10),
+                    "extrapolation_11_30": (11, 30)}
+
+
+def perception_report(agent: Genesis, world: PixelCausalWorld, seed: int, n_images: int = 8) -> dict:
+    """Read freshly rendered panels of known value. ``wrong`` must stay 0: a misreading would be learned as a
+    fact, whereas an abstention only costs an observation."""
+    rng = random.Random(f"perception-eval-{seed}")
+    panels = world.spec()["image"]["panels"]
+    out = {}
+    for band, (lo, hi) in PERCEPTION_BANDS.items():
+        ok = abstained = wrong = 0
+        for _ in range(n_images):
+            state = {p: rng.randint(lo, hi) for p in world.props}
+            seen = agent.read_image(world.env_id, world._render(state, rng), panels)
+            for p in world.props:
+                if seen[p] is None:
+                    abstained += 1
+                elif seen[p] == state[p]:
+                    ok += 1
+                else:
+                    wrong += 1
+        n = ok + abstained + wrong
+        out[band] = {"correct": round(ok / n, 4), "abstained": round(abstained / n, 4), "wrong": wrong, "panels": n}
+    return out
+
+
+def _panel_ink(image: dict, rect) -> float:
+    x0, y0, w, h = rect
+    return sum(sum(image["pixels"][(y0 + y) * image["width"] + x0:(y0 + y) * image["width"] + x0 + w])
+               for y in range(h)) / 255.0
+
+
+def ink_sum_baseline(world: PixelCausalWorld, looks: int, seed: int, n_images: int = 8) -> dict:
+    """Non-learned control: value = a * total ink + b, fitted on as many motor-babbling panels as the agent gets.
+    Distractor glyphs carry ink too, so total ink cannot be read exactly."""
+    rng = random.Random(f"ink-baseline-{seed}")
+    panels = world.spec()["image"]["panels"]
+    xs, ys = [], []
+    for _ in range(looks):
+        state = {p: rng.randint(0, world.n_values - 1) for p in world.props}
+        image = world._render(state, rng)
+        for p in world.props:
+            xs.append(_panel_ink(image, panels[p]))
+            ys.append(state[p])
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    a = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / max(sum((x - mx) ** 2 for x in xs), 1e-12)
+    b = my - a * mx
+    out = {}
+    for band, (lo, hi) in PERCEPTION_BANDS.items():
+        ok = n = 0
+        for _ in range(n_images):
+            state = {p: rng.randint(lo, hi) for p in world.props}
+            image = world._render(state, rng)
+            for p in world.props:
+                ok += round(a * _panel_ink(image, panels[p]) + b) == state[p]
+                n += 1
+        out[band] = round(ok / n, 4)
+    return out
+
+
+def pixel_end_to_end(agent: Genesis, world: PixelCausalWorld, evalset: list, seed: int) -> dict:
+    """Predict the next state from a rendered image of the current one (perception, then the learned rules).
+    An abstention counts as a failure in ``accuracy``."""
+    rng = random.Random(f"end-to-end-{seed}")
+    panels = world.spec()["image"]["panels"]
+    ok = abstained = 0
+    for s, a, nxt in evalset:
+        seen = agent.read_image(world.env_id, world._render(s, rng), panels)
+        if any(v is None for v in seen.values()):
+            abstained += 1
+            continue
+        pred, _ = agent.predict_transition(world.env_id, world.props, seen, a)
+        ok += pred == nxt
+    return {"accuracy": round(ok / len(evalset), 4), "abstained": round(abstained / len(evalset), 4)}
+
+
+def run_pixel_lab_benchmark(seed: int, looks: int = 10, watch: int = 60, budget: int = 120, kind: str = "neural",
+                            strategy: str = "curiosity", checkpoints=PIXEL_CHECKPOINTS, pixel_noise: float = 0.08,
+                            eval_images: int = 100) -> dict:
+    """Phase 5: the stage 2-3 protocol on :class:`PixelCausalWorld`. The agent first spends ``looks`` interactions
+    on motor babbling (learning a visual code and calibrating its readout), then watches and experiments with
+    every outcome read from pixels. Rule accuracy is scored exactly as in :func:`run_lab_benchmark` (true states,
+    unseen held-out set), so the learning curves are directly comparable; ``end_to_end_heldout`` adds perception
+    of the current state."""
+    with _tmpdb() as path:
+        agent = Genesis(path, seed=seed)
+        world = PixelCausalWorld(seed, pixel_noise=pixel_noise)
+        sb = sandboxed(world, looks + watch + budget + 100)
+        held = lab_eval_set(world, 400, seed + 991, 0, world.n_values - 1)
+        transfer = lab_eval_set(world, 400, seed + 993, world.n_values, world.n_values + 8)
+        t0 = time.process_time()
+        cal = agent.calibrate_vision(sb, looks, kind)
+        perception_calibrated = perception_report(agent, world, seed)
+        watcher = PixelPassiveAdapter(agent, sb)
+        agent.live(watcher, watch, "curiosity", stop_when_idle=False)
+        after_watch = lab_accuracy(agent, world, held)
+        adapter = PixelLabAdapter(agent, sb)
+        curve, done = [], 0
+        for cp in checkpoints:
+            if cp > done:
+                agent.live(adapter, cp - done, strategy, stop_when_idle=False)
+                done = cp
+            curve.append({"experiments": done, "heldout_unseen": lab_accuracy(agent, world, held,
+                                                                              experienced(agent, world))})
+        to_perfect = next((c["experiments"] for c in curve if c["heldout_unseen"] == 1.0), None)
+        res = {
+            "seed": seed, "kind": kind, "pixel_noise": pixel_noise, "looks": cal["looks"], "watch": watch,
+            "hidden_rules": world._describe_rules(),
+            "after_passive_watching": after_watch,
+            "watch_unreadable_situations": watcher.abstentions["unreadable_situations"],
+            "learning_curve": curve,
+            "experiments_to_perfect_heldout": to_perfect,
+            "samples_to_perfect": None if to_perfect is None else cal["looks"] + watch + to_perfect,
+            "final_heldout_unseen": curve[-1]["heldout_unseen"],
+            "final_transfer_out_of_range": lab_accuracy(agent, world, transfer),
+            "unreadable_outcomes": watcher.abstentions["unreadable_outcomes"]
+            + adapter.abstentions["unreadable_outcomes"],
+            "before_image_checks": adapter.perception_checks,
+            "perception_after_calibration": perception_calibrated,
+            "perception_final": perception_report(agent, world, seed + 1),
+            "end_to_end_heldout": pixel_end_to_end(agent, world, held[:eval_images], seed),
+            "confound_after_experiments": confound_resolved(agent, world),
+            "visual_code_losses": agent.visual_reader(world.env_id).code.losses,
+            "cpu_seconds": round(time.process_time() - t0, 3),
+        }
+        agent.ltm.close()
+        return res
+
+
+def run_pixel_comparison(seeds, looks: int = 10, kinds=("neural", "kmeans"), pixel_noise: float = 0.08,
+                         watch: int = 60) -> dict:
+    """Phase-5 acceptance: rule discovery from pixels within 2x the symbolic sample count. Samples are all
+    interactions spent until the unseen held-out accuracy first reaches 100% (checked every 5 experiments):
+    ``watch + experiments`` for the symbolic agent, ``looks + watch + experiments`` from pixels."""
+    seeds = list(seeds)
+    t0 = time.time()
+    symbolic = [run_lab_benchmark(s, watch=watch, checkpoints=PIXEL_CHECKPOINTS) for s in seeds]
+    sym_samples = [None if r["experiments_to_perfect_heldout"] is None else watch + r["experiments_to_perfect_heldout"]
+                   for r in symbolic]
+    pixel = {k: [run_pixel_lab_benchmark(s, looks, watch, kind=k, pixel_noise=pixel_noise) for s in seeds]
+             for k in kinds}
+
+    def summarise(runs):
+        per_seed, ratios = [], []
+        for r, ss in zip(runs, sym_samples):
+            sp = r["samples_to_perfect"]
+            ratio = round(sp / ss, 4) if sp is not None and ss is not None else None
+            if ratio is not None:
+                ratios.append(ratio)
+            per_seed.append({"seed": r["seed"], "pixel_samples": sp, "symbolic_samples": ss, "ratio": ratio,
+                             "within_2x": None if ss is None else (sp is not None and sp <= 2 * ss)})
+        judged = [p["within_2x"] for p in per_seed if p["within_2x"] is not None]
+        checks = [r["before_image_checks"] for r in runs]
+        bands = {b: {"correct": _mean([r["perception_final"][b]["correct"] for r in runs]),
+                     "abstained": _mean([r["perception_final"][b]["abstained"] for r in runs]),
+                     "wrong_panels": sum(r["perception_final"][b]["wrong"] for r in runs)}
+                 for b in PERCEPTION_BANDS}
+        return {
+            "runs_reaching_perfect": _mean([r["experiments_to_perfect_heldout"] is not None for r in runs]),
+            "experiments_to_perfect": _mean([r["experiments_to_perfect_heldout"] for r in runs]),
+            "samples_to_perfect": _mean([r["samples_to_perfect"] for r in runs]),
+            # stricter view: only the interactions the agent chooses (looks + experiments), watching excluded
+            "active_samples_to_perfect": _mean([None if r["experiments_to_perfect_heldout"] is None else
+                                                r["looks"] + r["experiments_to_perfect_heldout"] for r in runs]),
+            "sample_ratio_vs_symbolic": _mean(ratios),
+            "max_sample_ratio": max(ratios) if ratios else None,
+            "seeds_within_2x": f"{sum(judged)}/{len(judged)}",
+            "after_passive_watching": _mean([r["after_passive_watching"] for r in runs]),
+            "watch_unreadable_situations": _mean([r["watch_unreadable_situations"] for r in runs]),
+            "unreadable_outcomes": _mean([r["unreadable_outcomes"] for r in runs]),
+            "final_heldout_unseen": _mean([r["final_heldout_unseen"] for r in runs]),
+            "final_transfer_out_of_range": _mean([r["final_transfer_out_of_range"] for r in runs]),
+            "end_to_end_heldout": _mean([r["end_to_end_heldout"]["accuracy"] for r in runs]),
+            "end_to_end_abstained": _mean([r["end_to_end_heldout"]["abstained"] for r in runs]),
+            "before_images_read": sum(c["read"] for c in checks),
+            "before_images_misread": sum(c["read"] - c["agreed"] - c["abstained"] for c in checks),
+            "before_images_abstained": sum(c["abstained"] for c in checks),
+            "perception_final": bands,
+            "cpu_seconds": _mean([r["cpu_seconds"] for r in runs]),
+            "per_seed": per_seed,
+            "criterion_met": bool(judged) and all(judged),
+        }
+
+    ink = [ink_sum_baseline(PixelCausalWorld(s, pixel_noise=pixel_noise), looks, s) for s in seeds]
+    out = {
+        "seeds": seeds, "looks": looks, "watch": watch, "pixel_noise": pixel_noise,
+        "symbolic": {
+            "runs_reaching_perfect": _mean([r["experiments_to_perfect_heldout"] is not None for r in symbolic]),
+            "experiments_to_perfect": _mean([r["experiments_to_perfect_heldout"] for r in symbolic]),
+            "samples_to_perfect": _mean(sym_samples),
+            "final_heldout_unseen": _mean([r["final_heldout_unseen"] for r in symbolic]),
+            "final_transfer_out_of_range": _mean([r["final_transfer_out_of_range"] for r in symbolic]),
+        },
+        "pixel": {k: summarise(runs) for k, runs in pixel.items()},
+        "ink_sum_baseline_accuracy": {b: _mean([r[b] for r in ink]) for b in PERCEPTION_BANDS},
+        "wall_seconds": round(time.time() - t0, 1),
+    }
+    primary = kinds[0]
+    out["phase5_criterion"] = {
+        "definition": "pixel samples to 100% unseen held-out rule accuracy <= 2x symbolic, on every seed the "
+                      "symbolic agent solves", "encoder": primary, "met": out["pixel"][primary]["criterion_met"]}
     return out
 
 

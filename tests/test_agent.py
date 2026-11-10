@@ -68,7 +68,7 @@ def test_cognitive_modules_never_touch_world_internals():
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in {"_rules", "_true_next", "_describe_rules",
                                                                  "_future", "_family", "_confound",
-                                                                 "_Sandbox__world"}:
+                                                                 "_render", "_Sandbox__world"}:
                 pytest.fail(f"{path.name}:{node.lineno} accesses {node.attr}")
             if isinstance(node, ast.ImportFrom) and node.module and "environments" in node.module:
                 names = {a.name for a in node.names}

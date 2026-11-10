@@ -252,6 +252,33 @@ def test_tokens_cookie_and_roles(serve):
     assert reply["meta"]["intent"] == "policy-denied"
 
 
+def test_login_form_sets_cookie_and_is_audited_and_rate_limited(serve):
+    pw, pw_hash = governance.new_token()
+    box = serve({"require_auth": True, "default_role": None,
+                 "users": [{"name": "admin", "role": "admin", "token_sha256": pw_hash}]})
+    p = box["port"]
+    assert _http(p, "GET", "/api/whoami")[0] == 401
+    assert b'id="login-form"' in _http(p, "GET", "/")[1]  # the page itself is public: it holds the login form
+    assert _http(p, "POST", "/api/login", {"user": "admin", "password": pw}, {"Origin": "http://evil.example"})[0] \
+        == 403
+    for bad in ({"user": "admin", "password": "wrong-password-123456"}, {"user": "root", "password": pw},
+                {"user": "admin", "password": "short"}, {"user": ["admin"], "password": pw}):
+        assert _http(p, "POST", "/api/login", bad)[0] == 401, bad
+    code, body, r = _http(p, "POST", "/api/login", {"user": "admin", "password": pw})
+    cookie = r.getheader("Set-Cookie")
+    assert code == 200 and body == {"user": "admin", "role": "admin"}
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    who = _http(p, "GET", "/api/whoami", headers={"Cookie": cookie.split(";")[0]})[1]
+    assert who["user"] == "admin" and "policy.install" in who["permissions"]
+    assert "Max-Age=0" in _http(p, "POST", "/api/logout", {})[2].getheader("Set-Cookie")
+
+    logins = [(e["decision"], e["actor"]) for e in box["engine"].ltm.audit_entries() if e["action"] == "auth.login"]
+    assert logins.count(("deny", "anonymous")) == 4 and logins.count(("allow", "admin")) == 1
+    assert pw not in json.dumps(box["engine"].ltm.audit_entries())
+    codes = [_http(p, "POST", "/api/login", {"user": "admin", "password": pw})[0] for _ in range(6)]
+    assert codes[:5] == [200] * 5 and codes[5] == 429  # 10 attempts per minute and per address
+
+
 def test_rate_limit(serve):
     p = serve({"limits": {"requests_per_minute": 3}})["port"]
     codes = [_http(p, "GET", "/api/status")[0] for _ in range(5)]

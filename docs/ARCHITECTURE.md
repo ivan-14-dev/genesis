@@ -19,7 +19,7 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Curiosity that is *not* random (information-gain–driven experiments) | **High** – demonstrated here | Expected information gain over an explicit hypothesis posterior is computable exactly; it ignores unlearnable noise ("noisy-TV" immunity) because hypotheses agree there. |
 | Distinguish correlation from causation | **High in sandboxed worlds** – demonstrated here | The agent can intervene (`do(state)`), so confounds in passive data can be broken by experiments (Pearl's interventional rung). |
 | Persistent, auditable, non-forgetting memory | **High** for symbolic knowledge – demonstrated here | Per-context symbolic rules with provenance do not interfere with each other. This does **not** solve catastrophic forgetting in distributed neural representations. |
-| Perception of raw images/audio from scratch | **Medium** | Requires learned neural encoders (PyTorch). Self-supervised representation learning works, but needs data and compute, and the learned features must be bridged to the symbolic layer. Not implemented yet. |
+| Perception of raw images/audio from scratch | **Medium** – demonstrated on rendered counts (phase 5) | Self-supervised discrete codes, learned from unlabelled pixel patches with the in-house `genesis.nn` and read out through the agent's own motor commands, give the rule learner exact symbols, with abstention instead of guesses. Natural images, object segmentation and audio are not attempted: they need far more data and compute. |
 | Open-ended language understanding from scratch | **Low** within any reasonable budget | Humans need years of grounded multimodal experience. Without a pretrained LLM (which the spec forbids, rightly, for learning claims) this is a long-term research question, not an engineering task. |
 | Unrestricted recursive self-improvement | **Deliberately excluded** | Unsafe and unmeasurable. Only bounded, validated self-tuning (priors, strategies) is allowed. |
 
@@ -58,7 +58,7 @@ Notation: **innate** = present before any experience (fixed by the designers, re
 | Module | File | Scientific principle | Status |
 |---|---|---|---|
 | Innate core | `innate.py` | Core-knowledge hypothesis (Spelke): minimal domain-general primitives; explicit innate/acquired split | implemented |
-| Perception engine | `perception.py`, `adapters.py` | Feature extraction, novelty as inverse familiarity (habituation) | implemented (numeric/symbolic); neural encoders planned |
+| Perception engine | `perception.py`, `vision.py`, `adapters.py` | Feature extraction, novelty as inverse familiarity (habituation); learned discrete visual codes with an efference-copy readout and abstention | implemented (numeric/symbolic; pixels for rendered counts, phase 5) |
 | Working memory | `memory.py: WorkingMemory` | Limited capacity (Miller/Cowan), salience × recency decay eviction | implemented |
 | Long-term memory | `memory.py: LongTermMemory` | Multiple memory systems (Tulving/Squire): episodic, semantic, procedural, associative, metacognitive | implemented (SQLite) |
 | Attention engine | `attention.py` | Salience from novelty, surprise and reward (Itti & Baldi "Bayesian surprise") | implemented |
@@ -205,6 +205,7 @@ changes) and audited in `meta.stage0_audit`.
 | Symbolic teaching grammar and conditional class inheritance (`semantic.py`, declared in the language manifest) | Named entities, membership, inclusion and spatial relations; no example facts are installed at birth |
 | Bounded predictive feature abstraction (`grounding.py`, separate `innate_grounding` manifest) | Relevant channels, projected groups, effect tables and empirical validation evidence |
 | Sensor/effect predicate space and conjunction/local-negation grammar (`grounded_language.py`, declared in `innate_grounding`) | All object-word meanings, acquired through external examples linked to experiments |
+| Visual mechanisms only (`vision.py`, separate `innate_vision` manifest): 3×3 patches, a randomly initialised 32-code VQ autoencoder, ridge readout, abstention thresholds | The visual code, what each code means as a quantity (from its own motor commands), what looks unfamiliar; persisted per world in `meta["vision/<env>"]` |
 
 The language faculty is recorded separately in `meta.innate_language` (own digest, version, session installed);
 a designer upgrade is allowed but logged in `meta.innate_language_history`. It is interface knowledge, not world
@@ -575,13 +576,15 @@ future source must be tagged with provenance `external` and kept separate from e
 | 2 ✅ | **Noise-robust rules**: stochastic likelihoods for conditionals, probabilistic transitions | ≥ 0.9 held-out accuracy at 5% observation noise. *Met:* sequences (majority-residual fits, structured-error check, deep hits that must err less than shorter rules, sequential validation test, exact beliefs, anytime-valid test against chance): 100% at 10%, 20% and 30% innovation noise, 97.5% at 50%; causal lab with noisy conditionals: 100% held-out accuracy and every confounded cause found at 5%, 10% and 20% outcome noise; 0 false validations (RESULTS, robustness). Probabilistic transitions remain open |
 | 3 ✅ | **Library learning** (DreamCoder-style): promote recurring validated sub-programs to new primitives | measurable reduction in observations-to-validation on new worlds vs no library. *Met:* library-first search over remembered shapes cuts discovery search 16× on standard worlds (the rival search of severe validation, the same with or without memory, brings the total to 2×) and observations to validation by 25% on 7-node worlds; sleep-time sub-program promotion and dreaming (`library.py`) let a 7-node search budget learn later 9-node rules (curriculum, RESULTS) |
 | 4 ✅ | **Stage 6**: multi-world autonomy, learning-progress–based world selection, self-generated goals | beats round-robin world allocation in knowledge per interaction (met at budget 150 and 300; **not** at 100) |
-| 5 | **Neural perception** (PyTorch, CPU): self-supervised encoders for grid images/audio emitting discrete symbols to the learner | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count |
+| 5 ✅ | **Neural perception** (CPU, in-house `genesis.nn` instead of PyTorch): `PixelCausalWorld` renders each property as a panel of glyphs (count = value, same-ink distractors, jitter, pixel noise); `vision.py` learns a vector-quantised autoencoder over 3×3 patches (self-supervised), pools position-shared codes into histograms, calibrates a linear readout from efference copies of its motor commands and abstains on unfamiliar codes/appearances or ambiguous readings. Audio is not implemented | rule discovery in a pixel-rendered CausalWorld within 2× the symbolic sample count. *Met:* 10/10 held-out seeds reach 100% unseen held-out accuracy with 91.5 samples (10 looks + 60 watched + 21.5 experiments) vs 82 symbolic: 1.17× on average, 1.54× at worst; 0 misreadings among 4,800 checked panels. Stricter view, not met: counting only chosen interactions (looks + experiments) 31.5 vs 22, within 2× on 3/10 seeds (RESULTS, phase 5) |
 | 6 ✅ | **Stage 7 / self-improvement sandbox**: the agent proposes config variants (priors, budgets), evaluated on frozen benchmark seeds in a copy of memory; promoted only after human approval | improvement on held-out seeds, safety digest unchanged |
 | 7 ✅ | **Observability service**: read-only API over the memory DB + dashboard (stage, curves, beliefs, `explain`). Built with stdlib `http.server` + vanilla JS instead of FastAPI/React: no measured need yet justifies the dependencies | every dashboard element traceable to DB rows |
-| 8 (started) | Simulated physics world; text interaction grounded in learned concepts. *Done so far:* bilingual chat, learned word mappings, semantic teaching with conditional inference, predictive object abstractions, object-grounded word meanings and flat sentence-construction induction (see RESULTS). Ordinary commands still handle one intent; semantic messages can contain several assertions with local negation. No open-domain language learning, general syntax induction, SMS handling or realistic physics | defined when phase 5 is complete |
+| 8 (started) | Simulated physics world; text interaction grounded in learned concepts. *Done so far:* bilingual chat, learned word mappings, semantic teaching with conditional inference, predictive object abstractions, object-grounded word meanings and flat sentence-construction induction (see RESULTS). Ordinary commands still handle one intent; semantic messages can contain several assertions with local negation. No open-domain language learning, general syntax induction, SMS handling or realistic physics | *Proposed now that phase 5 is complete:* on held-out seeds of a pixel-rendered world, questions about configurations never seen (e.g. "what will p2 be after a1?", or a taught object word applied to a new image) are answered from perception plus learned rules with ≥ 90% accuracy, perception abstentions are answered as "I can't read it" rather than guessed, and taught relations remain marked unverified |
 
-Dependencies are added only when their phase begins and a measured need justifies them (PyTorch at phase 5;
-FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when there are services to orchestrate).
+Dependencies are added only when their phase begins and a measured need justifies them. Phase 5 needed none: its
+encoder trains on the in-house autograd (`genesis.nn`), consistent with building every model here, and at this
+scale (32 codes, 8-dimensional latents, ~2 s of training) PyTorch would bring no measured benefit. FastAPI/React
+only if the stdlib dashboard becomes insufficient; Docker when there are services to orchestrate.
 
 ### Risks
 
@@ -591,7 +594,7 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 | Inductive black swan (validated too early) | false knowledge | forward-validation, severe validation against rivals within reach, spaced review, refutation tracking; residual risk documented |
 | Designer bias in the hypothesis space | "learning" limited to what designers anticipated | explicit manifest; report "unpredictable" honestly; expand primitives only via documented versions |
 | Benchmark overfitting during development | inflated results | report held-out seeds (100–109) not used during development |
-| Symbolic-neural bridge | perception may not yield usable symbols | phase 5 has its own measurable criterion |
+| Symbolic-neural bridge | perception may not yield usable symbols, or wrong ones learned as facts | phase 5 criterion met on rendered counts; readings abstain on uncalibrated codes or appearances; misreadings are counted on every experiment's "before" image (0 / 4,800) |
 | Unsafe self-modification | loss of control | frozen safety digest; self-improvement only in sandbox + human approval (signed once an admin key is pinned) |
 | Learning outside the admin's rules | unwanted knowledge or behaviour | signed policy checked before every write; default deny; refusals answered and audited |
 | Poisoned or personal training data | model reproduces it | corpus gate: admin signature over each document hash, PII redaction, blocked terms, output filtering |
@@ -642,7 +645,13 @@ FastAPI/React only if the stdlib dashboard becomes insufficient; Docker when the
 - Stage 7 tunes only a few allowlisted parameters; most have no measurable effect. Since the v0.3 learner
   improvements, no variant survives holdout on the benchmark seeds. It cannot change algorithms or architecture.
 - Curiosity spends slightly more observations on noise than round-robin.
-- Neural perception is not implemented yet.
+- Neural perception (phase 5) is shown only on a world designed to be readable: grey-scale glyphs that never
+  touch, at most 64 per panel, and a sensor layout given by the body (which rectangle shows which property), so
+  there is no object segmentation. It cannot read values its motors cannot set (negative values are rings it
+  never calibrates on, so it abstains on them; the k-means ablation once misread one). It costs ~30 s CPU per
+  seed vs 0.5 s for symbols, pixel goal tasks/planning are not measured, and audio is not implemented. At pixel
+  noise σ = 0.15 the criterion fails: it abstains much more, misreads 64 of 4,800 checked panels, and 2/10 seeds
+  never reach 100% (RESULTS, phase 5).
 - The in-house language model is small (n-gram or ~10⁵-parameter Transformer on 2 CPUs) and only as good as the
   approved corpus. It predicts text; it does not reason, and the chat never stores its output as knowledge.
 - Governance trusts the host and the admin key: DB write access can still delete rows and seals (detected by

@@ -119,7 +119,7 @@ class LabAdapter:
         self.agent = agent
         self.sb = sandbox
         self.env_id = sandbox.env_id
-        spec = sandbox.call("spec")
+        spec = self.spec = sandbox.call("spec")
         self.props = spec["properties"]
         self.actions = spec["actions"]
         self.lo, self.hi = spec["settable_range"]
@@ -176,3 +176,81 @@ class PassiveLabAdapter(LabAdapter):
         nxt = sit.action.pop("_observed_next")
         action = sit.action["experiment"]
         return Outcome({self.key(action, p): nxt[p] for p in self.props}, {"state": sit.action["state"], "next": nxt})
+
+
+class PixelLabAdapter(LabAdapter):
+    """Controlled experiments seen through pixels (phase 5).
+
+    The query inputs are the motor command the agent issued (an efference copy, as in :class:`LabAdapter`);
+    the outcome is *read* from the "after" image by the agent's calibrated :class:`~genesis.vision.VisualReader`.
+    An unreadable panel yields no target for that property, so nothing is learned from it. The "before" image
+    shows the object exactly as the agent's motors set it: it is first read (a check of perception, counted in
+    ``perception_checks``) and then used to refine the readout calibration.
+    """
+
+    kind = "lab"
+
+    def __init__(self, agent, sandbox, n_random: int = 30):
+        super().__init__(agent, sandbox, n_random)
+        self.panels = self.spec["image"]["panels"]
+        self.reader = agent.visual_reader(self.env_id)
+        if self.reader is None:
+            raise RuntimeError(f"no calibrated vision for {self.env_id}: call Genesis.calibrate_vision first")
+        self.perception_checks = {"read": 0, "agreed": 0, "abstained": 0}
+        self.abstentions = {"unreadable_situations": 0, "unreadable_outcomes": 0}
+
+    def read(self, image: dict) -> tuple:
+        from .vision import panel_patches
+        values, glances = {}, {}
+        for p in self.props:
+            glances[p] = self.reader.glance(*panel_patches(image, self.panels[p]))
+            values[p], _ = self.reader.read(glances[p])
+        return values, glances
+
+    def _outcome(self, action: str, state: dict, after: dict, digests: list) -> Outcome:
+        nxt, _ = self.read(after)
+        unread = [p for p in self.props if nxt[p] is None]
+        self.abstentions["unreadable_outcomes"] += len(unread)
+        return Outcome({self.key(action, p): nxt[p] for p in self.props},
+                       {"state": state, "next": nxt, "unreadable": unread, "images_sha256": digests})
+
+    def execute(self, sit: Situation) -> Outcome:
+        from .vision import image_digest
+        state, action = sit.action["state"], sit.action["experiment"]
+        obs = self.sb.call("experiment", state, action)
+        self.history.append((dict(state), action))
+        seen, glances = self.read(obs["before"])
+        for p in self.props:
+            self.perception_checks["read"] += 1
+            if seen[p] is None:
+                self.perception_checks["abstained"] += 1
+            else:
+                self.perception_checks["agreed"] += seen[p] == state[p]
+            self.reader.calibrate(glances[p], state[p])
+        return self._outcome(action, state, obs["after"], [image_digest(obs["before"]), image_digest(obs["after"])])
+
+
+class PixelPassiveAdapter(PixelLabAdapter):
+    """Watching the pixel world: both states must be read; nothing calibrates the readout here."""
+
+    def candidates(self) -> list:
+        from .vision import image_digest
+        obs = self.sb.call("passive_observation")
+        state, _ = self.read(obs["before"])
+        action = obs["action"]
+        self._pending = (obs["after"], [image_digest(obs["before"]), image_digest(obs["after"])])
+        if any(v is None for v in state.values()):
+            # Unreadable situation: remembered as an episode, but it poses no learning problem.
+            self.abstentions["unreadable_situations"] += 1
+            return [Situation({"experiment": action, "state": state, "design": "passive"}, [], "observation",
+                              f"{self.env_id}/{action}")]
+        sit = self._situation(state, action, "passive", provenance="observation")
+        return [sit]
+
+    def execute(self, sit: Situation) -> Outcome:
+        after, digests = self._pending
+        self._pending = None
+        if not sit.queries:
+            return Outcome({}, {"state": sit.action["state"], "next": None, "unreadable": "before",
+                                "images_sha256": digests})
+        return self._outcome(sit.action["experiment"], sit.action["state"], after, digests)

@@ -19,7 +19,8 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from .adapters import LabAdapter, PassiveLabAdapter, SequenceAdapter, sequence_rollout_probes
+from .adapters import (LabAdapter, PassiveLabAdapter, PixelLabAdapter, PixelPassiveAdapter, SequenceAdapter,
+                       sequence_rollout_probes)
 from . import library
 from . import language
 from .attention import Attention
@@ -32,6 +33,7 @@ from .memory import LongTermMemory, WorkingMemory
 from . import grounding
 from .metacognition import Metacognition
 from .perception import Perception
+from . import vision
 
 
 def default_configs(safety: SafetyPolicy) -> dict:
@@ -116,6 +118,8 @@ class Genesis:
         self.learners: dict = {}
         self.learner_env: dict = {}
         self.learner_kind: dict = {}
+        # Phase-5 vision: env_id -> VisualReader (learned codes + efference-copy calibration), persisted in meta.
+        self.vision: dict = {}
         self.ltm_retrievals = 0
         self._shape_cache: Optional[dict] = None
         self.config = validate_config(dict(config if config is not None else
@@ -140,6 +144,7 @@ class Genesis:
         self.ltm.set_meta("innate_manifest", manifest)
         self.ltm.set_meta("innate_language", {**language.faculty_manifest(), "installed_session": 0})
         self.ltm.set_meta("innate_grounding", grounding.manifest())
+        self.ltm.set_meta("innate_vision", vision.manifest())
         self.ltm.set_meta("safety_policy_digest", self.safety.digest())
         self.ltm.set_meta("session", 0)
         self.ltm.set_meta("interactions", 0)
@@ -161,6 +166,7 @@ class Genesis:
             "no_learners": not self.learners,
             "language_faculty_has_no_world_knowledge": language.audit()["passed"],
             "grounding_has_no_preloaded_facts": grounding.manifest()["domain_knowledge"] == [],
+            "vision_has_no_pretrained_weights": vision.manifest()["pretrained_models"] == [] and not self.vision,
         }
         return {"passed": all(checks.values()), "checks": checks, "counts": counts}
 
@@ -189,6 +195,7 @@ class Genesis:
         self.ltm.set_meta("session", self.session)
         self._check_language_faculty()
         grounding.register(self.ltm, self.session)
+        vision.register(self.ltm, self.session)
         self.reviews = self.ltm.get_meta("reviews") or {}
         self.resolution_costs = self.ltm.get_meta("resolution_costs") or {}
         self.context_obs = {r[0]: r[1] for r in self.ltm.db.execute(
@@ -337,15 +344,17 @@ class Genesis:
             # 8 COMPARE
             surprise, n_ok = 0.0, 0
             pred_log = {}
-            for q in sit.queries:
+            # A target of None means perception abstained: nothing is compared or learned for that query.
+            answered = [q for q in sit.queries if outcome.targets.get(q.key) is not None]
+            for q in answered:
                 p = sit.predictions[q.key]
                 y = outcome.targets[q.key]
                 lr = self.learners[q.key]
                 surprise += -math.log2(max(p.prob_of(y, lr.cfg.outcome_range), 1e-12))
                 n_ok += p.value == y
                 pred_log[q.key] = {"predicted": p.value, "confidence": round(p.confidence, 4), "actual": y}
-            if sit.queries:
-                rep.accuracy.append(n_ok / len(sit.queries))
+            if answered:
+                rep.accuracy.append(n_ok / len(answered))
             novelty = sit.percept.novelty if sit.percept else 1.0
             salience = self.attention.salience(novelty, surprise, outcome.reward or 0.0)
             # 10 STORE (episode first so learned knowledge can cite it)
@@ -355,7 +364,7 @@ class Genesis:
                                           outcome.observation,
                                           pred_log, surprise, outcome.reward, salience)
             # 9 LEARN
-            for q in sit.queries:
+            for q in answered:
                 p = sit.predictions[q.key]
                 y = outcome.targets[q.key]
                 res = self.learners[q.key].observe(q.inputs, y, eid, sit.provenance)
@@ -439,6 +448,8 @@ class Genesis:
 
     def consolidate(self) -> dict:
         self.ltm.set_meta("interactions", self.interactions)
+        for env_id, reader in self.vision.items():
+            self.ltm.set_meta(f"vision/{env_id}", reader.to_json())
         self.ltm.set_meta("reviews", self.reviews)
         self.ltm.set_meta("resolution_costs", self.resolution_costs)
         summary = self.consolidator.run(self)
@@ -459,6 +470,66 @@ class Genesis:
 
     def experiment_lab(self, sandbox, max_steps: int, strategy: str = "curiosity", **kw) -> SessionReport:
         return self.live(LabAdapter(self, sandbox), max_steps, strategy, **kw)
+
+    # ------------------------------------------------------------ vision
+    def visual_reader(self, env_id: str):
+        if env_id not in self.vision:
+            state = self.ltm.get_meta(f"vision/{env_id}")
+            if state is None:
+                return None
+            self.vision[env_id] = vision.VisualReader.from_json(state)
+        return self.vision[env_id]
+
+    def calibrate_vision(self, sandbox, looks: int, kind: str = "neural") -> dict:
+        """Motor babbling: set random configurations, look at them, learn a visual code from the unlabelled
+        panels, then calibrate the readout with the commanded values (efference copies). Each look is one
+        interaction and one episode (the image is stored as a digest, the reading as the outcome)."""
+        spec = sandbox.call("spec")
+        lo, hi = spec["settable_range"]
+        rects = spec["image"]["panels"]
+        props = spec["properties"]
+        # A dedicated stream, so learning to see does not shift the agent's other random choices.
+        rng = random.Random(f"vision/{sandbox.env_id}/{self.seed}/{self.session}")
+        shots = []
+        for _ in range(looks):
+            if self.interactions >= self.safety.max_interactions_per_session * (self.session + 1):
+                break
+            controls = {p: rng.randint(lo, hi) for p in props}
+            try:
+                image = sandbox.call("look", controls)
+            except BudgetExceeded:
+                break
+            self.interactions += 1
+            shots.append((controls, image))
+        if not shots:
+            return {"looks": 0}
+        glimpses = [(controls, p, vision.panel_patches(image, rects[p])) for controls, image in shots for p in props]
+        reader = self.visual_reader(sandbox.env_id)
+        if reader is None:
+            reader = vision.VisualReader.fit([g for _, _, g in glimpses], kind, rng)
+            self.vision[sandbox.env_id] = reader
+        for controls, p, g in glimpses:
+            reader.calibrate(reader.glance(*g), controls[p])
+        for controls, image in shots:
+            self.ltm.record_episode(self.session, sandbox.env_id, f"{sandbox.env_id}/look", "motor-babbling",
+                                    {"look": controls}, {"image_sha256": vision.image_digest(image)})
+        self.consolidate()
+        return {"looks": len(shots), "kind": reader.code.kind, "panels_calibrated": reader.n_panels,
+                "codes_calibrated": sum(1 for c in reader.calibrated if c)}
+
+    def read_image(self, env_id: str, image: dict, panels: dict) -> dict:
+        """Perceived property values (``None`` where perception abstains)."""
+        reader = self.visual_reader(env_id)
+        out = {}
+        for p, rect in panels.items():
+            out[p] = reader.read(reader.glance(*vision.panel_patches(image, rect)))[0] if reader else None
+        return out
+
+    def watch_pixels(self, sandbox, n: int) -> SessionReport:
+        return self.live(PixelPassiveAdapter(self, sandbox), n, "curiosity", stop_when_idle=False)
+
+    def experiment_pixels(self, sandbox, max_steps: int, strategy: str = "curiosity", **kw) -> SessionReport:
+        return self.live(PixelLabAdapter(self, sandbox), max_steps, strategy, **kw)
 
     # ---------------------------------------------------- imagination / use
     def rollout_sequence(self, key: str, k: int) -> list:

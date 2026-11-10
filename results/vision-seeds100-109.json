@@ -1,0 +1,268 @@
+{
+  "seeds": [
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109
+  ],
+  "looks": 10,
+  "watch": 60,
+  "pixel_noise": 0.08,
+  "symbolic": {
+    "runs_reaching_perfect": 1.0,
+    "experiments_to_perfect": 22.0,
+    "samples_to_perfect": 82.0,
+    "final_heldout_unseen": 1.0,
+    "final_transfer_out_of_range": 1.0
+  },
+  "pixel": {
+    "neural": {
+      "runs_reaching_perfect": 1.0,
+      "experiments_to_perfect": 21.5,
+      "samples_to_perfect": 91.5,
+      "active_samples_to_perfect": 31.5,
+      "sample_ratio_vs_symbolic": 1.1732,
+      "max_sample_ratio": 1.5385,
+      "seeds_within_2x": "10/10",
+      "after_passive_watching": 0.277,
+      "watch_unreadable_situations": 3.4,
+      "unreadable_outcomes": 7.9,
+      "final_heldout_unseen": 1.0,
+      "final_transfer_out_of_range": 1.0,
+      "end_to_end_heldout": 0.981,
+      "end_to_end_abstained": 0.019,
+      "before_images_read": 4800,
+      "before_images_misread": 0,
+      "before_images_abstained": 30,
+      "perception_final": {
+        "negative_never_calibrated": {
+          "correct": 0.0,
+          "abstained": 1.0,
+          "wrong_panels": 0
+        },
+        "calibrated_0_5": {
+          "correct": 0.9906,
+          "abstained": 0.0094,
+          "wrong_panels": 0
+        },
+        "lab_outcomes_6_10": {
+          "correct": 0.9969,
+          "abstained": 0.0031,
+          "wrong_panels": 0
+        },
+        "extrapolation_11_30": {
+          "correct": 0.9875,
+          "abstained": 0.0125,
+          "wrong_panels": 0
+        }
+      },
+      "cpu_seconds": 30.3149,
+      "per_seed": [
+        {
+          "seed": 100,
+          "pixel_samples": 100,
+          "symbolic_samples": 65,
+          "ratio": 1.5385,
+          "within_2x": true
+        },
+        {
+          "seed": 101,
+          "pixel_samples": 90,
+          "symbolic_samples": 65,
+          "ratio": 1.3846,
+          "within_2x": true
+        },
+        {
+          "seed": 102,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 103,
+          "pixel_samples": 85,
+          "symbolic_samples": 65,
+          "ratio": 1.3077,
+          "within_2x": true
+        },
+        {
+          "seed": 104,
+          "pixel_samples": 80,
+          "symbolic_samples": 70,
+          "ratio": 1.1429,
+          "within_2x": true
+        },
+        {
+          "seed": 105,
+          "pixel_samples": 95,
+          "symbolic_samples": 140,
+          "ratio": 0.6786,
+          "within_2x": true
+        },
+        {
+          "seed": 106,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 107,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 108,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 109,
+          "pixel_samples": 165,
+          "symbolic_samples": 155,
+          "ratio": 1.0645,
+          "within_2x": true
+        }
+      ],
+      "criterion_met": true
+    },
+    "kmeans": {
+      "runs_reaching_perfect": 1.0,
+      "experiments_to_perfect": 27.5,
+      "samples_to_perfect": 97.5,
+      "active_samples_to_perfect": 37.5,
+      "sample_ratio_vs_symbolic": 1.2202,
+      "max_sample_ratio": 1.7692,
+      "seeds_within_2x": "10/10",
+      "after_passive_watching": 0.284,
+      "watch_unreadable_situations": 3.8,
+      "unreadable_outcomes": 8.3,
+      "final_heldout_unseen": 1.0,
+      "final_transfer_out_of_range": 1.0,
+      "end_to_end_heldout": 0.989,
+      "end_to_end_abstained": 0.011,
+      "before_images_read": 4800,
+      "before_images_misread": 0,
+      "before_images_abstained": 21,
+      "perception_final": {
+        "negative_never_calibrated": {
+          "correct": 0.0,
+          "abstained": 0.9969,
+          "wrong_panels": 1
+        },
+        "calibrated_0_5": {
+          "correct": 1.0,
+          "abstained": 0.0,
+          "wrong_panels": 0
+        },
+        "lab_outcomes_6_10": {
+          "correct": 1.0,
+          "abstained": 0.0,
+          "wrong_panels": 0
+        },
+        "extrapolation_11_30": {
+          "correct": 0.9906,
+          "abstained": 0.0094,
+          "wrong_panels": 0
+        }
+      },
+      "cpu_seconds": 27.1559,
+      "per_seed": [
+        {
+          "seed": 100,
+          "pixel_samples": 80,
+          "symbolic_samples": 65,
+          "ratio": 1.2308,
+          "within_2x": true
+        },
+        {
+          "seed": 101,
+          "pixel_samples": 115,
+          "symbolic_samples": 65,
+          "ratio": 1.7692,
+          "within_2x": true
+        },
+        {
+          "seed": 102,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 103,
+          "pixel_samples": 80,
+          "symbolic_samples": 65,
+          "ratio": 1.2308,
+          "within_2x": true
+        },
+        {
+          "seed": 104,
+          "pixel_samples": 80,
+          "symbolic_samples": 70,
+          "ratio": 1.1429,
+          "within_2x": true
+        },
+        {
+          "seed": 105,
+          "pixel_samples": 150,
+          "symbolic_samples": 140,
+          "ratio": 1.0714,
+          "within_2x": true
+        },
+        {
+          "seed": 106,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 107,
+          "pixel_samples": 75,
+          "symbolic_samples": 65,
+          "ratio": 1.1538,
+          "within_2x": true
+        },
+        {
+          "seed": 108,
+          "pixel_samples": 80,
+          "symbolic_samples": 65,
+          "ratio": 1.2308,
+          "within_2x": true
+        },
+        {
+          "seed": 109,
+          "pixel_samples": 165,
+          "symbolic_samples": 155,
+          "ratio": 1.0645,
+          "within_2x": true
+        }
+      ],
+      "criterion_met": true
+    }
+  },
+  "ink_sum_baseline_accuracy": {
+    "negative_never_calibrated": 0.0,
+    "calibrated_0_5": 0.4031,
+    "lab_outcomes_6_10": 0.0563,
+    "extrapolation_11_30": 0.0
+  },
+  "wall_seconds": 607.1,
+  "phase5_criterion": {
+    "definition": "pixel samples to 100% unseen held-out rule accuracy <= 2x symbolic, on every seed the symbolic agent solves",
+    "encoder": "neural",
+    "met": true
+  }
+}
