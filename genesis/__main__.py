@@ -1,4 +1,5 @@
-"""Command line: ``python -m genesis {demo,benchmark,grounded,inspect,improve,approve,rollback,dashboard,chat}``
+"""Command line: ``python -m genesis {init,start,demo,benchmark,vision,grounded,inspect,improve,approve,rollback,
+dashboard,chat}``
 and administration: ``python -m genesis {admin,audit,corpus,lm}`` (see :mod:`genesis.cli_admin`)."""
 
 from __future__ import annotations
@@ -37,9 +38,47 @@ def _chat_terminal(db: str, worlds, objects=None) -> None:
         agent.close()
 
 
+def _version() -> str:
+    from importlib import metadata
+    try:
+        return metadata.version("genesis-cognitive")
+    except metadata.PackageNotFoundError:
+        return "source tree"
+
+
+def _serve_chat(db: str, host: str, port: int, allow_host, pub=None, open_browser: bool = False) -> int:
+    from .chat_server import serve as serve_chat
+    from .environments import ObjectWorld, SequenceWorld, sandboxed
+    worlds = lambda s: sandboxed(SequenceWorld(s), 1000)  # noqa: E731 - harness supplies sandboxed worlds
+    objects = lambda s: sandboxed(ObjectWorld(s), 2000)  # noqa: E731
+    on_ready = None
+    if open_browser:
+        import webbrowser
+        on_ready = webbrowser.open
+    try:
+        serve_chat(db, host, port, worlds, objects, allow_host, pub, on_ready)
+    except OSError as exc:
+        print(f"cannot serve on {host}:{port}: {exc} (already running? try --port)", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="genesis")
+    ap.add_argument("--version", action="version", version=f"genesis {_version()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    ini = sub.add_parser("init", help="first-time setup: admin key, memory and generated web credentials")
+    ini.add_argument("--home", help="GENESIS folder (default: $GENESIS_HOME or ~/.genesis)")
+    ini.add_argument("--user", default="admin", help="web administrator user name")
+    ini.add_argument("--port", type=int, default=8766, help="port written in the credentials file")
+    ini.add_argument("--reset-password", action="store_true", help="sign a new policy with a new password")
+    ini.add_argument("--json", action="store_true", help="machine-readable output")
+    st = sub.add_parser("start", help="serve the web interface of the memory created by 'genesis init'")
+    st.add_argument("--home", help="GENESIS folder (default: $GENESIS_HOME or ~/.genesis)")
+    st.add_argument("--host", default="127.0.0.1")
+    st.add_argument("--port", type=int, default=8766)
+    st.add_argument("--open", action="store_true", help="open the web interface in the browser")
+    st.add_argument("--allow-host", action="append", default=[], help="extra accepted Host header (repeatable)")
     d = sub.add_parser("demo", help="developmental run of one agent through stages 0-7")
     d.add_argument("--seed", type=int, default=0)
     d.add_argument("--db", default="runs/demo.db")
@@ -47,6 +86,12 @@ def main(argv=None) -> int:
     b.add_argument("--seeds", default="100-109")
     b.add_argument("--out", default="runs/benchmark.json")
     b.add_argument("--quick", action="store_true")
+    v = sub.add_parser("vision", help="phase 5: rule discovery from pixels vs the symbolic lab (sample counts)")
+    v.add_argument("--seeds", default="100-109")
+    v.add_argument("--looks", type=int, default=10, help="motor-babbling looks used to learn to see")
+    v.add_argument("--kinds", default="neural,kmeans", help="visual codes to compare (first one is judged)")
+    v.add_argument("--pixel-noise", type=float, default=0.08)
+    v.add_argument("--out", default="runs/vision.json")
     gr = sub.add_parser("grounded", help="object-concept learning, transfer, baselines and adaptation")
     gr.add_argument("--seed", type=int, default=0)
     gr.add_argument("--steps", type=int, default=80, help="training interactions per phase (1-256)")
@@ -89,7 +134,25 @@ def main(argv=None) -> int:
         print(f"no memory at {args.db}", file=sys.stderr)
         return 1
 
-    if args.cmd == "demo":
+    if args.cmd == "init":
+        from . import bootstrap, governance
+        try:
+            res = (bootstrap.reset_password if args.reset_password else bootstrap.initialise)(
+                args.home, args.user, args.port)
+        except (OSError, PermissionError, ValueError, governance.PolicyIntegrityError) as exc:
+            print(f"init: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(res, indent=2) if args.json else bootstrap.describe(res))
+    elif args.cmd == "start":
+        from . import bootstrap, crypto
+        home = bootstrap.home_dir(args.home)
+        if not bootstrap.is_initialised(home):
+            print(f"GENESIS is not initialised in {home}: run 'genesis init' first", file=sys.stderr)
+            return 1
+        p = bootstrap.paths(home)
+        print(f"Sign in with the credentials in {p['credentials']}", flush=True)
+        return _serve_chat(p["db"], args.host, args.port, args.allow_host, crypto.load_public(p["pub"]), args.open)
+    elif args.cmd == "demo":
         from .demo import run_demo
         run_demo(args.seed, args.db)
     elif args.cmd == "grounded":
@@ -107,6 +170,16 @@ def main(argv=None) -> int:
         with open(args.out, "w") as f:
             json.dump(res, f, indent=2, default=str)
         print(json.dumps(res, indent=2, default=str))
+    elif args.cmd == "vision":
+        from .experiments import run_pixel_comparison
+        res = run_pixel_comparison(_seeds(args.seeds), looks=args.looks, kinds=tuple(args.kinds.split(",")),
+                                   pixel_noise=args.pixel_noise)
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w") as f:
+            json.dump(res, f, indent=2, default=str)
+        print(json.dumps({k: v for k, v in res.items() if k != "pixel"} | {
+            "pixel": {k: {m: x for m, x in v.items() if m != "per_seed"} for k, v in res["pixel"].items()}},
+            indent=2, default=str))
     elif args.cmd == "inspect":
         from .memory import LongTermMemory
         if not os.path.exists(args.db):
@@ -143,17 +216,15 @@ def main(argv=None) -> int:
         from .dashboard import serve
         serve(args.db, args.host, args.port, args.allow_host)
     elif args.cmd == "chat":
-        from .environments import ObjectWorld, SequenceWorld, sandboxed
         os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
-        worlds = lambda s: sandboxed(SequenceWorld(s), 1000)  # noqa: E731 - harness supplies sandboxed worlds
-        objects = lambda s: sandboxed(ObjectWorld(s), 2000)  # noqa: E731
         if args.terminal:
-            _chat_terminal(args.db, worlds, objects)
+            from .environments import ObjectWorld, SequenceWorld, sandboxed
+            _chat_terminal(args.db, lambda s: sandboxed(SequenceWorld(s), 1000),
+                           lambda s: sandboxed(ObjectWorld(s), 2000))
         else:
-            from .chat_server import serve as serve_chat
             from .crypto import load_public
-            pub = load_public(args.admin_pub) if args.admin_pub else None
-            serve_chat(args.db, args.host, args.port, worlds, objects, args.allow_host, pub)
+            return _serve_chat(args.db, args.host, args.port, args.allow_host,
+                               load_public(args.admin_pub) if args.admin_pub else None)
     return 0
 
 

@@ -4,6 +4,8 @@
 
     GET  /api/status                         stage and memory counts
     GET  /api/whoami                         identity, role and permissions under the admin policy
+    POST /api/login                          {"user": "...", "password": "..."} -> session cookie
+    POST /api/logout                         clears the session cookie
     GET  /api/conversations                  the caller's conversations (most recent first)
     POST /api/conversations                  {"lang": "fr"|"en"} -> new conversation
     GET  /api/conversations/<id>             messages of one of the caller's conversations
@@ -17,8 +19,10 @@ at a time. Defences, in the order a request meets them:
   rebinding, where a hostile page re-points its own name at 127.0.0.1.
 * **Same-origin writes**: POSTs must be JSON, and Origin / Sec-Fetch-Site must not be cross-site.
 * **Identity** from the admin policy (``governance.py``): a bearer token (``Authorization`` header, or
-  ``/?token=…`` once, which sets an HttpOnly SameSite=Strict cookie). Without a token the policy's default
-  role applies, unless the policy requires authentication.
+  ``/?token=…`` once, which sets an HttpOnly SameSite=Strict cookie), or the login form (user name + password,
+  the password being that user's token; ``genesis init`` generates one for the administrator). Without a token
+  the policy's default role applies, unless the policy requires authentication, in which case the page shows
+  the login form. Login attempts are rate-limited per client address and audited.
 * **Rate limit** per identity, bounded body size and socket timeouts, a per-message time budget in the engine.
 * **Policy guard** inside the engine: default deny, every refusal and write in the audit chain.
 * Responses carry a strict CSP (hash-pinned inline script/style), no-store and anti-framing headers; internal
@@ -49,6 +53,11 @@ MAX_BODY = 16 * 1024
 SOCKET_TIMEOUT = 10
 COOKIE = "genesis_token"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+LOGINS_PER_MINUTE = 10
+
+
+def _cookie(token: str) -> str:
+    return f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/" + ("" if token else "; Max-Age=0")
 
 
 def status(engine: ChatEngine) -> dict:
@@ -210,8 +219,7 @@ def make_handler(engine: ChatEngine, allow_hosts: Iterable[str] = (), expected_p
                             policies.get().identify(token)
                     except (governance.AuthError, governance.PolicyIntegrityError):
                         return self._send(401, {"error": "unknown token"})
-                    return self._send(303, b"", "text/plain", {
-                        "Location": "/", "Set-Cookie": f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/"})
+                    return self._send(303, b"", "text/plain", {"Location": "/", "Set-Cookie": _cookie(token)})
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if not path.startswith("/api/"):
                 return self._send(404, {"error": "not found"})
@@ -277,6 +285,29 @@ def make_handler(engine: ChatEngine, allow_hosts: Iterable[str] = (), expected_p
                 return None
             return data
 
+        def _login(self, data: dict):
+            if not limiter.allow("login:" + self.client_address[0], LOGINS_PER_MINUTE):
+                return self._send(429, {"error": "too many login attempts"}, headers={"Retry-After": "60"})
+            name, password = data.get("user"), data.get("password")
+            try:
+                with lock:
+                    try:
+                        if not (isinstance(name, str) and isinstance(password, str) and len(name) <= 64
+                                and TOKEN_RE.fullmatch(password)):
+                            raise governance.AuthError("invalid user name or password")
+                        actor, role = policies.get().authenticate(name.strip(), password)
+                    except governance.AuthError as exc:
+                        engine.ltm.append_audit("auth.login", "deny", "anonymous", None, None,
+                                                {"reason": "invalid credentials"})
+                        engine.ltm.commit()
+                        return self._send(401, {"error": str(exc)})
+                    engine.ltm.append_audit("auth.login", "allow", actor, role)
+                    engine.ltm.commit()
+            except governance.PolicyIntegrityError as exc:
+                print(f"[genesis chat] policy integrity failure: {exc}", file=sys.stderr, flush=True)
+                return self._send(503, {"error": "policy integrity check failed; refusing to serve"})
+            return self._send(200, {"user": actor, "role": role}, headers={"Set-Cookie": _cookie(password)})
+
         def do_POST(self):
             if not self._host_ok():
                 return
@@ -284,6 +315,10 @@ def make_handler(engine: ChatEngine, allow_hosts: Iterable[str] = (), expected_p
             data = self._body()
             if data is None:
                 return
+            if url.path == "/api/login":
+                return self._login(data)
+            if url.path == "/api/logout":
+                return self._send(200, {"ok": True}, headers={"Set-Cookie": _cookie("")})
             guard = self._identify()
             if guard is None:
                 return
@@ -310,14 +345,22 @@ def make_handler(engine: ChatEngine, allow_hosts: Iterable[str] = (), expected_p
 
 def serve(db_path: str, host: str = "127.0.0.1", port: int = 8766,
           world_factory: Optional[Callable] = None, object_factory: Optional[Callable] = None,
-          allow_hosts: Iterable[str] = (), expected_pub: Optional[bytes] = None) -> None:
+          allow_hosts: Iterable[str] = (), expected_pub: Optional[bytes] = None,
+          on_ready: Optional[Callable[[str], None]] = None) -> None:
     agent = Genesis(db_path, check_same_thread=False)  # used by one request thread at a time (engine lock)
-    governance.load_policy(agent.ltm, expected_pub)  # refuse to start under a tampered policy
-    engine = ChatEngine(agent, world_factory, object_factory)
-    srv = ThreadingHTTPServer((host, port), make_handler(engine, allow_hosts, expected_pub))
+    try:
+        governance.load_policy(agent.ltm, expected_pub)  # refuse to start under a tampered policy
+        engine = ChatEngine(agent, world_factory, object_factory)
+        srv = ThreadingHTTPServer((host, port), make_handler(engine, allow_hosts, expected_pub))
+    except BaseException:
+        agent.close()
+        raise
     srv.daemon_threads = True
-    print(f"GENESIS chat for {db_path} on http://{host}:{port}  (session {agent.session}; Ctrl+C to stop)",
-          flush=True)
+    shown = "127.0.0.1" if host in ("", "0.0.0.0", "::") else f"[{host}]" if ":" in host else host
+    url = f"http://{shown}:{srv.server_port}/"
+    print(f"GENESIS chat for {db_path} on {url}  (session {agent.session}; Ctrl+C to stop)", flush=True)
+    if on_ready is not None:
+        on_ready(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -391,6 +434,24 @@ textarea::placeholder{color:#9b9b9b}
 #send:disabled{background:#676767;color:#2f2f2f;cursor:default}
 .note{font-size:12px;color:#9b9b9b;text-align:center;padding-top:8px}
 #menu{display:none}
+#me{padding:2px 10px 8px;font-size:12px;color:#b4b4b4;display:flex;align-items:center;justify-content:space-between;gap:8px}
+#me b{color:#ececec}
+#me button{background:none;border:1px solid #3a3a3a;border-radius:999px;padding:2px 10px;font-size:12px;color:#b4b4b4}
+#me button:hover{background:#2f2f2f;color:#fff}
+#login{position:fixed;inset:0;z-index:10;background:#212121;display:flex;align-items:center;justify-content:center;padding:24px}
+#login[hidden]{display:none}
+#login form{width:100%;max-width:24rem;display:flex;flex-direction:column;gap:12px;text-align:center}
+#login .logo{width:48px;height:48px;font-size:22px;margin:0 auto 4px}
+#login h1{font-size:24px;font-weight:600;margin:0}
+#login p{color:#9b9b9b;font-size:14px;margin:0}
+#login label{display:flex;flex-direction:column;gap:4px;text-align:left;font-size:13px;color:#b4b4b4}
+#login input{background:#303030;border:1px solid #424242;border-radius:12px;padding:10px 14px;color:#ececec;font:inherit;outline:0}
+#login input:focus{border-color:#8e8e8e}
+#login button{background:#fff;color:#000;border:0;border-radius:999px;padding:10px;font-weight:600;margin-top:4px}
+#login button:disabled{background:#676767}
+#login-err{color:#f87171;font-size:14px;min-height:1.2em}
+#login .hint{font-size:12px;color:#8e8e8e;line-height:1.5}
+#login code{background:#2f2f2f;border-radius:6px;padding:1px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 @media (max-width:768px){#side{position:fixed;z-index:5;height:100%}#side.hidden{margin-left:-260px}.cards{grid-template-columns:1fr}.bubble{max-width:90%}}
 </style></head><body>
 <nav id="side">
@@ -400,6 +461,7 @@ textarea::placeholder{color:#9b9b9b}
   <div class="hist-label" data-i="history"></div>
   <div id="convs"></div>
   <div id="status"></div>
+  <div id="me" hidden></div>
 </nav>
 <main id="main">
   <header><button class="icon-btn" id="menu" title="Menu"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button>
@@ -411,6 +473,16 @@ textarea::placeholder{color:#9b9b9b}
       <button id="send" disabled title="Send"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg></button></div>
     <div class="note" data-i="note"></div></div></div>
 </main>
+<div id="login" hidden><form id="login-form" autocomplete="on">
+  <div class="logo">G</div>
+  <h1 data-i="loginTitle"></h1>
+  <p data-i="loginSub"></p>
+  <label><span data-i="userLabel"></span><input id="login-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+  <label><span data-i="passLabel"></span><input id="login-pass" name="password" type="password" autocomplete="current-password" required></label>
+  <div id="login-err" role="alert"></div>
+  <button type="submit" id="login-btn" data-i="loginBtn"></button>
+  <p class="hint" id="login-hint"></p>
+</form></div>
 <script>
 const FR = (navigator.language||'').toLowerCase().startsWith('fr');
 const LANG = FR ? 'fr' : 'en';
@@ -439,6 +511,19 @@ const T = FR ? {
   learnedWord:'learned words',
   intents:{clarify:'check',vocabulary:'vocabulary','teach-request':'word learning','yes-no':'yes/no',thanks:'thanks',continue:'learning','too-short':'too short',sequence:'learning',explain:'evidence',knowledge:'memory',explore:'exploration',stage:'stage',limitations:'limitations',questions:'curiosity',predict:'prediction','not-understood':'not understood',help:'help',intro:'intro',refused:'refused',define:'definition',languages:'languages',smalltalk:'small talk',bye:'goodbye',declined:'declined','unknown-topic':'outside my knowledge'}
 };
+Object.assign(T, FR ? {
+  loginTitle:'Connexion à GENESIS', loginSub:"Cette mémoire est protégée. Connecte-toi avec les identifiants créés à l'installation.",
+  userLabel:"Nom d'utilisateur", passLabel:'Mot de passe', loginBtn:'Se connecter',
+  loginHint:"Ils ont été affichés par l'installateur et enregistrés dans <code>credentials.txt</code>, dans le dossier de GENESIS (par défaut <code>~/.genesis</code>). Perdus ? <code>genesis init --reset-password</code>",
+  badLogin:"Nom d'utilisateur ou mot de passe incorrect.", tooMany:'Trop de tentatives : réessaie dans une minute.',
+  signedIn:'Connecté :', logout:'Se déconnecter'
+} : {
+  loginTitle:'Sign in to GENESIS', loginSub:'This memory is protected. Sign in with the credentials created at installation.',
+  userLabel:'User name', passLabel:'Password', loginBtn:'Sign in',
+  loginHint:'The installer printed them and saved them in <code>credentials.txt</code>, in the GENESIS folder (<code>~/.genesis</code> by default). Lost them? <code>genesis init --reset-password</code>',
+  badLogin:'Wrong user name or password.', tooMany:'Too many attempts: try again in a minute.',
+  signedIn:'Signed in:', logout:'Sign out'
+});
 Object.assign(T.intents, FR ? {
   'policy-denied':'refusé par la politique', 'lm-generate':'texte généré (non vérifié)'
 } : {
@@ -471,8 +556,37 @@ let current = null, busy = false;
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   const d = await r.json();
-  if (!r.ok) throw new Error(d.error || r.status);
+  if (!r.ok) {
+    if (r.status === 401 && path !== '/api/login') showLogin();
+    const err = new Error(d.error || r.status); err.status = r.status; throw err;
+  }
   return d;
+}
+function showLogin() {
+  if (!$('login').hidden) return;
+  $('login').hidden = false;
+  $('login-user').focus();
+}
+$('login-hint').innerHTML = T.loginHint;
+$('login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = $('login-btn');
+  btn.disabled = true; $('login-err').textContent = '';
+  try {
+    await api('/api/login', {user: $('login-user').value.trim(), password: $('login-pass').value.trim()});
+    location.reload();
+  } catch (err) {
+    $('login-err').textContent = err.status === 429 ? T.tooMany : T.badLogin;
+    $('login-pass').value = ''; $('login-pass').focus();
+  }
+  btn.disabled = false;
+});
+function showMe(me) {
+  const box = $('me');
+  box.innerHTML = '<span>' + esc(T.signedIn) + ' <b>' + esc(me.user) + '</b></span>';
+  const b = document.createElement('button'); b.textContent = T.logout;
+  b.onclick = async () => { try { await api('/api/logout', {}); } catch (e) {} location.reload(); };
+  box.appendChild(b); box.hidden = false;
 }
 const esc = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function inline(s) {
@@ -606,10 +720,16 @@ for (const [q, sub] of T.cards) {
   $('cards').appendChild(b);
 }
 if (innerWidth <= 768) $('side').classList.add('hidden');
-const m = location.hash.match(/c=(\d+)/);
-loadStatus();
-if (m) openConv(+m[1]).catch(newChat); else newChat();
-input.focus();
+async function boot() {
+  let me = null;
+  try { me = await api('/api/whoami'); } catch (e) { if (e.status === 401) return; }
+  if (me && me.user !== 'local') showMe(me);
+  const m = location.hash.match(/c=(\d+)/);
+  loadStatus();
+  if (m) openConv(+m[1]).catch(newChat); else newChat();
+  input.focus();
+}
+boot();
 </script>
 </body></html>
 """

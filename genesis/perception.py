@@ -1,8 +1,9 @@
 """Perception engine: raw observations -> named integer features, novelty, differences.
 
-The engine is modality-agnostic at its interface (:class:`Percept`). Only
-structured numeric/symbolic observations are implemented; image or audio
-encoders would plug in by producing the same feature dictionaries.
+The engine is modality-agnostic at its interface (:class:`Percept`). Images
+are first read by :mod:`genesis.vision` (learned discrete codes, readout
+calibrated by the agent's own motor commands, abstention), which produces the
+same feature dictionaries; audio is not implemented.
 """
 
 from __future__ import annotations

@@ -3,6 +3,8 @@ import os
 import sqlite3
 import stat
 
+import pytest
+
 from genesis.__main__ import main
 
 
@@ -63,3 +65,36 @@ def test_admin_governance_and_language_model_cli(tmp_path, capsys):
     code, rep, _ = _run(capsys, "audit", "verify", "--db", db)
     assert code == 2 and not rep["ok"]
     assert rep["corpus"]["tampered_documents"] == [1] and not rep["audit"]["ok"]
+
+
+def test_init_generates_web_credentials_once_and_reset_rotates_them(tmp_path, capsys):
+    from genesis import governance
+    from genesis.memory import LongTermMemory
+    home = str(tmp_path / "home")
+    code, res, _ = _run(capsys, "init", "--home", home, "--json")
+    pw = res["password"]
+    assert code == 0 and res["created"] and res["user"] == "admin" and len(pw) == 23
+    files = {n: os.path.join(home, n) for n in ("admin.key", "memory.db", "credentials.txt")}
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(home).st_mode) == 0o700
+        assert all(stat.S_IMODE(os.stat(f).st_mode) == 0o600 for f in files.values())
+    assert pw in open(files["credentials.txt"]).read()
+    ltm = LongTermMemory(files["memory.db"], read_only=True)
+    policy = governance.load_policy(ltm, bytes.fromhex(open(os.path.join(home, "admin.pub")).read()))
+    ltm.close()
+    assert policy.signed and policy.doc["require_auth"] and policy.doc["default_role"] is None
+    assert policy.authenticate("admin", pw) == ("admin", "admin")
+
+    code, again, _ = _run(capsys, "init", "--home", home)  # idempotent: never prints or replaces credentials
+    assert code == 0 and "already initialised" in again and pw not in again
+    assert pw in open(files["credentials.txt"]).read()
+
+    code, reset, _ = _run(capsys, "init", "--home", home, "--reset-password", "--json")
+    assert code == 0 and reset["password"] != pw and reset["password"] in open(files["credentials.txt"]).read()
+    ltm = LongTermMemory(files["memory.db"], read_only=True)
+    policy = governance.load_policy(ltm)
+    ltm.close()
+    assert policy.serial == 2 and policy.authenticate("admin", reset["password"])
+    with pytest.raises(governance.AuthError):
+        policy.authenticate("admin", pw)
+    assert _run(capsys, "start", "--home", str(tmp_path / "missing"))[0] == 1

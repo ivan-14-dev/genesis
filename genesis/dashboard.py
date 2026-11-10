@@ -53,6 +53,7 @@ def summary(ltm: LongTermMemory) -> dict:
             "innate": ltm.get_meta("innate_manifest"), "stage0_audit": ltm.get_meta("stage0_audit"),
             "innate_language": ltm.get_meta("innate_language"),
             "innate_grounding": ltm.get_meta("innate_grounding"),
+            "innate_vision": ltm.get_meta("innate_vision"),
             "grounded_evaluation": ltm.get_meta("grounded_evaluation")}
 
 

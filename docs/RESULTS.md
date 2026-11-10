@@ -280,6 +280,100 @@ tolerance.
 In v0.3.0 each branch had to match all of its observations exactly, so one corrupted outcome in a branch was
 enough to block that conditional.
 
+## Phase 5 — rule discovery from pixels (`vision.py`, `PixelCausalWorld`)
+
+Reproduce (about 10 minutes wall time; the raw output is in
+[`../results/vision-seeds100-109.json`](../results/vision-seeds100-109.json)):
+
+```bash
+python -m genesis vision --seeds 100-109 --out results/vision-seeds100-109.json
+python -m genesis vision --seeds 100-109 --kinds neural --pixel-noise 0.15 --out results/vision-noise15-seeds100-109.json
+```
+
+The labs, rules and seeds are the same as in stages 2–3, but the world never reports a property value. Every state is
+a grey-scale image with one 48×48 panel per property (`spec()` says which rectangle belongs to which property,
+just as a body knows which sensor is which). A value v ≥ 0 is drawn as v "plus" glyphs, and a negative value as
+|v| rings. Glyphs sit on a jittered 8×8 grid with random ink (0.7–1.0) and 0–3 "cross" distractors drawn with
+the same ink, and Gaussian pixel noise (σ = 0.08) is added. Counting ink cannot work (see the baseline below).
+
+What the agent does, with no pretrained weights (`innate_vision` is empty at birth, and the audit checks it):
+
+1. **Motor babbling (10 looks).** It sets random values 0–5 on the properties it can set, looks, and keeps the
+   image. A look costs one interaction, like any other sample.
+2. **Self-supervised visual code.** A small vector-quantised autoencoder (3×3 patches → 8-dimensional tanh
+   latent → 32 codes, straight-through estimator, trained for ~2 s with the in-house `genesis.nn`) learns a
+   discrete alphabet of local appearances from the unlabelled patches.
+3. **Efference-copy readout.** Each panel becomes a histogram of codes. A ridge regression maps the histogram
+   to the value the agent itself commanded. Codes are shared across positions, so the reading is a count and
+   extrapolates beyond the values used for calibration. The before-image of every later experiment refines the
+   readout, because the agent knows what it has just set.
+4. **Abstention.** A panel is unreadable when it contains a code that was never calibrated, a patch much worse
+   reconstructed than any calibrated patch of its code, or a reading too far from an integer. Unreadable
+   outcomes are not learned from, and an unreadable passive situation is skipped. Rules are then learned by the
+   unchanged symbolic learner.
+
+"Samples" counts every interaction: looks + 60 watched + experiments. Rule accuracy is scored as in stages 2–3
+(true states, unseen held-out configurations), so the curves are comparable. Columns are symbolic input, then
+pixels with the learned neural code, then pixels with a pixel-space k-means code (ablation, no autoencoder).
+
+| Held-out seeds 100–109 (pixel noise 0.08) | Symbolic | Pixels, neural | Pixels, k-means |
+|---|---|---|---|
+| Runs reaching 100% unseen held-out accuracy | 10 / 10 | **10 / 10** | 10 / 10 |
+| Experiments to 100% (checkpoints every 5) | 22.0 | **21.5** | 27.5 |
+| Samples to 100% | 82.0 | **91.5** | 97.5 |
+| Ratio to symbolic, mean (worst seed) | — | **1.17 (1.54)** | 1.22 (1.77) |
+| Seeds within 2× (phase 5 criterion) | — | **10 / 10: met** | 10 / 10: met |
+| Out-of-range transfer at the end | 100% | 100% | 100% |
+| Accuracy after the 60 watched samples | 27.8% | 27.7% | 28.4% |
+| End to end: image of an unseen state → predicted next state | — | **98.1%** (1.9% abstained, 0 wrong) | 98.9% (1.1% abstained, 0 wrong) |
+| Experiment before-images misread / abstained (of 4,800 panels) | — | **0** / 30 | **0** / 21 |
+| Unreadable watched situations / outcomes per seed | — | 3.4 / 7.9 | 3.8 / 8.3 |
+| CPU per seed | 0.5 s | 30.3 s | 27.2 s |
+
+Final perception on freshly rendered panels (320 per band, all seeds): correct / abstained / wrong panels.
+
+| Values shown | Neural code | k-means code | Ink-sum baseline (fit on 0–5) |
+|---|---|---|---|
+| Negatives (rings, never calibrated) | 0% / **100%** / 0 | 0% / 99.7% / **1** | 0% |
+| 0–5 (calibration range) | 99.1% / 0.9% / 0 | 100% / 0% / 0 | 40.3% |
+| 6–10 (seen only as experiment outcomes) | 99.7% / 0.3% / 0 | 100% / 0% / 0 | 5.6% |
+| 11–30 (never seen: extrapolation) | 98.8% / 1.2% / 0 | 99.1% / 0.9% / 0 | 0% |
+
+Reading of the results:
+
+- **Criterion met.** Pixels cost 1.17× the symbolic samples on average and at most 1.54×, so all ten seeds
+  stay within 2×. The overhead is the 10 looks. Experiments to 100% are about the same (21.5 vs 22.0) because
+  the before-image checks never found a misreading.
+- **Stricter view, not met.** If the 60 watched samples (identical for both agents) are excluded, the agent
+  chooses 31.5 interactions (looks + experiments) vs 22.0. Only 3/10 seeds stay within 2× on that count, because
+  the symbolic agent often finishes after 5 experiments while the 10 looks alone already cost 2×5.
+- **The learned code is not what makes this work at σ = 0.08.** Pixel-space k-means is about as good and
+  slightly faster, but it is the only variant that misread a negative panel. The autoencoder's advantage is
+  small here, and that is reported rather than hidden. What matters is the structure: position-shared discrete
+  codes, a readout calibrated by the agent's own actions, and abstention.
+- **Negative values are never readable.** The motors only set 0–5, so rings are never calibrated and the
+  reader abstains on them. Outcomes such as "add −2" that go below 0 are therefore not learned from, and the
+  rules are learned from the other observations.
+
+### Stress: more pixel noise (σ = 0.15, neural code)
+
+| Measure | σ = 0.08 | σ = 0.15 |
+|---|---|---|
+| Runs reaching 100% | 10 / 10 | **8 / 10** (seeds 101 and 103 never do within 120 experiments) |
+| Samples to 100% (runs that reach it) | 91.5 | 101.9 (1.30×, worst 1.93×) |
+| Phase 5 criterion | met | **not met** |
+| Final unseen held-out / transfer accuracy | 100% / 100% | 99.4% / 99.8% |
+| End to end (abstained) | 98.1% (1.9%) | 76.8% (20.1%; 3.1% wrong) |
+| Experiment before-images misread / abstained (of 4,800) | 0 / 30 | **64** / 334 |
+| Negatives: abstained / wrong panels | 100% / 0 | 79.4% / **66** |
+| 11–30 extrapolation: correct / abstained / wrong panels | 98.8% / 1.2% / 0 | 62.2% / 33.1% / 15 |
+| Unreadable watched situations / outcomes per seed | 3.4 / 7.9 | 33.9 / 44.0 |
+
+With noise close to the glyphs' own contrast, the patch code confuses noise with strokes. The novelty test then
+either abstains (most of the time) or lets wrong readings through, and the learner takes those as facts. The
+calibration does not adapt to the noise level, so this is a real limit of the current design, not a tuning
+artefact.
+
 ## Stage 4 — memory
 
 | Metric | Value |

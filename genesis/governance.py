@@ -217,6 +217,15 @@ class Policy:
                 return u["name"], u["role"]
         raise AuthError("unknown token")
 
+    def authenticate(self, name: str, password: str) -> tuple:
+        """Login form: the password is the user's access token (system-generated, so a SHA-256 is enough), and
+        the user name must match the entry that holds it."""
+        h = token_hash(password)
+        for u in self.doc["users"]:
+            if hmac.compare_digest(u["token_sha256"], h) and u["name"] == name:
+                return u["name"], u["role"]
+        raise AuthError("invalid user name or password")
+
     def summary(self) -> dict:
         return {"name": self.doc["name"], "serial": self.serial, "signed": self.signed, "key_id": self.key_id,
                 "digest": self.digest(), "default_role": self.doc["default_role"],
